@@ -243,11 +243,13 @@ def plot_error_comparison(time_vec, errors_nl, errors_lin,
     fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
     fig.suptitle(f'{title_prefix} — Absolute Errors', fontsize=14, fontweight='bold')
 
+    EPS = 1e-30  # floor to avoid log(0)
+
     for ax, (group_name, indices) in zip(axes.flat, groups.items()):
         for idx in indices:
-            ax.plot(time_vec, errors_nl[:, idx], '-', linewidth=1.0,
+            ax.plot(time_vec, np.maximum(errors_nl[:, idx], EPS), '-', linewidth=1.0,
                     label=f'NL: {labels[idx]}')
-            ax.plot(time_vec, errors_lin[:, idx], ':', linewidth=1.0,
+            ax.plot(time_vec, np.maximum(errors_lin[:, idx], EPS), ':', linewidth=1.0,
                     label=f'Lin: {labels[idx]}')
         ax.set_title(group_name, fontsize=11)
         ax.set_ylabel('Absolute error')
