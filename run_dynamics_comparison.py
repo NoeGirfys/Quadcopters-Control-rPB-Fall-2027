@@ -3,7 +3,7 @@ Dynamics Comparison: gym-pybullet-drones vs Goffin Model
 ========================================================
 
 This script:
-1. Runs a gym-pybullet-drones simulation (with PID control)
+1. Runs the pid.py circular trajectory in gym-pybullet-drones
 2. Logs RPMs and full state at every physics substep
 3. Replays the same RPMs through Goffin's model (nonlinear + linearized)
 4. Compares trajectories (open-loop: same initial state, diverge freely)
@@ -44,24 +44,49 @@ def run_and_log_substeps(drone_model=DroneModel.CF2X,
                           physics=Physics.PYB,
                           ctrl_freq=48,
                           pyb_freq=240,
-                          duration_sec=3.0,
-                          target_pos=np.array([0.0, 0.0, 1.0])):
+                          duration_sec=3.0):
     """
-    Same as above but logs state at EVERY physics substep for accurate comparison.
+    Reproduce the pid.py circular trajectory and log state at EVERY physics
+    substep for accurate comparison with Goffin's model.
 
-    This requires direct access to the environment internals to call
-    _updateAndStoreKinematicInformation() between substeps.
+    Trajectory setup is copied from gym_pybullet_drones/examples/pid.py:
+    circular path in X-Y plane, radius R=0.3, period=10s.
     """
     import pybullet as p
 
+    # ── pid.py trajectory parameters ──
+    H = 1.0
+    R = 0.3
+    PERIOD = 10
+    NUM_WP = ctrl_freq * PERIOD
+
+    INIT_XYZS = np.array([[
+        R * np.cos(np.pi / 2),
+        R * np.sin(np.pi / 2) - R,
+        H
+    ]])
+    INIT_RPYS = np.array([[0.0, 0.0, 0.0]])
+
+    # Circular waypoints (same formula as pid.py)
+    TARGET_POS = np.zeros((NUM_WP, 3))
+    for i in range(NUM_WP):
+        TARGET_POS[i, :] = [
+            R * np.cos((i / NUM_WP) * 2 * np.pi + np.pi / 2) + INIT_XYZS[0, 0],
+            R * np.sin((i / NUM_WP) * 2 * np.pi + np.pi / 2) - R + INIT_XYZS[0, 1],
+            0
+        ]
+    wp_counter = 0
+
     print(f"[SIM] drone={drone_model.name}, physics={physics.name}, "
           f"pyb_freq={pyb_freq}, ctrl_freq={ctrl_freq}, duration={duration_sec}s")
+    print(f"[SIM] Trajectory: circular, R={R}, period={PERIOD}s, "
+          f"init_xyz={INIT_XYZS[0]}")
 
     env = CtrlAviary(
         drone_model=drone_model,
         num_drones=1,
-        initial_xyzs=np.array([[0.0, 0.0, 0.1]]),
-        initial_rpys=np.array([[0.0, 0.0, 0.0]]),
+        initial_xyzs=INIT_XYZS,
+        initial_rpys=INIT_RPYS,
         physics=physics,
         pyb_freq=pyb_freq,
         ctrl_freq=ctrl_freq,
@@ -85,8 +110,8 @@ def run_and_log_substeps(drone_model=DroneModel.CF2X,
     steps_per_ctrl = pyb_freq // ctrl_freq
     total_ctrl_steps = int(duration_sec * ctrl_freq)
 
-    all_states = []  # Goffin 12-dim states at each physics step
-    all_rpms = []    # RPMs at each physics step
+    all_states = []
+    all_rpms = []
 
     obs, info = env.reset()
 
@@ -99,12 +124,20 @@ def run_and_log_substeps(drone_model=DroneModel.CF2X,
 
     for ctrl_step in range(total_ctrl_steps):
         # Get current state for PID
-        state_20 = env._getDroneStateVector(0)
+        state_20 = env._getDroneStateVector(0) # 0 for first (and only) drone
+
+        # Target = circular waypoint at current altitude (same as pid.py)
+        target = np.hstack([TARGET_POS[wp_counter, 0:2], INIT_XYZS[0, 2]])
+
         rpm_cmd, _, _ = pid.computeControlFromState(
             control_timestep=1.0 / ctrl_freq,
             state=state_20,
-            target_pos=target_pos,
+            target_pos=target,
+            target_rpy=INIT_RPYS[0, :],
         )
+
+        # Advance waypoint (same as pid.py)
+        wp_counter = wp_counter + 1 if wp_counter < (NUM_WP - 1) else 0
 
         # Clip RPMs (mimic _preprocessAction)
         clipped_rpm = np.clip(rpm_cmd, 0, env.MAX_RPM)
@@ -142,8 +175,8 @@ def run_and_log_substeps(drone_model=DroneModel.CF2X,
 
     env.close()
 
-    all_states = np.array(all_states)  # (N_phys+1, 12)
-    all_rpms = np.array(all_rpms)      # (N_phys, 4)
+    all_states = np.array(all_states)
+    all_rpms = np.array(all_rpms)
 
     print(f"[SIM-SUBSTEP] Done. {all_states.shape[0]} states, {all_rpms.shape[0]} RPMs logged.")
 
@@ -292,7 +325,6 @@ def run_full_comparison(drone_model, physics, config_name,
         ctrl_freq=48,
         pyb_freq=240,
         duration_sec=duration_sec,
-        target_pos=np.array([0.0, 0.0, 1.0]),
     )
 
     ref_states = log['states']  # (N+1, 12)
@@ -360,7 +392,7 @@ def run_full_comparison(drone_model, physics, config_name,
 if __name__ == '__main__':
 
     OUTPUT_DIR = 'results_comparison'
-    DURATION = 3.0  # seconds
+    DURATION = 10.0  # seconds (one full circle period from pid.py)
 
     # ─────────────────────────────────────────────────────────────────
     # Define all (drone_model, physics, config_name) combos to test
