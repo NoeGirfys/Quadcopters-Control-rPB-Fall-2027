@@ -242,9 +242,13 @@ def plot_trajectory_comparison(time_vec, ref_states, goffin_nl, goffin_lin,
         ax = axes[i // 3, i % 3]
         ax.plot(time_vec, ref_states[:, i], 'k-', linewidth=1.5, label='gym-pybullet-drones')
         ax.plot(time_vec, goffin_nl[:, i], 'b--', linewidth=1.0, label='Goffin nonlinear')
-        #ax.plot(time_vec, goffin_lin[:, i], 'r:', linewidth=1.0, label='Goffin linearized')
+        ax.plot(time_vec, goffin_lin[:, i], 'r:', linewidth=1.0, label='Goffin linearized')
         ax.set_ylabel(labels[i], fontsize=9)
         ax.grid(True, alpha=0.3)
+        if i in {0, 1, 2, 3, 5}:
+            ax.set_ylim(-1, 1)
+        if i==4:
+            ax.set_ylim(0, 2)
         if i == 0:
             ax.legend(fontsize=7, loc='upper right')
 
@@ -282,8 +286,8 @@ def plot_error_comparison(time_vec, errors_nl, errors_lin,
         for idx in indices:
             ax.plot(time_vec, np.maximum(errors_nl[:, idx], EPS), '-', linewidth=1.0,
                     label=f'NL: {labels[idx]}')
-            #ax.plot(time_vec, np.maximum(errors_lin[:, idx], EPS), ':', linewidth=1.0,
-            #        label=f'Lin: {labels[idx]}')
+            ax.plot(time_vec, np.maximum(errors_lin[:, idx], EPS), ':', linewidth=1.0,
+                    label=f'Lin: {labels[idx]}')
         ax.set_title(group_name, fontsize=11)
         ax.set_ylabel('Absolute error')
         ax.set_yscale('log')
