@@ -292,21 +292,21 @@ def gym_state_to_goffin(pos, rpy, vel, ang_v):
     omega_body = R.T @ ang_v  # [p, q, r]
 
     # Body rates -> Euler rates
-    if np.abs(c_theta) > 1e-8:
-        t_theta = s_theta / c_theta
-        phi_dot   = omega_body[0] + s_phi * t_theta * omega_body[1] + c_phi * t_theta * omega_body[2]
-        theta_dot = c_phi * omega_body[1] - s_phi * omega_body[2]
-        psi_dot   = (s_phi / c_theta) * omega_body[1] + (c_phi / c_theta) * omega_body[2]
-    else:
-        phi_dot, theta_dot, psi_dot = omega_body
+    #if np.abs(c_theta) > 1e-8:
+    #    t_theta = s_theta / c_theta
+    #    phi_dot   = omega_body[0] + s_phi * t_theta * omega_body[1] + c_phi * t_theta * omega_body[2]
+    #    theta_dot = c_phi * omega_body[1] - s_phi * omega_body[2]
+    #    psi_dot   = (s_phi / c_theta) * omega_body[1] + (c_phi / c_theta) * omega_body[2]
+    #else:
+    #    phi_dot, theta_dot, psi_dot = omega_body
 
     return np.array([
         pos[0], vel[0],
         pos[1], vel[1],
         pos[2], vel[2],
-        phi,    phi_dot,
-        theta,  theta_dot,
-        psi,    psi_dot
+        phi,    omega_body[0],
+        theta,  omega_body[1],
+        psi,    omega_body[2]
     ])
 
 
