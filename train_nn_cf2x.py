@@ -473,7 +473,7 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
     # Phase 2 : 48 pas  = 1.0 s    (commencer a reguler)
     # Phase 3 : 96 pas  = 2.0 s    (reguler)
     # Phase 4 : 192 pas = 4.0 s    (horizon complet)
-    horizons = [24, 48, 96, T_STEPS]
+    horizons = [T_STEPS]
     epochs_per_phase = epochs // len(horizons)
 
     print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr}")
@@ -562,7 +562,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n[Device] {device}")
 
-    policy = train(epochs=2000, lr=1e-3, hidden=64,
+    policy = train(epochs=600, lr=1e-3, hidden=64,
                    terminal_weight=10.0, half_side=0.3, device=device)
 
     # Test sur 20 points aleatoires
