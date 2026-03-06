@@ -13,9 +13,9 @@ Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
 The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
-    python train_nn_cf2x.py
-    -> saves  trained_policy_cf2x.pt  (full model)
-    -> saves  trained_weights_cf2x.pt (state_dict only)
+    python train_nn_cf2x.py              # nonlinear dynamics (default)
+    python train_nn_cf2x.py --linear     # linearized dynamics (faster)
+    python train_nn_cf2x.py --epochs 3000 --lr 5e-4
 """
 
 import numpy as np
@@ -308,6 +308,32 @@ print(f"\n[LQR] u_eq[0] (hover thrust) = {U_EQ[0]:.6f} N  (mg = {M*G:.6f} N)")
 
 
 # =====================================================================
+# 3b. Rollout lineaire (affine) differentiable
+# =====================================================================
+# x_{k+1} = Ad x_k + Bd u_k + d
+# Memes matrices que le LQR, mais le u vient du NN au lieu de -Kx.
+
+def rollout_linear(policy, x0, T_steps):
+    """Rollout avec dynamique lineaire affine (ZOH exact)."""
+    B = x0.shape[0]
+    dev = x0.device
+    Ad_t = torch.tensor(Ad_lqr, dtype=torch.float32, device=dev)
+    Bd_t = torch.tensor(Bd_lqr, dtype=torch.float32, device=dev)
+    d_t  = torch.tensor(d_lqr,  dtype=torch.float32, device=dev).unsqueeze(0)
+
+    X = torch.zeros(B, T_steps, 12, device=dev)
+    U = torch.zeros(B, T_steps, 4,  device=dev)
+    state = x0
+
+    for k in range(T_steps):
+        wrench = policy(state)
+        state  = (state @ Ad_t.T) + (wrench @ Bd_t.T) + d_t
+        X[:, k, :] = state
+        U[:, k, :] = wrench
+    return X, U
+
+
+# =====================================================================
 # 4. Reseau de neurones
 # =====================================================================
 
@@ -445,19 +471,18 @@ def generate_cube_points(half_side=0.3):
 
 
 def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
-          half_side=0.3, device="cpu"):
-    """Entraine le NN avec dynamique non-lineaire + curriculum sur l'horizon.
+          half_side=0.3, linearized=False, device="cpu"):
+    """Entraine le NN sur la tache de regulation vers l'origine.
 
-    Curriculum : on commence avec un horizon court (le drone n'a qu'a rester
-    stable 0.5s) puis on allonge progressivement jusqu'a T_SIM.
-    Cela permet au NN d'apprendre d'abord a stabiliser, puis a reguler.
-
-    On utilise 1 sous-pas par pas de controle (dt=1/48s) pendant l'entrainement
-    pour la vitesse.  La dynamique reste la meme, juste avec un dt plus grand.
-    C'est equivalent a Goffin qui utilisait dt=0.1s en Euler non-lineaire.
+    Parametres
+    ----------
+    linearized : bool
+        True  = dynamique lineaire affine (ZOH, rapide)
+        False = dynamique non-lineaire (replique pybullet DYN, 1 sous-pas)
     """
     policy = PolicyMLP(x_scale=X_SCALE, u_max=U_MAX, hidden=hidden).to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     cube_pts = generate_cube_points(half_side)
     x0_batch = make_x0_batch(cube_pts, device=device)
@@ -468,47 +493,29 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
         print(f"\n[Init] NN output at x=0: F={u_test[0,0]:.4f} N (mg={M*G:.4f}), "
               f"tau={u_test[0,1:]}")
 
-    # --- Curriculum : horizons croissants ---
-    # Phase 1 : 24 pas  = 0.5 s    (stabiliser)
-    # Phase 2 : 48 pas  = 1.0 s    (commencer a reguler)
-    # Phase 3 : 96 pas  = 2.0 s    (reguler)
-    # Phase 4 : 192 pas = 4.0 s    (horizon complet)
-    horizons = [T_STEPS]
-    epochs_per_phase = epochs // len(horizons)
-
+    dyn_label = "LINEAIRE" if linearized else "NON-LINEAIRE"
     print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr}")
-    print(f"[Train] Curriculum: {len(horizons)} phases, "
-          f"{epochs_per_phase} epochs/phase")
-    print(f"[Train] Horizons (ctrl steps): {horizons}")
-    print(f"[Train] 1 sous-pas/ctrl (dt={DT_CTRL:.4f}s) pour la vitesse")
+    print(f"[Train] dynamique {dyn_label}, horizon={T_STEPS} steps ({T_SIM}s)")
 
-    global_ep = 0
-    for phase_idx, horizon in enumerate(horizons):
-        t_horizon = horizon * DT_CTRL
-        print(f"\n--- Phase {phase_idx+1}/{len(horizons)}: "
-              f"horizon={horizon} steps ({t_horizon:.1f}s) ---")
+    # Choisir la fonction de rollout
+    rollout_fn = rollout_linear if linearized else rollout
 
-        # Reset le scheduler pour chaque phase
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=epochs_per_phase, eta_min=lr*0.1)
+    for ep in range(epochs):
+        X, U = rollout_fn(policy, x0_batch, T_STEPS)
+        loss = traj_cost(X, U, terminal_weight)
 
-        for ep in range(epochs_per_phase):
-            X, U = rollout(policy, x0_batch, horizon, n_substeps=1)
-            loss = traj_cost(X, U, terminal_weight)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        opt.step()
+        scheduler.step()
 
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-            opt.step()
-            scheduler.step()
-            global_ep += 1
-
-            if (ep + 1) % 100 == 0 or ep == 0:
-                with torch.no_grad():
-                    pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
-                    print(f"  [ep {global_ep:4d}]  loss={loss.item():.4e}  "
-                          f"|x_T|_mean={pos_end.mean().item():.4f}  "
-                          f"|x_T|_max={pos_end.max().item():.4f}")
+        if (ep + 1) % 100 == 0 or ep == 0:
+            with torch.no_grad():
+                pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+                print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
+                      f"|x_T|_mean={pos_end.mean().item():.4f}  "
+                      f"|x_T|_max={pos_end.max().item():.4f}")
 
     return policy
 
@@ -559,11 +566,21 @@ def evaluate(policy, test_pts, device="cpu"):
 # =====================================================================
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--linear", action="store_true",
+                        help="Use linearized dynamics (faster, less accurate)")
+    parser.add_argument("--epochs", type=int, default=2000)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--hidden", type=int, default=64)
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"\n[Device] {device}")
 
-    policy = train(epochs=600, lr=1e-3, hidden=64,
-                   terminal_weight=10.0, half_side=0.3, device=device)
+    policy = train(epochs=args.epochs, lr=args.lr, hidden=args.hidden,
+                   terminal_weight=10.0, half_side=0.3,
+                   linearized=args.linear, device=device)
 
     # Test sur 20 points aleatoires
     rng = np.random.default_rng(42)
@@ -580,13 +597,14 @@ if __name__ == "__main__":
     torch.save(policy.cpu(), path_full)
     torch.save({
         "state_dict": policy.state_dict(),
-        "hidden": 64,
+        "hidden": args.hidden,
         "x_scale": X_SCALE,
         "u_max": U_MAX,
         "ctrl_freq": CTRL_FREQ,
         "Ts": DT_CTRL,
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
         "MAX_RPM": MAX_RPM,
+        "linearized": args.linear,
     }, path_dict)
 
     print(f"\n[Saved] {path_full}")
