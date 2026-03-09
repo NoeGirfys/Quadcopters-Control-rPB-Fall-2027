@@ -274,7 +274,7 @@ class PolicyMLP(nn.Module):
     """
     def __init__(self, x_scale, u_max, hidden=64):
         super().__init__()
-        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32))
+        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32)) # register_buffer makes them part of the state_dict but not trainable parameters
         self.register_buffer("u_max",   torch.tensor(u_max,   dtype=torch.float32))
         self.net = nn.Sequential(
             nn.Linear(12, hidden),
@@ -306,19 +306,28 @@ class PolicyMLP(nn.Module):
 
 def rollout_nonlinear(policy, x0_12, T_steps, n_substeps=1):
     """Rollout with nonlinear quaternion dynamics.
-    State is 13D internally, converted to 12D for NN and storage."""
+
+    Conversions minimisees :
+      - 1x state13_to_state12 par pas (pour l'entree du NN, inevitable)
+      - 1x batch conversion a la fin (pour le cout)
+    Au lieu de 2x par pas dans la version precedente.
+    """
     B, dev = x0_12.shape[0], x0_12.device
-    X = torch.zeros(B, T_steps, 12, device=dev)
-    U = torch.zeros(B, T_steps, 4,  device=dev)
+    X13 = torch.zeros(B, T_steps, 13, device=dev)
+    U   = torch.zeros(B, T_steps, 4,  device=dev)
     s13 = state12_to_state13(x0_12)
 
     for k in range(T_steps):
-        s12 = state13_to_state12(s13)
+        s12 = state13_to_state12(s13)       # 1 conversion pour le NN
         wrench = policy(s12)
         s13 = dynamics_one_ctrl_step(s13, wrench, n_substeps)
-        X[:, k, :] = state13_to_state12(s13)
+        X13[:, k, :] = s13                  # stocke en 13D, pas de conversion
         U[:, k, :] = wrench
-    return X, U
+
+    # Batch conversion 13D -> 12D (une seule fois, sur tout le tenseur)
+    B, T, _ = X13.shape
+    X12 = state13_to_state12(X13.reshape(B*T, 13)).reshape(B, T, 12)
+    return X12, U
 
 
 def rollout_linear(policy, x0_12, T_steps):
@@ -379,10 +388,10 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-    x0_batch = make_x0_batch(generate_cube_points(half_side), device=device)
+    x0_batch = make_x0_batch(generate_cube_points(half_side), device=device) # initialize x, y, z of the state, the rest is zero (hover with no rotation), in a batch of 27 states
 
     with torch.no_grad():
-        u0 = policy(torch.zeros(1, 12, device=device))
+        u0 = policy(torch.zeros(1, 12, device=device)) # check the initial output of the policy at the origin (should be hover thrust)
         print(f"\n[Init] NN(0) = F={u0[0,0]:.4f} N (mg={M*G:.4f}), tau={u0[0,1:]}")
 
     dyn = "LINEAR" if linearized else "NONLINEAR (quaternion, pybullet-exact)"
@@ -400,7 +409,7 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
         opt.step()
         scheduler.step()
 
-        if (ep+1) % 100 == 0 or ep == 0:
+        if (ep+1) % 50 == 0 or ep == 0:
             with torch.no_grad():
                 err = X[:, -1, [0,2,4]].norm(dim=1)
                 print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
