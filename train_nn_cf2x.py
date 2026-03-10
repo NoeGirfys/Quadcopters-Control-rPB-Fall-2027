@@ -30,7 +30,7 @@ import itertools, os
 # 1. CF2X Physical Parameters  (from cf2x.urdf in gym-pybullet-drones)
 # =====================================================================
 
-# ---------- Identiques au URDF cf2x.urdf ----------
+# ---------- Identical to the cf2x.urdf values ----------
 M       = 0.027                         # mass [kg]
 G       = 9.8                           # gravity [m/s^2]  (pybullet uses 9.8)
 I_X     = 1.4e-5                        # Ixx [kg*m^2]
@@ -41,31 +41,31 @@ KF      = 3.16e-10                      # thrust coeff [N/RPM^2]
 KM      = 7.94e-12                      # torque coeff [N*m/RPM^2]
 T2W     = 2.25                          # thrust-to-weight ratio
 
-# ---------- Limites derivees (meme calcul que BaseAviary.__init__) ----------
-GRAVITY     = M * G                                         # poids [N]
+# ---------- Derived limits (same computation as BaseAviary.__init__) ----------
+GRAVITY     = M * G                                         # weight [N]
 HOVER_RPM   = np.sqrt(GRAVITY / (4 * KF))
 MAX_RPM     = np.sqrt((T2W * GRAVITY) / (4 * KF))
-F_MAX       = 4 * KF * MAX_RPM**2                          # poussee max [N]
+F_MAX       = 4 * KF * MAX_RPM**2                          # max thrust [N]
 TAU_XY_MAX  = (2 * L * KF * MAX_RPM**2) / np.sqrt(2)      # couple roll/pitch max
 TAU_Z_MAX   = 2 * KM * MAX_RPM**2                          # couple yaw max
 
 U_MAX = np.array([F_MAX, TAU_XY_MAX, TAU_XY_MAX, TAU_Z_MAX], dtype=np.float32)
 
 # ---------- State scaling ----------
-# Sert a :
-#   a) normaliser les entrees du NN  (le reseau recoit x / x_scale)
-#   b) ponderer la matrice Q du cout (Q_ii = 1 / x_scale_i^2)
+# Used to:
+#   a) normalize the NN inputs  (the network receives x / x_scale)
+#   b) weight the cost matrix Q (Q_ii = 1 / x_scale_i^2)
 #
-# Ce sont des hyperparametres. On les choisit comme les deviations maximales
-# "acceptables" de chaque composante d'etat.  Il faudra les tuner.
+# These are hyperparameters. We choose them as the maximum
+# "acceptable" deviations for each state component. They will need tuning.
 X_MAX       = 1.0                   # position max acceptable [m]
-X_DMAX      = 1.0                   # vitesse max acceptable [m/s]
+X_DMAX      = 1.0                   # max acceptable velocity [m/s]
 Y_MAX       = 1.0
 Y_DMAX      = 1.0
 Z_MAX       = 1.0
 Z_DMAX      = 1.0
-PHI_MAX     = np.deg2rad(30)        # inclinaison max acceptable
-PHI_DMAX    = np.deg2rad(200)       # taux angulaire max acceptable
+PHI_MAX     = np.deg2rad(30)        # max acceptable tilt
+PHI_DMAX    = np.deg2rad(200)       # max acceptable angular rate
 THETA_MAX   = np.deg2rad(30)
 THETA_DMAX  = np.deg2rad(200)
 PSI_MAX     = np.deg2rad(45)
@@ -75,14 +75,14 @@ X_SCALE = np.array([X_MAX, X_DMAX, Y_MAX, Y_DMAX, Z_MAX, Z_DMAX,
                      PHI_MAX, PHI_DMAX, THETA_MAX, THETA_DMAX,
                      PSI_MAX, PSI_DMAX], dtype=np.float32)
 
-# ---------- Timing  (identique a pybullet) ----------
-PYB_FREQ   = 240                    # frequence physique pybullet [Hz]
-CTRL_FREQ  = 48                     # frequence de controle [Hz]
-PYB_STEPS_PER_CTRL = PYB_FREQ // CTRL_FREQ   # = 5 sous-pas par pas de controle
-DT_PYB     = 1.0 / PYB_FREQ        # = 1/240 s  (pas de temps de chaque sous-pas)
-DT_CTRL    = 1.0 / CTRL_FREQ       # = 1/48 s   (intervalle entre deux actions du NN)
-T_SIM      = 4.0                    # duree de simulation [s]
-T_STEPS    = int(T_SIM / DT_CTRL)  # = 192 pas de controle
+# ---------- Timing  (identical to pybullet) ----------
+PYB_FREQ   = 240                    # pybullet physics frequency [Hz]
+CTRL_FREQ  = 48                     # control frequency [Hz]
+PYB_STEPS_PER_CTRL = PYB_FREQ // CTRL_FREQ   # = 5 sub-steps per control step
+DT_PYB     = 1.0 / PYB_FREQ        # = 1/240 s  (time step of each sub-step)
+DT_CTRL    = 1.0 / CTRL_FREQ       # = 1/48 s   (interval between two NN actions)
+T_SIM      = 4.0                    # simulation duration [s]
+T_STEPS    = int(T_SIM / DT_CTRL)  # = 192 control steps
 
 print(f"[CF2X] m={M}, g={G}, Ixx={I_X}, Iyy={I_Y}, Izz={I_Z}")
 print(f"[CF2X] F_max={F_MAX:.4f} N, tau_xy_max={TAU_XY_MAX:.6f} N*m, tau_z_max={TAU_Z_MAX:.6f} N*m")
@@ -92,72 +92,72 @@ print(f"[CF2X] DT_pyb={DT_PYB:.6f}s, DT_ctrl={DT_CTRL:.5f}s, "
 
 
 # =====================================================================
-# 2. Dynamique non-lineaire (replique le mode DYN de pybullet)
+# 2. Nonlinear dynamics (replicates pybullet DYN mode)
 # =====================================================================
 #
-# Reference : BaseAviary._dynamics()   (lignes 815-877)
+# Reference: BaseAviary._dynamics()   (lines 815-877)
 #
-# L'etat est :  [x, xdot, y, ydot, z, zdot, phi, p, theta, q, psi, r]
+# The state is:  [x, xdot, y, ydot, z, zdot, phi, p, theta, q, psi, r]
 #
-# ou p,q,r sont les vitesses angulaires body-frame (= rpy_rates dans pybullet).
-# Au voisinage du hover, p~=phi_dot, q~=theta_dot, r~=psi_dot.
+# where p,q,r are body-frame angular rates (= rpy_rates in pybullet).
+# Near hover, p~=phi_dot, q~=theta_dot, r~=psi_dot.
 #
-# L'entree est :  u = [F, tau_x, tau_y, tau_z]   (wrench)
+# The input is:  u = [F, tau_x, tau_y, tau_z]   (wrench)
 #
-# Trois blocs de physique reproduits fidelement :
+# Three physics blocks reproduced faithfully:
 #
-#   (a) Rotation du thrust en world-frame :
+#   (a) Rotation of thrust into the world frame:
 #         R(phi,theta,psi) @ [0, 0, F]
-#       Identique a pybullet  "thrust_world_frame = np.dot(rotation, thrust)"
-#       sauf que pybullet obtient R via le quaternion et nous via les angles d'Euler.
-#       La matrice R est la meme (convention ZYX intrinsic).
+#       Identical to pybullet  "thrust_world_frame = np.dot(rotation, thrust)"
+#       except that pybullet obtains R from the quaternion while we use Euler angles.
+#       The rotation matrix R is the same (intrinsic ZYX convention).
 #
-#   (b) Couplage gyroscopique :
+#   (b) Gyroscopic coupling:
 #         tau_net = [tau_x,tau_y,tau_z] - omega x (J*omega)
-#       Identique a pybullet  "torques = torques - np.cross(rpy_rates, np.dot(self.J, rpy_rates))"
+#       Identical to pybullet  "torques = torques - np.cross(rpy_rates, np.dot(self.J, rpy_rates))"
 #
-#   (c) Integration Euler semi-implicite (symplectique) :
-#         v  <- v  + dt*a          (vitesse mise a jour EN PREMIER)
+#   (c) Semi-implicit (symplectic) Euler integration:
+#         v  <- v  + dt*a          (velocity updated FIRST)
 #         omega <- omega + dt*omega_dot
-#         pos <- pos + dt*v        (position mise a jour AVEC la nouvelle vitesse)
-#         rpy <- rpy + dt*omega    (idem pour l'orientation)
-#       Identique a pybullet lignes 860-863.
+#         pos <- pos + dt*v        (position updated WITH the new velocity)
+#         rpy <- rpy + dt*omega    (same for orientation)
+#       Identical to pybullet lines 860-863.
 #
-#   (d) Structure de sous-pas :
-#         Pour chaque pas de controle, on fait PYB_STEPS_PER_CTRL sous-pas
-#         a dt = 1/240 s, avec le meme wrench tenu constant.
-#       Identique a la boucle "for _ in range(self.PYB_STEPS_PER_CTRL)"
+#   (d) Sub-step structure:
+#         For each control step, we perform PYB_STEPS_PER_CTRL sub-steps
+#         at dt = 1/240 s, with the same wrench held constant.
+#       Identical to the loop "for _ in range(self.PYB_STEPS_PER_CTRL)"
 #
-# NOTE : la seule difference est l'integration de l'orientation :
-#   - pybullet utilise des quaternions (_integrateQ)
-#   - nous utilisons rpy <- rpy + dt*omega
-#   Ces deux approches sont equivalentes au premier ordre et donnent les
-#   memes resultats au voisinage du hover.  Pour des manoeuvres agressives
-#   (> 60 deg de tilt), les quaternions seraient plus precis.
+# NOTE: the only difference is the orientation integration:
+#   - pybullet uses quaternions (_integrateQ)
+#   - we use rpy <- rpy + dt*omega
+#   These two approaches are first-order equivalent and give the
+#   same results near hover. For aggressive maneuvers
+#   (> 60 deg of tilt), quaternions would be more accurate.
 
 
 def rotation_matrix_zyx(phi, theta, psi):
-    """Matrice de rotation ZYX intrinsic (= XYZ extrinsic).
+    """Intrinsic ZYX rotation matrix (= extrinsic XYZ).
 
-    Identique a p.getMatrixFromQuaternion(p.getQuaternionFromEuler([phi,theta,psi]))
-    au voisinage du hover.
+    Identical to p.getMatrixFromQuaternion(p.getQuaternionFromEuler([phi,theta,psi]))
+    near hover.
 
-    Parametres : tenseurs de shape (B,) ou scalaires.
-    Retourne :   tenseur de shape (B, 3, 3).
+    Parameters: tensors of shape (B,) or scalars.
+    Returns:    tensor of shape (B, 3, 3).
     """
     cphi = torch.cos(phi);   sphi = torch.sin(phi)
     cth  = torch.cos(theta); sth  = torch.sin(theta)
     cpsi = torch.cos(psi);   spsi = torch.sin(psi)
 
-    # Ligne 1
+    # Row 1
     r00 = cth * cpsi
     r01 = sphi * sth * cpsi - cphi * spsi
     r02 = cphi * sth * cpsi + sphi * spsi
-    # Ligne 2
+    # Row 2
     r10 = cth * spsi
     r11 = sphi * sth * spsi + cphi * cpsi
     r12 = cphi * sth * spsi - sphi * cpsi
-    # Ligne 3
+    # Row 3
     r20 = -sth
     r21 = sphi * cth
     r22 = cphi * cth
@@ -171,21 +171,21 @@ def rotation_matrix_zyx(phi, theta, psi):
 
 
 def dynamics_substep(state, wrench, dt):
-    """Un sous-pas d'integration Euler semi-implicite.
+    """One semi-implicit Euler integration sub-step.
 
-    Replique exactement BaseAviary._dynamics() lignes 838-863.
+    Exactly replicates BaseAviary._dynamics() lines 838-863.
 
-    Parametres
+    Parameters
     ----------
     state  : (B, 12)  [x, vx, y, vy, z, vz, phi, p, theta, q, psi, r]
     wrench : (B, 4)   [F, tau_x, tau_y, tau_z]
-    dt     : float    pas de temps (= 1/240 s)
+    dt     : float    time step (= 1/240 s)
 
-    Retourne
-    --------
+    Returns
+    -------
     state_new : (B, 12)
     """
-    # --- Unpacker l'etat ---
+    # --- Unpack the state ---
     x     = state[:, 0];  vx = state[:, 1]
     y     = state[:, 2];  vy = state[:, 3]
     z     = state[:, 4];  vz = state[:, 5]
@@ -198,25 +198,25 @@ def dynamics_substep(state, wrench, dt):
     tau_y = wrench[:, 2]
     tau_z = wrench[:, 3]
 
-    # --- (a) Thrust en world-frame ---
+    # --- (a) Thrust in the world frame ---
     # pybullet : thrust = [0, 0, F]
     #            thrust_world = R @ thrust
     #            force_world = thrust_world - [0, 0, GRAVITY]
     #            acc = force_world / M
     R = rotation_matrix_zyx(phi, theta, psi)  # (B, 3, 3)
 
-    # R @ [0, 0, F]  =  F * R[:, :, 2]   (3eme colonne de R)
+    # R @ [0, 0, F]  =  F * R[:, :, 2]   (3rd column of R)
     thrust_world = F.unsqueeze(-1) * R[:, :, 2]  # (B, 3)
 
     ax = (thrust_world[:, 0]) / M
     ay = (thrust_world[:, 1]) / M
     az = (thrust_world[:, 2]) / M - G      # gravity: -[0,0,GRAVITY]/M = -g
 
-    # --- (b) Couplage gyroscopique ---
+    # --- (b) Gyroscopic coupling ---
     # pybullet : torques = [tau_x, tau_y, tau_z] - cross(omega, J @ omega)
     #            omega_dot = J_inv @ torques
     #
-    # cross(omega, J*omega) avec J diagonal :
+    # cross(omega, J*omega) with diagonal J:
     #   [p]     [Ix*p]     [q*Iz*r - r*Iy*q]     [(Iz-Iy)*q*r]
     #   [q]  x  [Iy*q]  =  [r*Ix*p - p*Iz*r]  =  [(Ix-Iz)*p*r]
     #   [r]     [Iz*r]     [p*Iy*q - q*Ix*p]     [(Iy-Ix)*p*q]
@@ -228,8 +228,8 @@ def dynamics_substep(state, wrench, dt):
     q_dot = (tau_y - gyro_y) / I_Y
     r_dot = (tau_z - gyro_z) / I_Z
 
-    # --- (c) Integration Euler semi-implicite ---
-    # Etape 1 : mettre a jour les vitesses
+    # --- (c) Semi-implicit Euler integration ---
+    # Step 1: update the velocities
     vx_new = vx + dt * ax
     vy_new = vy + dt * ay
     vz_new = vz + dt * az
@@ -237,7 +237,7 @@ def dynamics_substep(state, wrench, dt):
     q_new  = q  + dt * q_dot
     r_new  = r  + dt * r_dot
 
-    # Etape 2 : mettre a jour les positions AVEC LES NOUVELLES vitesses
+    # Step 2: update the positions WITH THE NEW velocities
     x_new     = x     + dt * vx_new
     y_new     = y     + dt * vy_new
     z_new     = z     + dt * vz_new
@@ -253,31 +253,31 @@ def dynamics_substep(state, wrench, dt):
 
 
 def dynamics_one_ctrl_step(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
-    """Avance d'un pas de controle complet.
+    """Advance by one full control step.
 
-    Parametres
+    Parameters
     ----------
     n_substeps : int
-        Nombre de sous-pas d'Euler.
-        - n_substeps=5, dt=1/240  : replique exactement pybullet (pour validation)
-        - n_substeps=1, dt=1/48   : 5x plus rapide (pour entrainement)
-        Les deux donnent des resultats proches car dt=1/48 reste petit.
-        (Goffin utilisait dt=0.1s avec Euler dans ses exp. non-lineaires !)
+        Number of Euler sub-steps.
+        - n_substeps=5, dt=1/240  : exactly replicates pybullet (for validation)
+        - n_substeps=1, dt=1/48   : 5x faster (for training)
+        Both give similar results because dt=1/48 remains small.
+        (Goffin used dt=0.1s with Euler in his nonlinear experiments!)
     """
-    dt = DT_CTRL / n_substeps  # duree de chaque sous-pas
+    dt = DT_CTRL / n_substeps  # duration of each sub-step
     for _ in range(n_substeps):
         state = dynamics_substep(state, wrench, dt)
     return state
 
 
 # =====================================================================
-# 3. LQR baseline (pour comparaison - utilise le modele linearise)
+# 3. LQR baseline (for comparison - uses the linearized model)
 # =====================================================================
-# On linearise uniquement pour calculer le gain LQR comme baseline.
-# L'entrainement du NN utilise la dynamique non-lineaire ci-dessus.
+# We linearize only to compute the LQR gain as a baseline.
+# NN training uses the nonlinear dynamics above.
 
 def _build_linear_model_for_lqr():
-    """Modele linearise + discretisation ZOH (seulement pour le LQR baseline)."""
+    """Linearized model + ZOH discretization (only for the LQR baseline)."""
     from scipy.signal import cont2discrete
 
     A = np.zeros((12, 12))
@@ -309,13 +309,13 @@ print(f"\n[LQR] u_eq[0] (hover thrust) = {U_EQ[0]:.6f} N  (mg = {M*G:.6f} N)")
 
 
 # =====================================================================
-# 3b. Rollout lineaire (affine) differentiable
+# 3b. Differentiable linear (affine) rollout
 # =====================================================================
 # x_{k+1} = Ad x_k + Bd u_k + d
-# Memes matrices que le LQR, mais le u vient du NN au lieu de -Kx.
+# Same matrices as for LQR, but u comes from the NN instead of -Kx.
 
 def rollout_linear(policy, x0, T_steps):
-    """Rollout avec dynamique lineaire affine (ZOH exact)."""
+    """Rollout with affine linear dynamics (exact ZOH)."""
     B = x0.shape[0]
     dev = x0.device
     Ad_t = torch.tensor(Ad_lqr, dtype=torch.float32, device=dev)
@@ -335,7 +335,7 @@ def rollout_linear(policy, x0, T_steps):
 
 
 # =====================================================================
-# 4. Reseau de neurones
+# 4. Neural network
 # =====================================================================
 
 class PolicyMLP(nn.Module):
@@ -344,13 +344,13 @@ class PolicyMLP(nn.Module):
     Thrust  -> sigmoid -> [0, F_max]
     Torques -> tanh    -> [-tau_max, +tau_max]
 
-    INITIALISATION CRITIQUE :
-    La derniere couche est initialisee a poids=0, biais=[logit(mg/Fmax), 0, 0, 0].
-    Ainsi, quelle que soit l'entree, la sortie initiale est :
+    CRITICAL INITIALIZATION:
+    The last layer is initialized with weight=0, bias=[logit(mg/Fmax), 0, 0, 0].
+    Therefore, regardless of the input, the initial output is:
         thrust  = sigmoid(logit(mg/Fmax)) * Fmax = mg    (hover)
-        torques = tanh(0) * tau_max = 0                   (pas de rotation)
-    Le drone commence donc en vol stationnaire, et le gradient peut guider
-    l'apprentissage depuis ce point d'equilibre stable.
+        torques = tanh(0) * tau_max = 0                   (no rotation)
+    The drone therefore starts in hover, and the gradient can guide
+    learning from this stable equilibrium point.
     """
     def __init__(self, x_scale, u_max, hidden=64):
         super().__init__()
@@ -366,15 +366,15 @@ class PolicyMLP(nn.Module):
         self._init_hover()
 
     def _init_hover(self):
-        """Initialise la derniere couche pour sortir le wrench de hover."""
+        """Initialize the last layer to output the hover wrench."""
         last_layer = self.net[-1]   # nn.Linear(hidden, 4)
-        # Poids a zero : la sortie ne depend pas de l'entree au depart
+        # Zero weights: the output does not depend on the input initially
         nn.init.zeros_(last_layer.weight)
         nn.init.zeros_(last_layer.bias)
-        # Biais du thrust : sigmoid(b) * Fmax = mg  =>  b = logit(mg/Fmax)
+        # Thrust bias: sigmoid(b) * Fmax = mg  =>  b = logit(mg/Fmax)
         hover_ratio = (M * G) / float(self.u_max[0])  # mg / Fmax ≈ 0.444
         last_layer.bias.data[0] = float(np.log(hover_ratio / (1.0 - hover_ratio)))
-        # Biais des torques = 0 : tanh(0) = 0, pas de couple
+        # Torque biases = 0: tanh(0) = 0, no torque
 
     def forward(self, x):
         x_n = x / self.x_scale
@@ -385,23 +385,23 @@ class PolicyMLP(nn.Module):
 
 
 # =====================================================================
-# 5. Rollout differentiable (non-lineaire) et cout
+# 5. Differentiable rollout (nonlinear) and cost
 # =====================================================================
 
 def rollout(policy, x0, T_steps, n_substeps=1):
-    """Deroule la politique sur T_steps pas de controle avec dynamique non-lineaire.
+    """Roll out the policy for T_steps control steps with nonlinear dynamics.
 
-    A chaque pas de controle :
-      1. Le NN choisit wrench = policy(state)
-      2. On integre n_substeps sous-pas de dynamique non-lineaire
-         avec le wrench tenu constant.
+    At each control step:
+      1. The NN chooses wrench = policy(state)
+      2. We integrate n_substeps nonlinear dynamics sub-steps
+         while keeping the wrench constant.
 
-    Parametres
+    Parameters
     ----------
     policy     : PolicyMLP
-    x0         : (B, 12) etats initiaux
-    T_steps    : int  nombre de pas de controle
-    n_substeps : int  sous-pas par pas de controle (1=rapide, 5=pybullet exact)
+    x0         : (B, 12) initial states
+    T_steps    : int  number of control steps
+    n_substeps : int  sub-steps per control step (1=fast, 5=exact pybullet)
     """
     B = x0.shape[0]
     dev = x0.device
@@ -417,7 +417,7 @@ def rollout(policy, x0, T_steps, n_substeps=1):
     return X, U
 
 
-# --- Matrice de cout ---
+# --- Cost matrix ---
 Q_DIAG = np.array([
     1/X_MAX**2,     1/X_DMAX**2,
     1/Y_MAX**2,     1/Y_DMAX**2,
@@ -436,7 +436,7 @@ R_DIAG = np.array([
 
 
 def traj_cost(X, U, terminal_weight=0.0):
-    """Cout quadratique : sum_k (x'Qx + u'Ru), moyenne sur le batch."""
+    """Quadratic cost: sum_k (x'Qx + u'Ru), averaged over the batch."""
     Q = torch.as_tensor(Q_DIAG, dtype=X.dtype, device=X.device)
     R = torch.as_tensor(R_DIAG, dtype=U.dtype, device=U.device)
 
@@ -451,12 +451,12 @@ def traj_cost(X, U, terminal_weight=0.0):
 
 
 # =====================================================================
-# 6. Entrainement
+# 6. Training
 # =====================================================================
 
 def make_x0_batch(xyz_list, device="cpu"):
-    """Convertit une liste de (x,y,z) en tenseur (B, 12) d'etats initiaux.
-    Toutes les vitesses et angles sont a zero."""
+    """Convert a list of (x,y,z) into a tensor (B, 12) of initial states.
+    All velocities and angles are zero."""
     X0 = torch.zeros(len(xyz_list), 12, dtype=torch.float32, device=device)
     for b, (x, y, z) in enumerate(xyz_list):
         X0[b, 0] = x
@@ -466,20 +466,20 @@ def make_x0_batch(xyz_list, device="cpu"):
 
 
 def generate_cube_points(half_side=0.3):
-    """27 points : sommets + centres des faces + centres des aretes + centre."""
+    """27 points: vertices + face centers + edge centers + center."""
     vals = [-half_side, 0.0, half_side]
     return list(itertools.product(vals, repeat=3))
 
 
 def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
           half_side=0.3, linearized=False, device="cpu"):
-    """Entraine le NN sur la tache de regulation vers l'origine.
+    """Train the NN on the regulation-to-origin task.
 
-    Parametres
+    Parameters
     ----------
     linearized : bool
-        True  = dynamique lineaire affine (ZOH, rapide)
-        False = dynamique non-lineaire (replique pybullet DYN, 1 sous-pas)
+        True  = affine linear dynamics (ZOH, fast)
+        False = nonlinear dynamics (replicates pybullet DYN, 1 sub-step)
     """
     policy = PolicyMLP(x_scale=X_SCALE, u_max=U_MAX, hidden=hidden).to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
@@ -488,7 +488,7 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
     cube_pts = generate_cube_points(half_side)
     x0_batch = make_x0_batch(cube_pts, device=device)
 
-    # Verifier l'init hover
+    # Check hover initialization
     with torch.no_grad():
         u_test = policy(torch.zeros(1, 12, device=device))
         print(f"\n[Init] NN output at x=0: F={u_test[0,0]:.4f} N (mg={M*G:.4f}), "
@@ -498,7 +498,7 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
     print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr}")
     print(f"[Train] dynamique {dyn_label}, horizon={T_STEPS} steps ({T_SIM}s)")
 
-    # Choisir la fonction de rollout
+    # Choose the rollout function
     rollout_fn = rollout_linear if linearized else rollout
 
     for ep in range(epochs):
@@ -527,18 +527,18 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
 
 @torch.no_grad()
 def evaluate(policy, test_pts, device="cpu"):
-    """Evalue le NN et le LQR sur des positions de test."""
+    """Evaluate the NN and the LQR on test positions."""
 
     x0 = make_x0_batch(test_pts, device=device)
 
-    # --- NN (dynamique non-lineaire, 5 sous-pas = pybullet exact) ---
+    # --- NN (nonlinear dynamics, 5 sub-steps = exact pybullet) ---
     X_nn, U_nn = rollout(policy, x0, T_STEPS, n_substeps=PYB_STEPS_PER_CTRL)
     err_nn = X_nn[:, -1, [0, 2, 4]].norm(dim=1)
     print(f"\n[Eval] {len(test_pts)} test points (non-lineaire, {PYB_STEPS_PER_CTRL} sous-pas):")
     print(f"  NN   terminal error  mean={err_nn.mean().item():.5f} m  "
           f"max={err_nn.max().item():.5f} m")
 
-    # --- LQR (dynamique lineaire, pour baseline) ---
+    # --- LQR (linear dynamics, for baseline) ---
     Ad_t  = torch.tensor(Ad_lqr, dtype=torch.float32, device=device)
     Bd_t  = torch.tensor(Bd_lqr, dtype=torch.float32, device=device)
     d_t   = torch.tensor(d_lqr,  dtype=torch.float32, device=device).unsqueeze(0)
@@ -596,14 +596,14 @@ if __name__ == "__main__":
                    terminal_weight=10.0, half_side=0.3,
                    linearized=args.linear, device=device)
 
-    # Test sur 20 points aleatoires
+    # Test on 20 random points
     rng = np.random.default_rng(42)
     test_pts = [(rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3)) for _ in range(20)]
     evaluate(policy, test_pts, device=device)
 
-    # Sauvegarde
+    # Save
     out_dir = os.path.dirname(os.path.abspath(__file__))
     run_name = build_run_name(args.linear, args.epochs, args.lr, args.hidden, args.tag)
     path_full = os.path.join(out_dir, f"trained_policy_{run_name}.pt")
