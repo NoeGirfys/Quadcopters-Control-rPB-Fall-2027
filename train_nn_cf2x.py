@@ -13,9 +13,8 @@ Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
 The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
-    python train_nn_cf2x.py                 # nonlinear dynamics (Euler angles, default)
-    python train_nn_cf2x.py --quaternions   # PyBullet-style quaternion dynamics
-    python train_nn_cf2x.py --linear        # linearized dynamics (faster)
+    python train_nn_cf2x.py              # nonlinear dynamics (default)
+    python train_nn_cf2x.py --linear     # linearized dynamics (faster)
     python train_nn_cf2x.py --epochs 3000 --lr 5e-4
 """
 
@@ -136,131 +135,6 @@ print(f"[CF2X] DT_pyb={DT_PYB:.6f}s, DT_ctrl={DT_CTRL:.5f}s, "
 #   (> 60 deg de tilt), les quaternions seraient plus precis.
 
 
-
-
-def euler_to_quat_xyzw(phi, theta, psi):
-    """Euler ZYX -> quaternion [x, y, z, w], same convention as PyBullet."""
-    cy = torch.cos(psi * 0.5)
-    sy = torch.sin(psi * 0.5)
-    cp = torch.cos(theta * 0.5)
-    sp = torch.sin(theta * 0.5)
-    cr = torch.cos(phi * 0.5)
-    sr = torch.sin(phi * 0.5)
-
-    qx = sr * cp * cy - cr * sp * sy
-    qy = cr * sp * cy + sr * cp * sy
-    qz = cr * cp * sy - sr * sp * cy
-    qw = cr * cp * cy + sr * sp * sy
-    return torch.stack([qx, qy, qz, qw], dim=-1)
-
-
-def quat_to_euler_xyzw(quat):
-    """Quaternion [x, y, z, w] -> Euler ZYX = [roll, pitch, yaw]."""
-    qx = quat[:, 0]
-    qy = quat[:, 1]
-    qz = quat[:, 2]
-    qw = quat[:, 3]
-
-    sinr_cosp = 2.0 * (qw * qx + qy * qz)
-    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
-    phi = torch.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2.0 * (qw * qy - qz * qx)
-    sinp = torch.clamp(sinp, -1.0, 1.0)
-    theta = torch.asin(sinp)
-
-    siny_cosp = 2.0 * (qw * qz + qx * qy)
-    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-    psi = torch.atan2(siny_cosp, cosy_cosp)
-
-    return phi, theta, psi
-
-
-def quat_to_rotmat_xyzw(quat):
-    """Quaternion [x, y, z, w] -> rotation matrix, same convention as PyBullet."""
-    qx = quat[:, 0]
-    qy = quat[:, 1]
-    qz = quat[:, 2]
-    qw = quat[:, 3]
-
-    xx = qx * qx
-    yy = qy * qy
-    zz = qz * qz
-    xy = qx * qy
-    xz = qx * qz
-    yz = qy * qz
-    wx = qw * qx
-    wy = qw * qy
-    wz = qw * qz
-
-    two = quat.new_tensor(2.0)
-
-    r00 = 1.0 - two * (yy + zz)
-    r01 = two * (xy - wz)
-    r02 = two * (xz + wy)
-    r10 = two * (xy + wz)
-    r11 = 1.0 - two * (xx + zz)
-    r12 = two * (yz - wx)
-    r20 = two * (xz - wy)
-    r21 = two * (yz + wx)
-    r22 = 1.0 - two * (xx + yy)
-
-    return torch.stack([
-        torch.stack([r00, r01, r02], dim=-1),
-        torch.stack([r10, r11, r12], dim=-1),
-        torch.stack([r20, r21, r22], dim=-1),
-    ], dim=-2)
-
-
-def integrate_quat_pyb(quat, omega, dt):
-    """Torch version of BaseAviary._integrateQ(), batch-vectorized."""
-    p = omega[:, 0]
-    q = omega[:, 1]
-    r = omega[:, 2]
-    omega_norm = torch.linalg.norm(omega, dim=1)
-
-    lam = torch.stack([
-        torch.stack([torch.zeros_like(p),  r, -q,  p], dim=-1),
-        torch.stack([-r, torch.zeros_like(p),  p,  q], dim=-1),
-        torch.stack([ q, -p, torch.zeros_like(p),  r], dim=-1),
-        torch.stack([-p, -q, -r, torch.zeros_like(p)], dim=-1),
-    ], dim=1) * 0.5  # (B, 4, 4)
-
-    theta = omega_norm * dt / 2.0
-    eye = torch.eye(4, dtype=quat.dtype, device=quat.device).unsqueeze(0).expand(quat.shape[0], -1, -1)
-    omega_norm_safe = torch.where(omega_norm > 0.0, omega_norm, torch.ones_like(omega_norm))
-
-    A = (
-        eye * torch.cos(theta).view(-1, 1, 1)
-        + (2.0 / omega_norm_safe).view(-1, 1, 1) * lam * torch.sin(theta).view(-1, 1, 1)
-    )
-    quat_new = torch.bmm(A, quat.unsqueeze(-1)).squeeze(-1)
-
-    mask = (omega_norm > 1e-12).unsqueeze(-1)
-    quat_new = torch.where(mask, quat_new, quat)
-    quat_new = quat_new / quat_new.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-    return quat_new
-
-
-def state12_to_state13(state12):
-    """[x,vx,y,vy,z,vz,phi,p,theta,q,psi,r] -> [x,vx,y,vy,z,vz,qx,qy,qz,qw,p,q,r]."""
-    quat = euler_to_quat_xyzw(state12[:, 6], state12[:, 8], state12[:, 10])
-    return torch.cat([state12[:, :6], quat, state12[:, 7:8], state12[:, 9:10], state12[:, 11:12]], dim=-1)
-
-
-def state13_to_state12(state13):
-    """[x,vx,y,vy,z,vz,qx,qy,qz,qw,p,q,r] -> [x,vx,y,vy,z,vz,phi,p,theta,q,psi,r]."""
-    phi, theta, psi = quat_to_euler_xyzw(state13[:, 6:10])
-    return torch.stack([
-        state13[:, 0], state13[:, 1],
-        state13[:, 2], state13[:, 3],
-        state13[:, 4], state13[:, 5],
-        phi, state13[:, 10],
-        theta, state13[:, 11],
-        psi, state13[:, 12],
-    ], dim=-1)
-
-
 def rotation_matrix_zyx(phi, theta, psi):
     """Matrice de rotation ZYX intrinsic (= XYZ extrinsic).
 
@@ -375,69 +249,6 @@ def dynamics_substep(state, wrench, dt):
         phi_new, p_new, theta_new, q_new, psi_new, r_new
     ], dim=-1)
     return state_new
-
-
-
-
-def dynamics_substep_quat(state, wrench, dt):
-    """Un sous-pas de dynamique avec quaternion, au plus proche de BaseAviary._dynamics().
-
-    state  : (B, 13) [x,vx,y,vy,z,vz,qx,qy,qz,qw,p,q,r]
-    wrench : (B, 4)  [F,tau_x,tau_y,tau_z]
-    """
-    x     = state[:, 0];  vx = state[:, 1]
-    y     = state[:, 2];  vy = state[:, 3]
-    z     = state[:, 4];  vz = state[:, 5]
-    quat  = state[:, 6:10]
-    p     = state[:, 10]
-    q     = state[:, 11]
-    r     = state[:, 12]
-
-    F     = wrench[:, 0]
-    tau_x = wrench[:, 1]
-    tau_y = wrench[:, 2]
-    tau_z = wrench[:, 3]
-
-    R = quat_to_rotmat_xyzw(quat)
-    thrust_world = F.unsqueeze(-1) * R[:, :, 2]
-
-    ax = thrust_world[:, 0] / M
-    ay = thrust_world[:, 1] / M
-    az = thrust_world[:, 2] / M - G
-
-    gyro_x = (I_Z - I_Y) * q * r
-    gyro_y = (I_X - I_Z) * p * r
-    gyro_z = (I_Y - I_X) * p * q
-
-    p_new = p + dt * (tau_x - gyro_x) / I_X
-    q_new = q + dt * (tau_y - gyro_y) / I_Y
-    r_new = r + dt * (tau_z - gyro_z) / I_Z
-
-    vx_new = vx + dt * ax
-    vy_new = vy + dt * ay
-    vz_new = vz + dt * az
-
-    x_new = x + dt * vx_new
-    y_new = y + dt * vy_new
-    z_new = z + dt * vz_new
-
-    quat_new = integrate_quat_pyb(quat, torch.stack([p_new, q_new, r_new], dim=-1), dt)
-
-    return torch.cat([
-        x_new.unsqueeze(-1), vx_new.unsqueeze(-1),
-        y_new.unsqueeze(-1), vy_new.unsqueeze(-1),
-        z_new.unsqueeze(-1), vz_new.unsqueeze(-1),
-        quat_new,
-        p_new.unsqueeze(-1), q_new.unsqueeze(-1), r_new.unsqueeze(-1)
-    ], dim=-1)
-
-
-def dynamics_one_ctrl_step_quat(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
-    """Avance d'un pas de controle complet avec etat quaternion."""
-    dt = DT_CTRL / n_substeps
-    for _ in range(n_substeps):
-        state = dynamics_substep_quat(state, wrench, dt)
-    return state
 
 
 def dynamics_one_ctrl_step(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
@@ -576,7 +387,7 @@ class PolicyMLP(nn.Module):
 # 5. Rollout differentiable (non-lineaire) et cout
 # =====================================================================
 
-def rollout(policy, x0, T_steps, n_substeps=PYB_STEPS_PER_CTRL):
+def rollout(policy, x0, T_steps, n_substeps=1):
     """Deroule la politique sur T_steps pas de controle avec dynamique non-lineaire.
 
     A chaque pas de controle :
@@ -601,26 +412,6 @@ def rollout(policy, x0, T_steps, n_substeps=PYB_STEPS_PER_CTRL):
         wrench = policy(state)
         state  = dynamics_one_ctrl_step(state, wrench, n_substeps)
         X[:, k, :] = state
-        U[:, k, :] = wrench
-    return X, U
-
-
-
-
-def rollout_quat(policy, x0, T_steps, n_substeps=PYB_STEPS_PER_CTRL):
-    """Rollout avec dynamique quaternion interne et observation Euler pour le NN."""
-    B = x0.shape[0]
-    dev = x0.device
-    X = torch.zeros(B, T_steps, 12, device=dev)
-    U = torch.zeros(B, T_steps, 4,  device=dev)
-
-    state13 = state12_to_state13(x0)
-
-    for k in range(T_steps):
-        obs12 = state13_to_state12(state13)
-        wrench = policy(obs12)
-        state13 = dynamics_one_ctrl_step_quat(state13, wrench, n_substeps=n_substeps)
-        X[:, k, :] = state13_to_state12(state13)
         U[:, k, :] = wrench
     return X, U
 
@@ -680,18 +471,14 @@ def generate_cube_points(half_side=0.3):
 
 
 def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
-          half_side=0.3, linearized=False, quaternions=False, device="cpu"):
+          half_side=0.3, linearized=False, device="cpu"):
     """Entraine le NN sur la tache de regulation vers l'origine.
 
     Parametres
     ----------
     linearized : bool
         True  = dynamique lineaire affine (ZOH, rapide)
-        False = dynamique non-lineaire
-    quaternions : bool
-        True  = dynamique quaternion avec integration PyBullet exacte
-                et 5 sous-pas a 1/240 s par pas de controle
-        False = dynamique Euler-angle existante
+        False = dynamique non-lineaire (replique pybullet DYN, 1 sous-pas)
     """
     policy = PolicyMLP(x_scale=X_SCALE, u_max=U_MAX, hidden=hidden).to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
@@ -706,18 +493,12 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
         print(f"\n[Init] NN output at x=0: F={u_test[0,0]:.4f} N (mg={M*G:.4f}), "
               f"tau={u_test[0,1:]}")
 
-    if linearized:
-        dyn_label = "LINEAIRE"
-        rollout_fn = rollout_linear
-    elif quaternions:
-        dyn_label = f"NON-LINEAIRE + QUATERNIONS ({PYB_STEPS_PER_CTRL} sous-pas PyBullet)"
-        rollout_fn = lambda pol, x0, T: rollout_quat(pol, x0, T, n_substeps=PYB_STEPS_PER_CTRL)
-    else:
-        dyn_label = "NON-LINEAIRE (Euler angles)"
-        rollout_fn = rollout
-
+    dyn_label = "LINEAIRE" if linearized else "NON-LINEAIRE"
     print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr}")
     print(f"[Train] dynamique {dyn_label}, horizon={T_STEPS} steps ({T_SIM}s)")
+
+    # Choisir la fonction de rollout
+    rollout_fn = rollout_linear if linearized else rollout
 
     for ep in range(epochs):
         X, U = rollout_fn(policy, x0_batch, T_STEPS)
@@ -744,20 +525,15 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
 # =====================================================================
 
 @torch.no_grad()
-def evaluate(policy, test_pts, quaternions=False, device="cpu"):
+def evaluate(policy, test_pts, device="cpu"):
     """Evalue le NN et le LQR sur des positions de test."""
 
     x0 = make_x0_batch(test_pts, device=device)
 
-    # --- NN ---
-    if quaternions:
-        X_nn, U_nn = rollout_quat(policy, x0, T_STEPS, n_substeps=PYB_STEPS_PER_CTRL)
-        eval_label = f"non-lineaire + quaternions, {PYB_STEPS_PER_CTRL} sous-pas"
-    else:
-        X_nn, U_nn = rollout(policy, x0, T_STEPS, n_substeps=PYB_STEPS_PER_CTRL)
-        eval_label = f"non-lineaire Euler, {PYB_STEPS_PER_CTRL} sous-pas"
+    # --- NN (dynamique non-lineaire, 5 sous-pas = pybullet exact) ---
+    X_nn, U_nn = rollout(policy, x0, T_STEPS, n_substeps=PYB_STEPS_PER_CTRL)
     err_nn = X_nn[:, -1, [0, 2, 4]].norm(dim=1)
-    print(f"\n[Eval] {len(test_pts)} test points ({eval_label}):")
+    print(f"\n[Eval] {len(test_pts)} test points (non-lineaire, {PYB_STEPS_PER_CTRL} sous-pas):")
     print(f"  NN   terminal error  mean={err_nn.mean().item():.5f} m  "
           f"max={err_nn.max().item():.5f} m")
 
@@ -792,11 +568,8 @@ def evaluate(policy, test_pts, quaternions=False, device="cpu"):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--linear", action="store_true",
-                      help="Use linearized dynamics (faster, less accurate)")
-    mode.add_argument("--quaternions", action="store_true",
-                      help="Use PyBullet-style quaternion dynamics during training/eval")
+    parser.add_argument("--linear", action="store_true",
+                        help="Use linearized dynamics (faster, less accurate)")
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=64)
@@ -807,20 +580,19 @@ if __name__ == "__main__":
 
     policy = train(epochs=args.epochs, lr=args.lr, hidden=args.hidden,
                    terminal_weight=10.0, half_side=0.3,
-                   linearized=args.linear, quaternions=args.quaternions, device=device)
+                   linearized=args.linear, device=device)
 
     # Test sur 20 points aleatoires
     rng = np.random.default_rng(42)
     test_pts = [(rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3)) for _ in range(20)]
-    evaluate(policy, test_pts, quaternions=args.quaternions, device=device)
+    evaluate(policy, test_pts, device=device)
 
     # Sauvegarde
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    mode_suffix = "_linear" if args.linear else ("_quat" if args.quaternions else "")
-    path_full = os.path.join(out_dir, f"trained_policy_cf2x{mode_suffix}.pt")
-    path_dict = os.path.join(out_dir, f"trained_weights_cf2x{mode_suffix}.pt")
+    path_full = os.path.join(out_dir, "trained_policy_cf2x.pt")
+    path_dict = os.path.join(out_dir, "trained_weights_cf2x.pt")
 
     torch.save(policy.cpu(), path_full)
     torch.save({
@@ -833,7 +605,6 @@ if __name__ == "__main__":
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
         "MAX_RPM": MAX_RPM,
         "linearized": args.linear,
-        "quaternions": args.quaternions,
     }, path_dict)
 
     print(f"\n[Saved] {path_full}")
