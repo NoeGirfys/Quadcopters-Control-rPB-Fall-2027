@@ -13,9 +13,10 @@ Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
 The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
-    python train_nn_cf2x.py              # nonlinear dynamics (default)
-    python train_nn_cf2x.py --linear     # linearized dynamics (faster)
+    python train_nn_cf2x.py                          # nonlinear dynamics (default)
+    python train_nn_cf2x.py --linear                 # linearized dynamics (faster)
     python train_nn_cf2x.py --epochs 3000 --lr 5e-4
+    python train_nn_cf2x.py --tag exp1
 """
 
 import numpy as np
@@ -561,6 +562,17 @@ def evaluate(policy, test_pts, device="cpu"):
     return X_nn, U_nn
 
 
+def build_run_name(linearized, epochs, lr, hidden, tag=""):
+    """Build a descriptive run name for saved models/checkpoints."""
+    dyn = "linear" if linearized else "nonlinear"
+    lr_str = f"{lr:.0e}" if lr < 1e-2 else str(lr).replace(".", "p")
+    name = f"cf2x_{dyn}_h{hidden}_ep{epochs}_lr{lr_str}"
+    if tag:
+        safe_tag = str(tag).replace(" ", "_")
+        name += f"_{safe_tag}"
+    return name
+
+
 # =====================================================================
 # 8. Main
 # =====================================================================
@@ -573,6 +585,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=2000)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=64)
+    parser.add_argument("--tag", type=str, default="",
+                        help="Optional suffix added to saved filenames")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -591,8 +605,9 @@ if __name__ == "__main__":
 
     # Sauvegarde
     out_dir = os.path.dirname(os.path.abspath(__file__))
-    path_full = os.path.join(out_dir, "trained_policy_cf2x.pt")
-    path_dict = os.path.join(out_dir, "trained_weights_cf2x.pt")
+    run_name = build_run_name(args.linear, args.epochs, args.lr, args.hidden, args.tag)
+    path_full = os.path.join(out_dir, f"trained_policy_{run_name}.pt")
+    path_dict = os.path.join(out_dir, f"trained_weights_{run_name}.pt")
 
     torch.save(policy.cpu(), path_full)
     torch.save({
@@ -605,8 +620,13 @@ if __name__ == "__main__":
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
         "MAX_RPM": MAX_RPM,
         "linearized": args.linear,
+        "run_name": run_name,
+        "train_dynamics": "linear" if args.linear else "nonlinear",
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "target_definition": "error state regulated to origin",
     }, path_dict)
 
     print(f"\n[Saved] {path_full}")
     print(f"[Saved] {path_dict}")
-    print("\nDone! Run  validate_nn_pybullet.py  to test in pybullet-drones.")
+    print("\nDone! Run  validate_nn_pybullet.py --weights <checkpoint_name>  to test in pybullet-drones.")
