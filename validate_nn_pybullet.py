@@ -395,10 +395,10 @@ if __name__ == "__main__":
     # ── Test offsets from target (same cube as training ±0.3m) ──
     test_offsets = [
         (0.0,  0.0,  0.0),     # already at target (trivial)
-        (0.3,  0.3,  0.3),     # cube corner
-        (-0.3, -0.3, -0.3),    # opposite corner
-        (0.3, -0.3,  0.0),     # edge
-        (0.0,  0.0,  0.3),     # above target
+        (0.5,  0.1,  0.05),     # cube corner
+        (-0.28, -0.1, -0.2),    # opposite corner
+        (0.05, -0.38,  0.0),     # edge
+        (0.0,  0.0,  0.53),     # above target
         (-0.2,  0.1, -0.15),   # random
     ]
 
