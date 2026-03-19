@@ -595,29 +595,30 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 ))
 
                 # Step 4 — Physical torques -> angular accelerations [rad/s²]
-                # Newton-Euler: tau = J * alpha  =>  alpha = tau / J
+                # Full Newton-Euler: tau = J*alpha + omega x (J*omega)
+                # => alpha = J^-1 * (tau - omega x (J*omega))
                 # J is diagonal for the symmetric CF2X.
-                alpha_roll  = tau_roll_Nm  / IXX                    # [rad/s²]
-                alpha_pitch = tau_pitch_Nm / IYY                    # [rad/s²]
-                alpha_yaw   = tau_yaw_Nm   / IZZ                    # [rad/s²]
-
-                # Step 5 — Angular accelerations -> rate setpoints [rad/s]
-                # One Euler integration step: omega_des = omega_cur + alpha*dt
-                # The firmware rate controller will then track omega_des.
                 cur_rates = np.radians([_real_state['gx'],
                                         _real_state['gy'],
                                         _real_state['gz']])          # [rad/s]
+                J     = np.diag([IXX, IYY, IZZ])
+                tau   = np.array([tau_roll_Nm, tau_pitch_Nm, tau_yaw_Nm])
+                omega = cur_rates
+                gyro  = np.cross(omega, J @ omega)                  # [N·m]
+                alpha = np.linalg.solve(J, tau - gyro)              # [rad/s²]
+                alpha_roll, alpha_pitch, alpha_yaw = alpha
+ 
+                # Step 5 — Angular accelerations -> rate setpoints [rad/s]
+                # One Euler integration step: omega_des = omega_cur + alpha*dt
+                # The firmware rate controller will then track omega_des.
                 rollrate_rps  = cur_rates[0] + alpha_roll  * CTRL_TIMESTEP
                 pitchrate_rps = cur_rates[1] + alpha_pitch * CTRL_TIMESTEP
                 yawrate_rps   = cur_rates[2] + alpha_yaw   * CTRL_TIMESTEP
 
                 # [rad/s] -> [deg/s] with safety clipping
-                rollrate_dps  = float(np.clip(np.degrees(rollrate_rps),
-                                              -MAX_RATE_DPS, MAX_RATE_DPS))
-                pitchrate_dps = float(np.clip(np.degrees(pitchrate_rps),
-                                              -MAX_RATE_DPS, MAX_RATE_DPS))
-                yawrate_dps   = float(np.clip(np.degrees(yawrate_rps),
-                                              -MAX_RATE_DPS, MAX_RATE_DPS))
+                rollrate_dps  = float(np.clip(np.degrees(rollrate_rps),  -MAX_RATE_DPS, MAX_RATE_DPS))
+                pitchrate_dps = float(np.clip(np.degrees(pitchrate_rps), -MAX_RATE_DPS, MAX_RATE_DPS))
+                yawrate_dps   = float(np.clip(np.degrees(yawrate_rps),   -MAX_RATE_DPS, MAX_RATE_DPS))
 
                 cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps,
                                               yawrate_dps, thrust_cf)
