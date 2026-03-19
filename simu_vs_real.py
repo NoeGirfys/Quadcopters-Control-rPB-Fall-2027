@@ -48,22 +48,9 @@ PERIOD     = 10     # circle period          [s]
 TAKEOFF_SEC  = 3.0  # duration of climb from 0 to H [s]
 LANDING_SEC  = 3.0  # duration of descent from H to 0 [s]
 
-# ── PWM <-> RPM (from DSLPIDControl) ──────────────────────────────────────────
-PWM2RPM_SCALE = 0.2685
-PWM2RPM_CONST = 4070.3
-MIN_PWM       = 20000
-MAX_PWM       = 65535
-
 # ── cflib thrust range ─────────────────────────────────────────────────────────
 CF_THRUST_MIN = 10001
 CF_THRUST_MAX = 60000
-
-# ── CF2X allocation matrix  pwm = ALLOC @ [T, tau_r, tau_p, tau_y] ────────────
-ALLOC      = np.array([[1, -.5, -.5, -1],
-                        [1, -.5,  .5,  1],
-                        [1,  .5,  .5, -1],
-                        [1,  .5, -.5,  1]], dtype=float)
-ALLOC_PINV = np.linalg.pinv(ALLOC)
 
 # ── CF2X physical parameters (from cf2x.urdf) ────────────────────────────────
 KF    = 3.16e-10   # thrust coefficient     [N / RPM^2]  (also used for HOVER_RPM)
@@ -74,6 +61,7 @@ IYY   = 1.4e-5     # pitch inertia          [kg·m²]
 IZZ   = 2.17e-5    # yaw   inertia          [kg·m²]
 MASS  = 0.027      # vehicle mass           [kg]
 G     = 9.8        # gravitational accel    [m/s²]
+T2W   = 2.25
 
 MAX_RATE_DPS = 200.0   # safety clip for body rate setpoints [deg/s]
 
@@ -581,41 +569,44 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                     target_rpy=np.zeros(3),
                 )
 
-                # RPM -> PWM
-                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE, MIN_PWM, MAX_PWM)
+                # Step 1 — RPM -> forces per motor [N]
+                # F_i = KF * rpm_i^2
+                forces = rpms**2 * KF                         # (4,) [N]
 
-                # PWM -> [T_pwm, tau_roll, tau_pitch, tau_yaw]
-                # tau_* are dimensionless PWM mixer units at this point.
-                T_pwm, tau_r, tau_p, tau_y = ALLOC_PINV @ pwm
+                # Step 2 — Forces -> physical torques [N·m]
+                # CF2X geometry: motors at 45 deg, arm projected = L/sqrt(2)
+                # Motor layout (top view):
+                #   0(CCW) 1(CW)
+                #   3(CW)  2(CCW)
+                L_eff = ARM_L / np.sqrt(2)
+                tau_roll_Nm  = (forces[0] + forces[1]
+                                - forces[2] - forces[3]) * L_eff   # [N·m]
+                tau_pitch_Nm = (-forces[0] + forces[1]
+                                + forces[2] - forces[3]) * L_eff   # [N·m]
+                tau_yaw_Nm   = (- rpms[0]**2 + rpms[1]**2
+                                - rpms[2]**2 + rpms[3]**2) * KM    # [N·m]
 
-                # Collective thrust -> cflib integer [10001, 60000]
+                # Step 3 — Collective thrust -> cflib integer [10001, 60000]
+                F_total = float(np.sum(forces))                     # [N]
+                F_hover = MASS * G                                  # [N]
                 thrust_cf = int(np.clip(
-                    CF_THRUST_MIN + (T_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
-                                  * (CF_THRUST_MAX - CF_THRUST_MIN),
+                    CF_THRUST_MIN + (F_total - 0.) / (T2W * F_hover - 0.) * (CF_THRUST_MAX - CF_THRUST_MIN),
                     CF_THRUST_MIN, CF_THRUST_MAX
                 ))
 
-                # Step 1 — PWM mixer units -> physical torques [N·m]
-                # The CF2X mixer sums/differences PWM values; each unit
-                # corresponds to a force KF*pwm at each motor at arm ARM_L,
-                # or a reaction torque KM*pwm for yaw.
-                tau_roll_Nm  = tau_r * KF * ARM_L  # [N·m]
-                tau_pitch_Nm = tau_p * KF * ARM_L  # [N·m]
-                tau_yaw_Nm   = tau_y * KM           # [N·m]
-
-                # Step 2 — Physical torques -> angular accelerations [rad/s²]
+                # Step 4 — Physical torques -> angular accelerations [rad/s²]
                 # Newton-Euler: tau = J * alpha  =>  alpha = tau / J
                 # J is diagonal for the symmetric CF2X.
-                alpha_roll  = tau_roll_Nm  / IXX   # [rad/s²]
-                alpha_pitch = tau_pitch_Nm / IYY   # [rad/s²]
-                alpha_yaw   = tau_yaw_Nm   / IZZ   # [rad/s²]
+                alpha_roll  = tau_roll_Nm  / IXX                    # [rad/s²]
+                alpha_pitch = tau_pitch_Nm / IYY                    # [rad/s²]
+                alpha_yaw   = tau_yaw_Nm   / IZZ                    # [rad/s²]
 
-                # Step 3 — Angular accelerations -> rate setpoints [rad/s]
+                # Step 5 — Angular accelerations -> rate setpoints [rad/s]
                 # One Euler integration step: omega_des = omega_cur + alpha*dt
                 # The firmware rate controller will then track omega_des.
                 cur_rates = np.radians([_real_state['gx'],
                                         _real_state['gy'],
-                                        _real_state['gz']])  # [rad/s]
+                                        _real_state['gz']])          # [rad/s]
                 rollrate_rps  = cur_rates[0] + alpha_roll  * CTRL_TIMESTEP
                 pitchrate_rps = cur_rates[1] + alpha_pitch * CTRL_TIMESTEP
                 yawrate_rps   = cur_rates[2] + alpha_yaw   * CTRL_TIMESTEP
