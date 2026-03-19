@@ -65,15 +65,19 @@ ALLOC      = np.array([[1, -.5, -.5, -1],
                         [1,  .5, -.5,  1]], dtype=float)
 ALLOC_PINV = np.linalg.pinv(ALLOC)
 
-# empirical torque -> deg / deg/s scale factors  (tune on your hardware)
-ROLL_SCALE  = 0.5
-PITCH_SCALE = 0.5
-YAW_SCALE   = 0.5
+# ── CF2X physical parameters (from cf2x.urdf) ────────────────────────────────
+KF    = 3.16e-10   # thrust coefficient     [N / RPM^2]  (also used for HOVER_RPM)
+KM    = 7.94e-12   # torque coefficient     [N·m / RPM^2]
+ARM_L = 0.0397     # motor arm length       [m]
+IXX   = 1.4e-5     # roll  inertia          [kg·m²]
+IYY   = 1.4e-5     # pitch inertia          [kg·m²]
+IZZ   = 2.17e-5    # yaw   inertia          [kg·m²]
+MASS  = 0.027      # vehicle mass           [kg]
+G     = 9.8        # gravitational accel    [m/s²]
+
+MAX_RATE_DPS = 200.0   # safety clip for body rate setpoints [deg/s]
 
 # hover RPM placeholder used when building obs in real mode
-KF        = 3.16e-10
-MASS      = 0.027
-G         = 9.8
 HOVER_RPM = math.sqrt((MASS * G) / (4 * KF))
 
 
@@ -123,18 +127,18 @@ def start_logging(cf):
     """Open two 6-float log blocks at 50 Hz (max packet = 26 bytes)."""
     from cflib.crazyflie.log import LogConfig
 
-    lc1 = LogConfig('StatePos', period_in_ms=20)
+    lc1 = LogConfig('StatePos', period_in_ms=20) # create a log block named 'StatePos' that sends data every 20 ms (50 Hz)
     for v in ['stateEstimate.x', 'stateEstimate.y', 'stateEstimate.z',
               'stateEstimate.vx', 'stateEstimate.vy', 'stateEstimate.vz']:
-        lc1.add_variable(v, 'float')
-    lc1.data_received_cb.add_callback(_state_cb)
-    cf.cf.log.add_config(lc1)
-    lc1.start()
+        lc1.add_variable(v, 'float') # add position and velocity variables to the log block
+    lc1.data_received_cb.add_callback(_state_cb) # each time a log packet is received, _state_cb is called to update _real_state
+    cf.cf.log.add_config(lc1) # add the log block to the Crazyflie log subsystem that checks that everything is in order
+    lc1.start() # start the log block, which begins the periodic logging and calls _state_cb every 20 ms with the latest state estimate and gyro data
 
-    lc2 = LogConfig('StateAtt', period_in_ms=20)
+    lc2 = LogConfig('StateAtt', period_in_ms=20) # create a log block named 'StateAtt' that sends data every 20 ms (50 Hz)
     for v in ['stateEstimate.roll', 'stateEstimate.pitch', 'stateEstimate.yaw',
               'gyro.x', 'gyro.y', 'gyro.z']:
-        lc2.add_variable(v, 'float')
+        lc2.add_variable(v, 'float') # add attitude and angular velocity variables to the log block
     lc2.data_received_cb.add_callback(_state_cb)
     cf.cf.log.add_config(lc2)
     lc2.start()
@@ -485,6 +489,17 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
 
         ctrl.reset()
 
+        # ── Switch firmware to rate mode ──────────────────────────────────────
+        # By default send_setpoint interprets roll/pitch as absolute angles and
+        # routes them through the firmware attitude PID, which would add a
+        # redundant controller on top of our own PID. Setting stabMode* = 0
+        # bypasses the attitude PID: the firmware only runs its fast gyro rate
+        # controller (~1 kHz) to track the body-rate setpoints we send.
+        cf.cf.param.set_value('flightmode.stabModeRoll',  '0')
+        cf.cf.param.set_value('flightmode.stabModePitch', '0')
+        cf.cf.param.set_value('flightmode.stabModeYaw',   '0')
+        print('[INFO] Rate mode enabled')
+
         # ── Circle — stop after exactly one full lap ───────────────────────────
         print('[CIRCLE-REAL] Starting circle ...')
         START = time.time()
@@ -508,22 +523,51 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE,
                               MIN_PWM, MAX_PWM)
 
-                # PWM -> [T, tau_roll, tau_pitch, tau_yaw]
+                # PWM -> [T_pwm, tau_roll, tau_pitch, tau_yaw]
+                # tau_* are dimensionless PWM mixer units at this point.
                 T_pwm, tau_r, tau_p, tau_y = ALLOC_PINV @ pwm
 
-                # Collective thrust -> cflib integer
+                # Collective thrust -> cflib integer [10001, 60000]
                 thrust_cf = int(np.clip(
                     CF_THRUST_MIN + (T_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
                                   * (CF_THRUST_MAX - CF_THRUST_MIN),
                     CF_THRUST_MIN, CF_THRUST_MAX
                 ))
 
-                # Torques -> roll [deg], pitch [deg], yawrate [deg/s]
-                roll_deg    = float(np.clip(tau_r * ROLL_SCALE,  -30,  30))
-                pitch_deg   = float(np.clip(tau_p * PITCH_SCALE, -30,  30))
-                yawrate_dps = float(np.clip(tau_y * YAW_SCALE,  -200, 200))
+                # Step 1 — PWM mixer units -> physical torques [N·m]
+                # The CF2X mixer sums/differences PWM values; each unit
+                # corresponds to a force KF*pwm at each motor at arm ARM_L,
+                # or a reaction torque KM*pwm for yaw.
+                tau_roll_Nm  = tau_r * KF * ARM_L  # [N·m]
+                tau_pitch_Nm = tau_p * KF * ARM_L  # [N·m]
+                tau_yaw_Nm   = tau_y * KM           # [N·m]
 
-                cf.cf.commander.send_setpoint(roll_deg, pitch_deg,
+                # Step 2 — Physical torques -> angular accelerations [rad/s²]
+                # Newton-Euler: tau = J * alpha  =>  alpha = tau / J
+                # J is diagonal for the symmetric CF2X.
+                alpha_roll  = tau_roll_Nm  / IXX   # [rad/s²]
+                alpha_pitch = tau_pitch_Nm / IYY   # [rad/s²]
+                alpha_yaw   = tau_yaw_Nm   / IZZ   # [rad/s²]
+
+                # Step 3 — Angular accelerations -> rate setpoints [rad/s]
+                # One Euler integration step: omega_des = omega_cur + alpha*dt
+                # The firmware rate controller will then track omega_des.
+                cur_rates = np.radians([_real_state['gx'],
+                                        _real_state['gy'],
+                                        _real_state['gz']])  # [rad/s]
+                rollrate_rps  = cur_rates[0] + alpha_roll  * CTRL_TIMESTEP
+                pitchrate_rps = cur_rates[1] + alpha_pitch * CTRL_TIMESTEP
+                yawrate_rps   = cur_rates[2] + alpha_yaw   * CTRL_TIMESTEP
+
+                # [rad/s] -> [deg/s] with safety clipping
+                rollrate_dps  = float(np.clip(np.degrees(rollrate_rps),
+                                              -MAX_RATE_DPS, MAX_RATE_DPS))
+                pitchrate_dps = float(np.clip(np.degrees(pitchrate_rps),
+                                              -MAX_RATE_DPS, MAX_RATE_DPS))
+                yawrate_dps   = float(np.clip(np.degrees(yawrate_rps),
+                                              -MAX_RATE_DPS, MAX_RATE_DPS))
+
+                cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps,
                                               yawrate_dps, thrust_cf)
 
                 logger.log(drone=0,
