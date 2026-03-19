@@ -463,11 +463,28 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         cf_ctx = SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache'))
         cf = cf_ctx.__enter__()
         print(f'[INFO] Connected on {uri}')
+        """
+        The two followings are equivalents : 
+        with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as cf:
+            # cf is connected here
+            cf.cf.commander.send_setpoint(...)
+
+        cf_ctx = SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache'))
+        cf = cf_ctx.__enter__()   # equivalent to the "as cf" of the with
+        # here cf is connected
+        cf.cf.commander.send_setpoint(...)
+        cf_ctx.__exit__(None, None, None)  # equivalent to exiting the with block, which disconnects cf
+
+        Here we chose to connect and disconnect synchronously so at the end we control perfectly the order : stop motors, stop logs, disconnect.
+        """
 
         # ── Check Flow Deck ───────────────────────────────────────────────────
-        cf.cf.param.add_update_callback(group='deck', name='bcFlow2',
-                                        cb=_deck_cb)
-        time.sleep(1)
+        cf.cf.param.add_update_callback(group='deck', name='bcFlow2', cb=_deck_cb)
+        # deck.bcFlow2 is a firmware setting (not a log variable). Its value is 1 if the Flow Deck v2 is physically connected
+        # and detected at startup; otherwise, it is 0.
+        # add_update_callback triggers the radio request and store the callback for when we will receive the info from the drone
+        # and when it happens it calls _deck_cb, which happens shortly after connection. If the value is 1,
+        # _deck_cb sets deck_event, otherwise deck_event remains unset and we can detect that the Flow Deck v2 is not present.
         if not deck_event.wait(timeout=5):
             cf_ctx.__exit__(None, None, None)
             raise RuntimeError('Flow Deck v2 not detected!')
@@ -475,6 +492,51 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
 
         # ── Start logging ─────────────────────────────────────────────────────
         log_cfgs = start_logging(cf)
+        """
+        _real_state = dict(x=0., y=0., z=0.,
+                   vx=0., vy=0., vz=0.,
+                   roll=0., pitch=0., yaw=0.,
+                   gx=0., gy=0., gz=0.)
+        _state_ready = Event()
+
+
+        def _state_cb(timestamp, data, logconf):
+            _real_state['x']     = data.get('stateEstimate.x',     0.)
+            _real_state['y']     = data.get('stateEstimate.y',     0.)
+            _real_state['z']     = data.get('stateEstimate.z',     0.)
+            _real_state['vx']    = data.get('stateEstimate.vx',    0.)
+            _real_state['vy']    = data.get('stateEstimate.vy',    0.)
+            _real_state['vz']    = data.get('stateEstimate.vz',    0.)
+            _real_state['roll']  = data.get('stateEstimate.roll',  0.)
+            _real_state['pitch'] = data.get('stateEstimate.pitch', 0.)
+            _real_state['yaw']   = data.get('stateEstimate.yaw',   0.)
+            _real_state['gx']    = data.get('gyro.x',              0.)
+            _real_state['gy']    = data.get('gyro.y',              0.)
+            _real_state['gz']    = data.get('gyro.z',              0.)
+            _state_ready.set()
+            
+        def start_logging(cf):
+            #Open two 6-float log blocks at 50 Hz (max packet = 26 bytes).
+            from cflib.crazyflie.log import LogConfig
+
+            lc1 = LogConfig('StatePos', period_in_ms=20) # create a log block named 'StatePos' that sends data every 20 ms (50 Hz)
+            for v in ['stateEstimate.x', 'stateEstimate.y', 'stateEstimate.z',
+                    'stateEstimate.vx', 'stateEstimate.vy', 'stateEstimate.vz']:
+                lc1.add_variable(v, 'float') # add position and velocity variables to the log block
+            lc1.data_received_cb.add_callback(_state_cb) # each time a log packet is received, _state_cb is called to update _real_state
+            cf.cf.log.add_config(lc1) # add the log block to the Crazyflie log subsystem that checks that everything is in order
+            lc1.start() # start the log block, which begins the periodic logging and calls _state_cb every 20 ms with the latest state estimate and gyro data
+
+            lc2 = LogConfig('StateAtt', period_in_ms=20) # create a log block named 'StateAtt' that sends data every 20 ms (50 Hz)
+            for v in ['stateEstimate.roll', 'stateEstimate.pitch', 'stateEstimate.yaw',
+                    'gyro.x', 'gyro.y', 'gyro.z']:
+                lc2.add_variable(v, 'float') # add attitude and angular velocity variables to the log block
+            lc2.data_received_cb.add_callback(_state_cb)
+            cf.cf.log.add_config(lc2)
+            lc2.start()
+
+            return [lc1, lc2]
+        """
         print('[INFO] Waiting for state estimator ...')
         if not _state_ready.wait(timeout=10):
             cf_ctx.__exit__(None, None, None)
@@ -482,7 +544,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         print(f'[INFO] State ready  z = {_real_state["z"]:.3f} m')
 
         # ── Arm + takeoff ─────────────────────────────────────────────────────
-        cf.cf.platform.send_arming_request(True)
+        cf.cf.platform.send_arming_request(True) # mandatory arming before sending any setpoint, otherwise the firmware will ignore them
         time.sleep(1.0)
         step_offset = takeoff_real(cf)
         time.sleep(0.5)
@@ -520,8 +582,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 )
 
                 # RPM -> PWM
-                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE,
-                              MIN_PWM, MAX_PWM)
+                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE, MIN_PWM, MAX_PWM)
 
                 # PWM -> [T_pwm, tau_roll, tau_pitch, tau_yaw]
                 # tau_* are dimensionless PWM mixer units at this point.
