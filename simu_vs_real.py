@@ -85,11 +85,11 @@ def build_circle_waypoints():
     # Circle centred at origin in x-y, altitude offset applied separately
     NUM_WP = CONTROL_FREQ_HZ * PERIOD
     wps = np.zeros((NUM_WP, 3))
-    # Starting point on circle: (R, 0) so the drone starts directly in front
+    # Starting point on circle: (R, -R) so the top of the circle is the origin
     for i in range(NUM_WP):
         angle = (i / NUM_WP) * 2 * math.pi
         wps[i, 0] = R * math.cos(angle)
-        wps[i, 1] = R * math.sin(angle) - R   # centred so start = (R, 0)
+        wps[i, 1] = R * math.sin(angle) - R   # starts at (R, -R)
     return wps
 
 
@@ -310,11 +310,11 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         gui: bool = True, plot: bool = True):
 
     # ── Circle waypoints ──────────────────────────────────────────────────────
-    circle_wps = build_circle_waypoints()   # (NUM_WP, 3)  xy only, z unused
+    circle_wps = build_circle_waypoints()   # (NUM_WP, 3)  xy only, starts at (R, -R), z unused
     NUM_WP     = circle_wps.shape[0]
     wp_counter = 0
 
-    # Starting xy position = first waypoint = (R, 0)
+    # Starting xy position = first waypoint = (R, -R)
     start_xy = circle_wps[0, :2].copy()
 
     # ── Logger ────────────────────────────────────────────────────────────────
@@ -341,7 +341,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
             initial_xyzs=INIT_XYZS,
             initial_rpys=INIT_RPYS,
             physics=Physics('pyb'),
-            neighbourhood_radius=10,
+            neighbourhood_radius=1,
             pyb_freq=SIMULATION_FREQ_HZ,
             ctrl_freq=CONTROL_FREQ_HZ,
             gui=gui,
