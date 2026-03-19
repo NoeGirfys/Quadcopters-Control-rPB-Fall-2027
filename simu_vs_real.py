@@ -253,9 +253,12 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
 
     print('[TAKEOFF-SIM] Climbing ...')
     while True:
-        rpms, _, _ = ctrl.computeControlFromState(
+        rpms, _, _ = ctrl.computeControl(
             control_timestep=CTRL_TIMESTEP,
-            state=obs[0],
+            cur_pos=obs[0][0:3],
+            cur_quat=obs[0][3:7],
+            cur_vel=obs[0][10:13],
+            cur_ang_vel=obs[0][13:16],
             target_pos=target,
             target_rpy=target_rpy,
         )
@@ -359,9 +362,12 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         START = time.time()
 
         for i in range(total_steps):
-            rpms, _, _ = ctrl.computeControlFromState(
+            rpms, _, _ = ctrl.computeControl(
                 control_timestep=CTRL_TIMESTEP,
-                state=obs,
+                cur_pos=obs[0:3],
+                cur_quat=obs[3:7],
+                cur_vel=obs[10:13],
+                cur_ang_vel=obs[13:16],
                 target_pos=np.hstack([circle_wps[wp_counter, :2], H]),
                 target_rpy=np.zeros(3),
             )
@@ -435,9 +441,12 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
             for i in range(total_steps):
                 obs = real_state_to_obs()
 
-                rpms, _, _ = ctrl.computeControlFromState(
+                rpms, _, _ = ctrl.computeControl(
                     control_timestep=CTRL_TIMESTEP,
-                    state=obs,
+                    cur_pos=obs[0:3],
+                    cur_quat=obs[3:7],
+                    cur_vel=obs[10:13],
+                    cur_ang_vel=obs[13:16],
                     target_pos=np.hstack([circle_wps[wp_counter, :2], H]),
                     target_rpy=np.zeros(3),
                 )
