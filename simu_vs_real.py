@@ -175,53 +175,6 @@ def real_state_to_obs() -> np.ndarray:
     ])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ACTION DISPATCH — the single toggle point
-# ══════════════════════════════════════════════════════════════════════════════
-
-def apply_action(rpms: np.ndarray, env, cf, real: bool) -> np.ndarray:
-    """Dispatch RPMs to PyBullet (sim) or cflib (real).
-
-    Parameters
-    ----------
-    rpms : (4,) motor RPMs from DSLPIDControl
-    env  : CtrlAviary | None   (None in real mode)
-    cf   : SyncCrazyflie | None
-    real : toggle
-
-    Returns
-    -------
-    obs : (20,) state observation
-    """
-    if not real:
-        # ── SIMULATION ────────────────────────────────────────────────────────
-        obs, _, _, _, _ = env.step(rpms.reshape(1, 4))
-        return obs[0]
-
-    else:
-        # ── REAL DRONE ────────────────────────────────────────────────────────
-
-        # RPM -> PWM
-        pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE, MIN_PWM, MAX_PWM)
-
-        # PWM -> [T, tau_roll, tau_pitch, tau_yaw]
-        T_pwm, tau_r, tau_p, tau_y = ALLOC_PINV @ pwm
-
-        # Collective thrust -> cflib integer
-        thrust_cf = int(np.clip(
-            CF_THRUST_MIN + (T_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
-                          * (CF_THRUST_MAX - CF_THRUST_MIN),
-            CF_THRUST_MIN, CF_THRUST_MAX
-        ))
-
-        # Torques -> roll [deg], pitch [deg], yawrate [deg/s]
-        roll_deg    = float(np.clip(tau_r * ROLL_SCALE,  -30,  30))
-        pitch_deg   = float(np.clip(tau_p * PITCH_SCALE, -30,  30))
-        yawrate_dps = float(np.clip(tau_y * YAW_SCALE,  -200, 200))
-
-        cf.cf.commander.send_setpoint(roll_deg, pitch_deg, yawrate_dps, thrust_cf)
-        return real_state_to_obs()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TAKEOFF
@@ -457,8 +410,34 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                     target_rpy=np.zeros(3),
                 )
 
-                # ── THE TOGGLE IS HERE ────────────────────────────────────────
-                obs = apply_action(rpms, env=None, cf=cf, real=True)
+                # ──────────────── APPLY ACTION ──────────────────────────
+                ##########################################################
+                ##########################################################
+
+                # RPM -> PWM
+                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE, MIN_PWM, MAX_PWM)
+
+                # PWM -> [T, tau_roll, tau_pitch, tau_yaw]
+                T_pwm, tau_r, tau_p, tau_y = ALLOC_PINV @ pwm
+
+                # Collective thrust -> cflib integer
+                thrust_cf = int(np.clip(
+                    CF_THRUST_MIN + (T_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
+                                * (CF_THRUST_MAX - CF_THRUST_MIN),
+                    CF_THRUST_MIN, CF_THRUST_MAX
+                ))
+
+                # Torques -> roll [deg], pitch [deg], yawrate [deg/s]
+                roll_deg    = float(np.clip(tau_r * ROLL_SCALE,  -30,  30))
+                pitch_deg   = float(np.clip(tau_p * PITCH_SCALE, -30,  30))
+                yawrate_dps = float(np.clip(tau_y * YAW_SCALE,  -200, 200))
+
+                cf.cf.commander.send_setpoint(roll_deg, pitch_deg, yawrate_dps, thrust_cf)
+
+                obs = real_state_to_obs()
+
+                ##########################################################
+                ##########################################################
                 # ─────────────────────────────────────────────────────────────
 
                 wp_counter = (wp_counter + 1) % NUM_WP
