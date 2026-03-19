@@ -239,7 +239,7 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
 
     Returns
     -------
-    obs        : (20,) last observation after takeoff
+    obs        : (1, 20) last observation after takeoff
     step_count : number of steps taken (for timestamp continuity)
     """
     from gym_pybullet_drones.utils.utils import sync
@@ -247,7 +247,7 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
     target = np.hstack([start_xy, H])
     target_rpy = np.zeros(3)
 
-    obs, _, _, _, _ = env.step(np.zeros((1, 4)))
+    obs, _, _, _, _ = env.step(np.zeros((1, 4))) # obs is (nb_drones, 20) but nb_drones=1 so we take obs[0] for the single drone
     step = 0
     START = time.time()
 
@@ -268,6 +268,9 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
                    control=np.hstack([target, target_rpy, np.zeros(6)]))
         env.render()
         sync(step, START, CTRL_TIMESTEP)
+        # keeps the simulation synced to real time,
+        # it waits until the next control timestep if the loop is running faster than real time.
+        # if we look into the details, it sleeps only one step out of two with the current parameters.
         step += 1
 
         current_z = obs[0][2]
@@ -280,7 +283,7 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
             break
 
     print(f'[TAKEOFF-SIM] Reached z = {obs[0][2]:.3f} m')
-    return obs[0], step
+    return obs, step
 
 
 def takeoff_real(cf) -> int:
@@ -355,7 +358,11 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
 
         # ── Takeoff ───────────────────────────────────────────────────────────
         obs, step_offset = takeoff_sim(env, ctrl, logger, start_xy=start_xy)
-        ctrl.reset()
+        ctrl.reset() # ctrl.last_rpy = 0 and ctrl.pos_e = 0 and especially ctrl.integral_pos_e = 0 after reset,
+        # which cleans up the transition between takeoff and circle, otherwise the PID would have accumulated errors
+        # during takeoff and would apply a nonzero control at the first step of the circle, which would make the drone
+        # deviate from the ideal trajectory right from the start. With the reset, the PID starts fresh at the beginning
+        # of the circle, which is what we want for a clean comparison between sim and real.
 
         # ── Circle ────────────────────────────────────────────────────────────
         total_steps = int(CIRCLE_SEC * CONTROL_FREQ_HZ)
@@ -364,22 +371,21 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         for i in range(total_steps):
             rpms, _, _ = ctrl.computeControl(
                 control_timestep=CTRL_TIMESTEP,
-                cur_pos=obs[0:3],
-                cur_quat=obs[3:7],
-                cur_vel=obs[10:13],
-                cur_ang_vel=obs[13:16],
+                cur_pos=obs[0][0:3],
+                cur_quat=obs[0][3:7],
+                cur_vel=obs[0][10:13],
+                cur_ang_vel=obs[0][13:16],
                 target_pos=np.hstack([circle_wps[wp_counter, :2], H]),
                 target_rpy=np.zeros(3),
             )
 
-            # ── THE TOGGLE IS HERE ────────────────────────────────────────────
-            obs = apply_action(rpms, env, cf=None, real=False)
+            obs, _, _, _, _ = env.step(rpms.reshape(1, 4))
             # ─────────────────────────────────────────────────────────────────
 
             wp_counter = (wp_counter + 1) % NUM_WP
             logger.log(drone=0,
                        timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
-                       state=obs,
+                       state=obs[0],
                        control=np.hstack([circle_wps[wp_counter, :2], H,
                                           np.zeros(9)]))
             env.render()
