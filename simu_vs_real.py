@@ -2,10 +2,11 @@
 
 Both modes share the same sequence:
     1. Takeoff  : climb from z=0 to H
-    2. Circle   : fly a horizontal circle of radius R at height H
+    2. Circle   : fly one full horizontal circle of radius R at height H
+    3. Landing  : descend from H back to z=0
 
-The toggle is at the lowest possible level: inside apply_action(), the single
-point where computed RPMs are dispatched to either PyBullet or cflib.
+The RPM dispatch to either PyBullet or cflib is done directly in the
+respective sim/real loops.
 In real mode, PyBullet is never instantiated.
 
 Usage
@@ -42,10 +43,10 @@ CTRL_TIMESTEP      = 1.0 / CONTROL_FREQ_HZ
 H          = 0.4    # cruise height          [m]
 R          = 0.3    # circle radius          [m]
 PERIOD     = 10     # circle period          [s]
-CIRCLE_SEC = 12     # total circle duration  [s]
 
-# takeoff: shared parameters
-TAKEOFF_SEC = 3.0   # duration of climb from 0 to H [s]
+# takeoff / landing shared parameters
+TAKEOFF_SEC  = 3.0  # duration of climb from 0 to H [s]
+LANDING_SEC  = 3.0  # duration of descent from H to 0 [s]
 
 # ── PWM <-> RPM (from DSLPIDControl) ──────────────────────────────────────────
 PWM2RPM_SCALE = 0.2685
@@ -81,11 +82,9 @@ HOVER_RPM = math.sqrt((MASS * G) / (4 * KF))
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_circle_waypoints():
-    """Return (NUM_WP, 3) array of xy waypoints for one full circle."""
-    # Circle centred at origin in x-y, altitude offset applied separately
+    """Return (NUM_WP, 2) array of xy waypoints for one full circle."""
     NUM_WP = CONTROL_FREQ_HZ * PERIOD
-    wps = np.zeros((NUM_WP, 3))
-    # Starting point on circle: (R, -R) so the top of the circle is the origin
+    wps = np.zeros((NUM_WP, 2))
     for i in range(NUM_WP):
         angle = (i / NUM_WP) * 2 * math.pi
         wps[i, 0] = R * math.cos(angle)
@@ -146,12 +145,12 @@ def start_logging(cf):
 def real_state_to_obs() -> np.ndarray:
     """Build a (20,) obs vector in gym-pybullet-drones format from _real_state.
 
-    Layout:
+    Layout (matches _getDroneStateVector in BaseAviary):
         [0:3]   x, y, z          [m]
         [3:7]   qx, qy, qz, qw
-        [7:10]  vx, vy, vz       [m/s]  world frame
-        [10:13] wx, wy, wz       [rad/s] world frame
-        [13:16] roll, pitch, yaw [rad]
+        [7:10]  roll, pitch, yaw [rad]
+        [10:13] vx, vy, vz       [m/s]  world frame
+        [13:16] wx, wy, wz       [rad/s] world frame
         [16:20] rpm0..3          (hover placeholder)
     """
     r = math.radians(_real_state['roll'])
@@ -168,16 +167,15 @@ def real_state_to_obs() -> np.ndarray:
     return np.concatenate([
         [_real_state['x'], _real_state['y'], _real_state['z']],
         quat,
+        [r, p, y],
         [_real_state['vx'], _real_state['vy'], _real_state['vz']],
         w_world,
-        [r, p, y],
         [HOVER_RPM] * 4,
     ])
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  TAKEOFF
+#  TAKEOFF & LANDING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
@@ -197,11 +195,11 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
     """
     from gym_pybullet_drones.utils.utils import sync
 
-    target = np.hstack([start_xy, H])
+    target     = np.hstack([start_xy, H])
     target_rpy = np.zeros(3)
 
-    obs, _, _, _, _ = env.step(np.zeros((1, 4))) # obs is (nb_drones, 20) but nb_drones=1 so we take obs[0] for the single drone
-    step = 0
+    obs, _, _, _, _ = env.step(np.zeros((1, 4)))  # obs is (1, 20)
+    step  = 0
     START = time.time()
 
     print('[TAKEOFF-SIM] Climbing ...')
@@ -221,22 +219,67 @@ def takeoff_sim(env, ctrl, logger, start_xy: np.ndarray) -> tuple:
                    control=np.hstack([target, target_rpy, np.zeros(6)]))
         env.render()
         sync(step, START, CTRL_TIMESTEP)
-        # keeps the simulation synced to real time,
-        # it waits until the next control timestep if the loop is running faster than real time.
-        # if we look into the details, it sleeps only one step out of two with the current parameters.
         step += 1
 
-        current_z = obs[0][2]
-        if current_z >= H - 0.02:
+        if obs[0][2] >= H - 0.02:
             break
 
         # Safety: bail out after 2 * TAKEOFF_SEC
         if step > int(2 * TAKEOFF_SEC * CONTROL_FREQ_HZ):
-            print('[TAKEOFF-SIM] Warning: timeout reached before target height')
+            print('[TAKEOFF-SIM] Warning: timeout before target height')
             break
 
     print(f'[TAKEOFF-SIM] Reached z = {obs[0][2]:.3f} m')
     return obs, step
+
+
+def landing_sim(env, ctrl, logger, step_offset: int, land_xy: np.ndarray,
+                obs: np.ndarray) -> int:
+    """Descend from H to z=0 inside PyBullet using the PID.
+
+    The target z is linearly ramped from H down to 0 over LANDING_SEC seconds.
+    The xy target stays fixed at land_xy (last circle waypoint position).
+
+    Parameters
+    ----------
+    step_offset : timestamp offset for the logger (steps already elapsed)
+    land_xy     : (2,) xy position to hold during descent
+    obs         : (1, 20) last observation from the circle phase
+
+    Returns
+    -------
+    step_count : total number of landing steps taken
+    """
+    from gym_pybullet_drones.utils.utils import sync
+
+    steps      = int(LANDING_SEC * CONTROL_FREQ_HZ)
+    target_rpy = np.zeros(3)
+    START      = time.time()
+
+    print('[LANDING-SIM] Descending ...')
+    for i in range(steps):
+        z_target = H * (1 - (i + 1) / steps)   # H -> 0
+        target   = np.hstack([land_xy, z_target])
+
+        rpms, _, _ = ctrl.computeControl(
+            control_timestep=CTRL_TIMESTEP,
+            cur_pos=obs[0][0:3],
+            cur_quat=obs[0][3:7],
+            cur_vel=obs[0][10:13],
+            cur_ang_vel=obs[0][13:16],
+            target_pos=target,
+            target_rpy=target_rpy,
+        )
+        obs, _, _, _, _ = env.step(rpms.reshape(1, 4))
+        logger.log(drone=0,
+                   timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
+                   state=obs[0],
+                   control=np.hstack([target, target_rpy, np.zeros(6)]))
+        env.render()
+        sync(i, START, CTRL_TIMESTEP)
+
+    print(f'[LANDING-SIM] Reached z = {obs[0][2]:.3f} m')
+    return steps
 
 
 def takeoff_real(cf) -> int:
@@ -261,6 +304,45 @@ def takeoff_real(cf) -> int:
     return steps
 
 
+def landing_real(cf, step_offset: int, land_xy: np.ndarray, logger) -> int:
+    """Descend from H to 0 using send_hover_setpoint (ToF-based).
+
+    The height target is linearly ramped from H down to 0 over LANDING_SEC
+    seconds, mirroring takeoff_real() in reverse.
+
+    Parameters
+    ----------
+    step_offset : timestamp offset for the logger
+    land_xy     : (2,) xy position at end of circle (unused by hover setpoint
+                  but logged for consistency)
+
+    Returns
+    -------
+    step_count : number of landing steps taken
+    """
+    steps = int(LANDING_SEC * CONTROL_FREQ_HZ)
+    START = time.time()
+    print(f'[LANDING-REAL] Descending to 0 m ...')
+
+    for i in range(steps):
+        z_target = H * (1 - (i + 1) / steps)   # H -> 0
+        cf.cf.commander.send_hover_setpoint(0.0, 0.0, 0.0, z_target)
+
+        obs = real_state_to_obs()
+        logger.log(drone=0,
+                   timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
+                   state=obs,
+                   control=np.hstack([land_xy, z_target, np.zeros(9)]))
+
+        elapsed = time.time() - START - i * CTRL_TIMESTEP
+        sleep_t = CTRL_TIMESTEP - elapsed
+        if sleep_t > 0:
+            time.sleep(sleep_t)
+
+    print(f'[LANDING-REAL] Done  z = {_real_state["z"]:.3f} m')
+    return steps
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -269,12 +351,12 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         gui: bool = True, plot: bool = True):
 
     # ── Circle waypoints ──────────────────────────────────────────────────────
-    circle_wps = build_circle_waypoints()   # (NUM_WP, 3)  xy only, starts at (R, -R), z unused
+    circle_wps = build_circle_waypoints()   # (NUM_WP, 2) xy only, starts at (R, -R)
     NUM_WP     = circle_wps.shape[0]
     wp_counter = 0
 
     # Starting xy position = first waypoint = (R, -R)
-    start_xy = circle_wps[0, :2].copy()
+    start_xy = circle_wps[0, :].copy()
 
     # ── Logger ────────────────────────────────────────────────────────────────
     logger = Logger(logging_freq_hz=CONTROL_FREQ_HZ, num_drones=1,
@@ -317,32 +399,44 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         # deviate from the ideal trajectory right from the start. With the reset, the PID starts fresh at the beginning
         # of the circle, which is what we want for a clean comparison between sim and real.
 
-        # ── Circle ────────────────────────────────────────────────────────────
-        total_steps = int(CIRCLE_SEC * CONTROL_FREQ_HZ)
+        # ── Circle — stop after exactly one full lap ───────────────────────────
+        print('[CIRCLE-SIM] Starting circle ...')
         START = time.time()
+        i     = 0
 
-        for i in range(total_steps):
+        while True:
             rpms, _, _ = ctrl.computeControl(
                 control_timestep=CTRL_TIMESTEP,
                 cur_pos=obs[0][0:3],
                 cur_quat=obs[0][3:7],
                 cur_vel=obs[0][10:13],
                 cur_ang_vel=obs[0][13:16],
-                target_pos=np.hstack([circle_wps[wp_counter, :2], H]),
+                target_pos=np.hstack([circle_wps[wp_counter], H]),
                 target_rpy=np.zeros(3),
             )
-
             obs, _, _, _, _ = env.step(rpms.reshape(1, 4))
-            # ─────────────────────────────────────────────────────────────────
-
-            wp_counter = (wp_counter + 1) % NUM_WP
             logger.log(drone=0,
                        timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
                        state=obs[0],
-                       control=np.hstack([circle_wps[wp_counter, :2], H,
+                       control=np.hstack([circle_wps[wp_counter], H,
                                           np.zeros(9)]))
             env.render()
             sync(i, START, CTRL_TIMESTEP)
+
+            wp_counter = (wp_counter + 1) % NUM_WP
+            i += 1
+
+            # One full lap completed when wp_counter wraps back to 0
+            if wp_counter == 0:
+                print('[CIRCLE-SIM] One full lap completed.')
+                break
+
+        # ── Landing ───────────────────────────────────────────────────────────
+        land_xy      = circle_wps[0]   # back at start of circle
+        circle_steps = i
+        landing_sim(env, ctrl, logger,
+                    step_offset=step_offset + circle_steps,
+                    land_xy=land_xy, obs=obs)
 
         env.close()
 
@@ -389,15 +483,15 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         step_offset = takeoff_real(cf)
         time.sleep(0.5)
 
-        # Reset PID with real starting state
         ctrl.reset()
 
-        # ── Circle ────────────────────────────────────────────────────────────
-        total_steps = int(CIRCLE_SEC * CONTROL_FREQ_HZ)
+        # ── Circle — stop after exactly one full lap ───────────────────────────
+        print('[CIRCLE-REAL] Starting circle ...')
         START = time.time()
+        i     = 0
 
         try:
-            for i in range(total_steps):
+            while True:
                 obs = real_state_to_obs()
 
                 rpms, _, _ = ctrl.computeControl(
@@ -406,16 +500,13 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                     cur_quat=obs[3:7],
                     cur_vel=obs[10:13],
                     cur_ang_vel=obs[13:16],
-                    target_pos=np.hstack([circle_wps[wp_counter, :2], H]),
+                    target_pos=np.hstack([circle_wps[wp_counter], H]),
                     target_rpy=np.zeros(3),
                 )
 
-                # ──────────────── APPLY ACTION ──────────────────────────
-                ##########################################################
-                ##########################################################
-
                 # RPM -> PWM
-                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE, MIN_PWM, MAX_PWM)
+                pwm = np.clip((rpms - PWM2RPM_CONST) / PWM2RPM_SCALE,
+                              MIN_PWM, MAX_PWM)
 
                 # PWM -> [T, tau_roll, tau_pitch, tau_yaw]
                 T_pwm, tau_r, tau_p, tau_y = ALLOC_PINV @ pwm
@@ -423,7 +514,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 # Collective thrust -> cflib integer
                 thrust_cf = int(np.clip(
                     CF_THRUST_MIN + (T_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
-                                * (CF_THRUST_MAX - CF_THRUST_MIN),
+                                  * (CF_THRUST_MAX - CF_THRUST_MIN),
                     CF_THRUST_MIN, CF_THRUST_MAX
                 ))
 
@@ -432,25 +523,34 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 pitch_deg   = float(np.clip(tau_p * PITCH_SCALE, -30,  30))
                 yawrate_dps = float(np.clip(tau_y * YAW_SCALE,  -200, 200))
 
-                cf.cf.commander.send_setpoint(roll_deg, pitch_deg, yawrate_dps, thrust_cf)
+                cf.cf.commander.send_setpoint(roll_deg, pitch_deg,
+                                              yawrate_dps, thrust_cf)
 
-                obs = real_state_to_obs()
-
-                ##########################################################
-                ##########################################################
-                # ─────────────────────────────────────────────────────────────
-
-                wp_counter = (wp_counter + 1) % NUM_WP
                 logger.log(drone=0,
                            timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
-                           state=obs,
-                           control=np.hstack([circle_wps[wp_counter, :2], H,
+                           state=real_state_to_obs(),
+                           control=np.hstack([circle_wps[wp_counter], H,
                                               np.zeros(9)]))
+
+                wp_counter = (wp_counter + 1) % NUM_WP
+                i += 1
+
+                # One full lap completed when wp_counter wraps back to 0
+                if wp_counter == 0:
+                    print('[CIRCLE-REAL] One full lap completed.')
+                    break
 
                 elapsed = time.time() - START - i * CTRL_TIMESTEP
                 sleep_t = CTRL_TIMESTEP - elapsed
                 if sleep_t > 0:
                     time.sleep(sleep_t)
+
+            # ── Landing ───────────────────────────────────────────────────────
+            circle_steps = i
+            landing_real(cf,
+                         step_offset=step_offset + circle_steps,
+                         land_xy=circle_wps[0],
+                         logger=logger)
 
         finally:
             print('[INFO] Stopping ...')
