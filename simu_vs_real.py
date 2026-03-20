@@ -100,16 +100,16 @@ _state_ready = Event()
 
 
 def _state_cb(timestamp, data, logconf):
-    _real_state['x']     = data.get('stateEstimate.x',     0.)
+    _real_state['x']     = data.get('stateEstimate.x',     0.) # m, world frame
     _real_state['y']     = data.get('stateEstimate.y',     0.)
     _real_state['z']     = data.get('stateEstimate.z',     0.)
-    _real_state['vx']    = data.get('stateEstimate.vx',    0.)
+    _real_state['vx']    = data.get('stateEstimate.vx',    0.) # m/s, world frame
     _real_state['vy']    = data.get('stateEstimate.vy',    0.)
     _real_state['vz']    = data.get('stateEstimate.vz',    0.)
     _real_state['roll']  = data.get('stateEstimate.roll',  0.)
-    _real_state['pitch'] = data.get('stateEstimate.pitch', 0.)
+    _real_state['pitch'] = data.get('stateEstimate.pitch', 0.) # MAYBE INVERTED SIGN
     _real_state['yaw']   = data.get('stateEstimate.yaw',   0.)
-    _real_state['gx']    = data.get('gyro.x',              0.)
+    _real_state['gx']    = data.get('gyro.x',              0.) # deg/s, body frame
     _real_state['gy']    = data.get('gyro.y',              0.)
     _real_state['gz']    = data.get('gyro.z',              0.)
     _state_ready.set()
@@ -147,7 +147,7 @@ def real_state_to_obs() -> np.ndarray:
         [7:10]  roll, pitch, yaw [rad]
         [10:13] vx, vy, vz       [m/s]  world frame
         [13:16] wx, wy, wz       [rad/s] world frame
-        [16:20] rpm0..3          (hover placeholder)
+        [16:20] rpm0..3          (hover placeholder) NEVER USED, only to imitate the sim obs
     """
     r = math.radians(_real_state['roll'])
     p = math.radians(_real_state['pitch'])
