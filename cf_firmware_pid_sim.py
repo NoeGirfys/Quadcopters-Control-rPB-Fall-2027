@@ -961,6 +961,15 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
     action = np.full((1, 4), HOVER_RPM)
     START = time.time()
 
+    # --- Data logging arrays ---
+    log_t   = np.zeros(n_steps)
+    log_sp  = np.zeros((n_steps, 3))
+    log_pos = np.zeros((n_steps, 3))
+    log_vel = np.zeros((n_steps, 3))
+    log_rpy = np.zeros((n_steps, 3))
+    log_rpms = np.zeros((n_steps, 4))
+    log_thrust = np.zeros(n_steps)
+
     for i in range(n_steps):
         # --- Step the simulation ---
         obs, _, _, _, _ = env.step(action)
@@ -987,6 +996,15 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
 
         action[0, :] = rpms
 
+        # --- Log ---
+        log_t[i]      = i / CTRL_FREQ
+        log_sp[i]     = setpoint_pos
+        log_pos[i]    = pos
+        log_vel[i]    = vel
+        log_rpy[i]    = rpy_deg
+        log_rpms[i]   = rpms
+        log_thrust[i] = ctrl.actuator_thrust
+
         # --- Print status periodically ---
         if i % (CTRL_FREQ * 1) == 0:
             t = i / CTRL_FREQ
@@ -1002,6 +1020,88 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
 
     env.close()
     print("[SIM] Done.")
+
+    # --- Plots ---
+    _plot_sim(log_t, log_sp, log_pos, log_vel, log_rpy, log_rpms, log_thrust)
+
+
+def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
+    """Plot simulation results."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping plots.")
+        return
+
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
+    fig.suptitle('Crazyflie firmware PID — simulation results', fontsize=14)
+
+    # -- Position tracking --
+    ax = axes[0, 0]
+    ax.plot(t, sp[:, 0], '--', label='sp_x', alpha=0.7)
+    ax.plot(t, sp[:, 1], '--', label='sp_y', alpha=0.7)
+    ax.plot(t, sp[:, 2], '--', label='sp_z', alpha=0.7)
+    ax.plot(t, pos[:, 0], label='x')
+    ax.plot(t, pos[:, 1], label='y')
+    ax.plot(t, pos[:, 2], label='z')
+    ax.set_ylabel('Position [m]')
+    ax.legend(fontsize=7, ncol=3)
+    ax.set_title('Position tracking')
+    ax.grid(True, alpha=0.3)
+
+    # -- Velocity --
+    ax = axes[0, 1]
+    ax.plot(t, vel[:, 0], label='vx')
+    ax.plot(t, vel[:, 1], label='vy')
+    ax.plot(t, vel[:, 2], label='vz')
+    ax.set_ylabel('Velocity [m/s]')
+    ax.legend(fontsize=7)
+    ax.set_title('Velocity')
+    ax.grid(True, alpha=0.3)
+
+    # -- Attitude --
+    ax = axes[1, 0]
+    ax.plot(t, rpy[:, 0], label='roll')
+    ax.plot(t, rpy[:, 1], label='pitch')
+    ax.set_ylabel('Angle [deg]')
+    ax.legend(fontsize=7)
+    ax.set_title('Roll / Pitch')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    ax.plot(t, rpy[:, 2], label='yaw', color='green')
+    ax.set_ylabel('Angle [deg]')
+    ax.legend(fontsize=7)
+    ax.set_title('Yaw')
+    ax.grid(True, alpha=0.3)
+
+    # -- Thrust --
+    ax = axes[2, 0]
+    ax.plot(t, thrust, label='thrust', color='black')
+    ax.axhline(PID_VEL_THRUST_BASE, ls=':', color='gray',
+               label=f'THRUST_BASE={PID_VEL_THRUST_BASE:.0f}')
+    ax.set_ylabel('Thrust [uint16]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7)
+    ax.set_title('Thrust command')
+    ax.grid(True, alpha=0.3)
+
+    # -- RPMs --
+    ax = axes[2, 1]
+    ax.plot(t, rpms[:, 0], label='M1 (FR)', alpha=0.7)
+    ax.plot(t, rpms[:, 1], label='M2 (BR)', alpha=0.7)
+    ax.plot(t, rpms[:, 2], label='M3 (BL)', alpha=0.7)
+    ax.plot(t, rpms[:, 3], label='M4 (FL)', alpha=0.7)
+    ax.set_ylabel('RPM')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7, ncol=2)
+    ax.set_title('Motor RPMs')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('sim_results.png', dpi=150)
+    print("[PLOT] Saved to sim_results.png")
+    plt.show()
 
 
 # ===================================================================
