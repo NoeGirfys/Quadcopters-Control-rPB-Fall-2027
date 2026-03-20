@@ -553,11 +553,12 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         print(f'[INFO] State ready  z = {_real_state["z"]:.3f} m')
 
         # ── Arm + takeoff ─────────────────────────────────────────────────────
-        is_flying = False   # tracks whether the drone is airborne
+        is_flying   = False  # tracks whether the drone is airborne
+        step_offset = 0      # initialised here so finally can always reference it
         try:
             cf.cf.platform.send_arming_request(True) # mandatory arming before sending any setpoint, otherwise the firmware will ignore them
             time.sleep(1.0)
-            is_flying = True
+            is_flying = True               # set before takeoff so Ctrl+C lands gently
             step_offset = takeoff_real(cf)
             time.sleep(0.5)
 
@@ -701,14 +702,21 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                 # Ctrl+C or exception while airborne: land gently before closing
                 print('[INFO] Emergency landing ...')
                 landing_real(cf,
-                             step_offset=0,
+                             step_offset=step_offset,
                              land_xy=np.array([_real_state['x'],
                                                _real_state['y']]),
                              logger=logger)
-            cf.cf.commander.send_setpoint(0, 0, 0, 0)
-            time.sleep(0.1)
-            for lc in log_cfgs:
-                lc.stop()
+            try:
+                cf.cf.commander.send_setpoint(0, 0, 0, 0)
+                time.sleep(0.1)
+            except Exception:
+                pass
+            if 'log_cfgs' in dir():
+                for lc in log_cfgs:
+                    try:
+                        lc.stop()
+                    except Exception:
+                        pass
             cf_ctx.__exit__(None, None, None)
             print('[INFO] Disconnected.')
 
