@@ -63,7 +63,7 @@ ARM_L = 0.0397     # motor arm length       [m]
 IXX   = 1.4e-5     # roll  inertia          [kg·m²]
 IYY   = 1.4e-5     # pitch inertia          [kg·m²]
 IZZ   = 2.17e-5    # yaw   inertia          [kg·m²]
-MASS  = 0.027      # vehicle mass           [kg]
+MASS  = 0.027      # vehicle mass           [kg] MAYBE MORE WITH FLOWDECK V2
 G     = 9.8        # gravitational accel    [m/s²]
 T2W   = 2.25
 
