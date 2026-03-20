@@ -48,6 +48,10 @@ PERIOD     = 10     # circle period          [s]
 TAKEOFF_SEC  = 3.0  # duration of climb from 0 to H [s]
 LANDING_SEC  = 3.0  # duration of descent from H to 0 [s]
 
+# ── PWM (from DSLPIDControl) ──────────────────────────────────────────
+MIN_PWM       = 20000
+MAX_PWM       = 65535
+
 # ── cflib thrust range ─────────────────────────────────────────────────────────
 CF_THRUST_MIN = 10001
 CF_THRUST_MAX = 60000
@@ -340,7 +344,8 @@ def landing_real(cf, step_offset: int, land_xy: np.ndarray, logger) -> int:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run(real: bool = False, uri: str = DEFAULT_URI,
-        gui: bool = True, plot: bool = True):
+        gui: bool = True, plot: bool = True,
+        rate: bool = False):
 
     # ── Circle waypoints ──────────────────────────────────────────────────────
     circle_wps = build_circle_waypoints()   # (NUM_WP, 2) xy only, starts at (R, -R)
@@ -539,16 +544,22 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
 
         ctrl.reset()
 
-        # ── Switch firmware to rate mode ──────────────────────────────────────
-        # By default send_setpoint interprets roll/pitch as absolute angles and
-        # routes them through the firmware attitude PID, which would add a
-        # redundant controller on top of our own PID. Setting stabMode* = 0
-        # bypasses the attitude PID: the firmware only runs its fast gyro rate
-        # controller (~1 kHz) to track the body-rate setpoints we send.
-        cf.cf.param.set_value('flightmode.stabModeRoll',  '0')
-        cf.cf.param.set_value('flightmode.stabModePitch', '0')
-        cf.cf.param.set_value('flightmode.stabModeYaw',   '0')
-        print('[INFO] Rate mode enabled')
+        # ── Configure firmware control mode ───────────────────────────────────
+        if rate:
+            # Rate mode: bypasses the firmware attitude PID.
+            # The firmware only runs its fast gyro rate controller (~1 kHz)
+            # to track the body-rate setpoints we send.
+            cf.cf.param.set_value('flightmode.stabModeRoll',  '0')
+            cf.cf.param.set_value('flightmode.stabModePitch', '0')
+            cf.cf.param.set_value('flightmode.stabModeYaw',   '0')
+            print('[INFO] Rate mode enabled')
+        else:
+            # Angle mode (default): send_setpoint takes absolute roll/pitch
+            # angles [deg], which the firmware attitude PID tracks.
+            cf.cf.param.set_value('flightmode.stabModeRoll',  '1')
+            cf.cf.param.set_value('flightmode.stabModePitch', '1')
+            cf.cf.param.set_value('flightmode.stabModeYaw',   '1')
+            print('[INFO] Angle mode enabled')
 
         # ── Circle — stop after exactly one full lap ───────────────────────────
         print('[CIRCLE-REAL] Starting circle ...')
@@ -559,69 +570,89 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
             while True:
                 obs = real_state_to_obs()
 
-                rpms, _, _ = ctrl.computeControl(
-                    control_timestep=CTRL_TIMESTEP,
-                    cur_pos=obs[0:3],
-                    cur_quat=obs[3:7],
-                    cur_vel=obs[10:13],
-                    cur_ang_vel=obs[13:16],
-                    target_pos=np.hstack([circle_wps[wp_counter], H]),
-                    target_rpy=np.zeros(3),
-                )
+                if not rate:
+                    # ── ANGLE MODE ────────────────────────────────────────────
+                    # _dslPIDPositionControl returns thrust [PWM] and target
+                    # roll/pitch/yaw [rad] directly — no RPM conversion needed.
+                    thrust_pwm, target_euler, _ = ctrl._dslPIDPositionControl(
+                        control_timestep=CTRL_TIMESTEP,
+                        cur_pos=obs[0:3],
+                        cur_quat=obs[3:7],
+                        cur_vel=obs[10:13],
+                        target_pos=np.hstack([circle_wps[wp_counter], H]),
+                        target_rpy=np.zeros(3),
+                        target_vel=np.zeros(3),
+                    )
+                    # thrust_pwm [MIN_PWM, MAX_PWM] -> cflib integer [10001, 60000]
+                    thrust_cf = int(np.clip(
+                        CF_THRUST_MIN + (thrust_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
+                                      * (CF_THRUST_MAX - CF_THRUST_MIN),
+                        CF_THRUST_MIN, CF_THRUST_MAX
+                    ))
+                    # target_euler [rad] -> [deg]
+                    roll_deg  = float(np.clip(np.degrees(target_euler[0]), -30., 30.))
+                    pitch_deg = float(np.clip(np.degrees(target_euler[1]), -30., 30.))
+                    yaw_deg   = float(np.clip(np.degrees(target_euler[2]), -30., 30.))
+                    cf.cf.commander.send_setpoint(roll_deg, pitch_deg,
+                                                  yaw_deg, thrust_cf)
 
-                # Step 1 — RPM -> forces per motor [N]
-                # F_i = KF * rpm_i^2
-                forces = rpms**2 * KF                         # (4,) [N]
+                else:
+                    # ── RATE MODE ─────────────────────────────────────────────
+                    # computeControl returns RPMs; convert to physical forces
+                    # and torques, then to body angular rate setpoints.
+                    rpms, _, _ = ctrl.computeControl(
+                        control_timestep=CTRL_TIMESTEP,
+                        cur_pos=obs[0:3],
+                        cur_quat=obs[3:7],
+                        cur_vel=obs[10:13],
+                        cur_ang_vel=obs[13:16],
+                        target_pos=np.hstack([circle_wps[wp_counter], H]),
+                        target_rpy=np.zeros(3),
+                    )
+                    # Step 1 — RPM -> forces per motor [N]
+                    forces = rpms**2 * KF                            # (4,) [N]
 
-                # Step 2 — Forces -> physical torques [N·m]
-                # CF2X geometry: motors at 45 deg, arm projected = L/sqrt(2)
-                # Motor layout (top view):
-                #   0(CCW) 1(CW)
-                #   3(CW)  2(CCW)
-                L_eff = ARM_L / np.sqrt(2)
-                tau_roll_Nm  = (forces[0] + forces[1]
-                                - forces[2] - forces[3]) * L_eff   # [N·m]
-                tau_pitch_Nm = (-forces[0] + forces[1]
-                                + forces[2] - forces[3]) * L_eff   # [N·m]
-                tau_yaw_Nm   = (- rpms[0]**2 + rpms[1]**2
-                                - rpms[2]**2 + rpms[3]**2) * KM    # [N·m]
+                    # Step 2 — Forces -> physical torques [N·m]
+                    # CF2X: motors at 45 deg, projected arm = L/sqrt(2)
+                    # Motor layout (top view):
+                    #   0(CCW) 1(CW)
+                    #   3(CW)  2(CCW)
+                    L_eff        = ARM_L / np.sqrt(2)
+                    tau_roll_Nm  = (forces[0] + forces[1]
+                                    - forces[2] - forces[3]) * L_eff # [N·m]
+                    tau_pitch_Nm = (-forces[0] + forces[1]
+                                    + forces[2] - forces[3]) * L_eff # [N·m]
+                    tau_yaw_Nm   = (-rpms[0]**2 + rpms[1]**2
+                                    - rpms[2]**2 + rpms[3]**2) * KM # [N·m]
 
-                # Step 3 — Collective thrust -> cflib integer [10001, 60000]
-                F_total = float(np.sum(forces))                     # [N]
-                F_hover = MASS * G                                  # [N]
-                thrust_cf = int(np.clip(
-                    CF_THRUST_MIN + (F_total - 0.) / (T2W * F_hover - 0.) * (CF_THRUST_MAX - CF_THRUST_MIN),
-                    CF_THRUST_MIN, CF_THRUST_MAX
-                ))
+                    # Step 3 — Collective thrust -> cflib integer [10001, 60000]
+                    F_total   = float(np.sum(forces))
+                    F_hover   = MASS * G
+                    thrust_cf = int(np.clip(
+                        CF_THRUST_MIN + (F_total / (T2W * F_hover))
+                                      * (CF_THRUST_MAX - CF_THRUST_MIN),
+                        CF_THRUST_MIN, CF_THRUST_MAX
+                    ))
 
-                # Step 4 — Physical torques -> angular accelerations [rad/s²]
-                # Full Newton-Euler: tau = J*alpha + omega x (J*omega)
-                # => alpha = J^-1 * (tau - omega x (J*omega))
-                # J is diagonal for the symmetric CF2X.
-                cur_rates = np.radians([_real_state['gx'],
-                                        _real_state['gy'],
-                                        _real_state['gz']])          # [rad/s]
-                J     = np.diag([IXX, IYY, IZZ])
-                tau   = np.array([tau_roll_Nm, tau_pitch_Nm, tau_yaw_Nm])
-                omega = cur_rates
-                gyro  = np.cross(omega, J @ omega)                  # [N·m]
-                alpha = np.linalg.solve(J, tau - gyro)              # [rad/s²]
-                alpha_roll, alpha_pitch, alpha_yaw = alpha
- 
-                # Step 5 — Angular accelerations -> rate setpoints [rad/s]
-                # One Euler integration step: omega_des = omega_cur + alpha*dt
-                # The firmware rate controller will then track omega_des.
-                rollrate_rps  = cur_rates[0] + alpha_roll  * CTRL_TIMESTEP
-                pitchrate_rps = cur_rates[1] + alpha_pitch * CTRL_TIMESTEP
-                yawrate_rps   = cur_rates[2] + alpha_yaw   * CTRL_TIMESTEP
+                    # Step 4 — Full Newton-Euler: alpha = J^-1*(tau - omega x J*omega)
+                    cur_rates = np.radians([_real_state['gx'],
+                                            _real_state['gy'],
+                                            _real_state['gz']])
+                    J    = np.diag([IXX, IYY, IZZ])
+                    tau  = np.array([tau_roll_Nm, tau_pitch_Nm, tau_yaw_Nm])
+                    gyro = np.cross(cur_rates, J @ cur_rates)
+                    alpha = np.linalg.solve(J, tau - gyro)           # [rad/s²]
 
-                # [rad/s] -> [deg/s] with safety clipping
-                rollrate_dps  = float(np.clip(np.degrees(rollrate_rps),  -MAX_RATE_DPS, MAX_RATE_DPS))
-                pitchrate_dps = float(np.clip(np.degrees(pitchrate_rps), -MAX_RATE_DPS, MAX_RATE_DPS))
-                yawrate_dps   = float(np.clip(np.degrees(yawrate_rps),   -MAX_RATE_DPS, MAX_RATE_DPS))
-
-                cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps,
-                                              yawrate_dps, thrust_cf)
+                    # Step 5 — Euler integration: omega_des = omega_cur + alpha*dt
+                    rates_des = cur_rates + alpha * CTRL_TIMESTEP    # [rad/s]
+                    rollrate_dps  = float(np.clip(np.degrees(rates_des[0]),
+                                                  -MAX_RATE_DPS, MAX_RATE_DPS))
+                    pitchrate_dps = float(np.clip(np.degrees(rates_des[1]),
+                                                  -MAX_RATE_DPS, MAX_RATE_DPS))
+                    yawrate_dps   = float(np.clip(np.degrees(rates_des[2]),
+                                                  -MAX_RATE_DPS, MAX_RATE_DPS))
+                    cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps,
+                                                  yawrate_dps, thrust_cf)
 
                 logger.log(drone=0,
                            timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
@@ -676,6 +707,8 @@ if __name__ == '__main__':
                         help='Disable PyBullet GUI in sim mode')
     parser.add_argument('--no-plot', dest='plot', action='store_false',
                         help='Disable end-of-run plots')
+    parser.add_argument('--rate', action='store_true',
+                        help='Rate mode: send body rates instead of angles (default: angle mode)')
     parser.set_defaults(gui=True, plot=True)
     args = parser.parse_args()
-    run(real=args.real, uri=args.uri, gui=args.gui, plot=args.plot)
+    run(real=args.real, uri=args.uri, gui=args.gui, plot=args.plot, rate=args.rate)
