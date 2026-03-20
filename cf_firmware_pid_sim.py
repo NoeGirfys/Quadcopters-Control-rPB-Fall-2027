@@ -943,17 +943,22 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
     # τ ≈ 20 ms is typical for CF2.1+ brushed coreless motors
     motor_filter = MotorDynamicsFilter(n_motors=4, tau=0.02, dt=1.0/CTRL_FREQ)
 
+    # Pre-arm: initialize motor filter and first action at hover RPM
+    # so the drone doesn't freefall on the first env.step()
+    HOVER_RPM = env.HOVER_RPM
+    motor_filter.rpm = np.full(4, HOVER_RPM)
+
     # Generate trajectory
     waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
                                     hover_height=hover_height, radius=radius)
     n_steps = len(waypoints)
 
     print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz")
-    print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {env.HOVER_RPM:.1f}")
+    print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {HOVER_RPM:.1f}")
     print(f"[SIM] Trajectory: {n_steps} steps, {duration_sec}s")
     print(f"[SIM] Phases: takeoff 3s → circle {duration_sec-6}s → land 3s")
 
-    action = np.zeros((1, 4))
+    action = np.full((1, 4), HOVER_RPM)
     START = time.time()
 
     for i in range(n_steps):

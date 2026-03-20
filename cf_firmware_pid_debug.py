@@ -638,6 +638,7 @@ def run_debug(trajectory='circle', duration_sec=15, gui=True,
 
     # Motor dynamics filter — simulates real motor response lag (τ ≈ 20 ms)
     motor_filter = MotorDynamicsFilter(n_motors=4, tau=0.02, dt=1.0/CTRL_FREQ)
+    motor_filter.rpm = np.full(4, HOVER_RPM)  # pre-arm at hover
 
     if trajectory == 'circle':
         waypoints = generate_circle_trajectory(CTRL_FREQ, duration_sec, hover_height, radius)
@@ -648,7 +649,7 @@ def run_debug(trajectory='circle', duration_sec=15, gui=True,
     print(f"[DEBUG] Trajectory: {trajectory}, {n_steps} steps, {n_steps/CTRL_FREQ:.1f}s")
 
     # --- Reset controller with initial state ---
-    obs_init, _, _, _, _ = env.step(np.zeros((1,4)))
+    obs_init, _, _, _, _ = env.step(np.full((1,4), HOVER_RPM))
     pos0, vel0, rpy0, gyro0 = obs_to_firmware_state(obs_init[0])
     ctrl.reset(rpy0, pos0)
     print(f"[DEBUG] Initial state: pos={pos0}, rpy={rpy0}")
@@ -690,7 +691,7 @@ def run_debug(trajectory='circle', duration_sec=15, gui=True,
     ]
     writer.writerow(header)
 
-    action = np.zeros((1, 4))
+    action = np.full((1, 4), HOVER_RPM)
     START = time.time()
     crashed = False
 
