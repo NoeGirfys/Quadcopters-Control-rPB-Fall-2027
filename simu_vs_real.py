@@ -553,36 +553,38 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         print(f'[INFO] State ready  z = {_real_state["z"]:.3f} m')
 
         # ── Arm + takeoff ─────────────────────────────────────────────────────
-        cf.cf.platform.send_arming_request(True) # mandatory arming before sending any setpoint, otherwise the firmware will ignore them
-        time.sleep(1.0)
-        step_offset = takeoff_real(cf)
-        time.sleep(0.5)
-
-        ctrl.reset()
-
-        # ── Configure firmware control mode ───────────────────────────────────
-        if rate:
-            # Rate mode: bypasses the firmware attitude PID.
-            # The firmware only runs its fast gyro rate controller (~1 kHz)
-            # to track the body-rate setpoints we send.
-            cf.cf.param.set_value('flightmode.stabModeRoll',  '0')
-            cf.cf.param.set_value('flightmode.stabModePitch', '0')
-            cf.cf.param.set_value('flightmode.stabModeYaw',   '0')
-            print('[INFO] Rate mode enabled')
-        else:
-            # Angle mode (default): send_setpoint takes absolute roll/pitch
-            # angles [deg], which the firmware attitude PID tracks.
-            cf.cf.param.set_value('flightmode.stabModeRoll',  '1')
-            cf.cf.param.set_value('flightmode.stabModePitch', '1')
-            cf.cf.param.set_value('flightmode.stabModeYaw',   '1')
-            print('[INFO] Angle mode enabled')
-
-        # ── Circle — stop after exactly one full lap ───────────────────────────
-        print('[CIRCLE-REAL] Starting circle ...')
-        START = time.time()
-        i     = 0
-
+        is_flying = False   # tracks whether the drone is airborne
         try:
+            cf.cf.platform.send_arming_request(True) # mandatory arming before sending any setpoint, otherwise the firmware will ignore them
+            time.sleep(1.0)
+            step_offset = takeoff_real(cf)
+            is_flying = True
+            time.sleep(0.5)
+
+            ctrl.reset()
+
+            # ── Configure firmware control mode ───────────────────────────────
+            if rate:
+                # Rate mode: bypasses the firmware attitude PID.
+                # The firmware only runs its fast gyro rate controller (~1 kHz)
+                # to track the body-rate setpoints we send.
+                cf.cf.param.set_value('flightmode.stabModeRoll',  '0')
+                cf.cf.param.set_value('flightmode.stabModePitch', '0')
+                cf.cf.param.set_value('flightmode.stabModeYaw',   '0')
+                print('[INFO] Rate mode enabled')
+            else:
+                # Angle mode (default): send_setpoint takes absolute roll/pitch
+                # angles [deg], which the firmware attitude PID tracks.
+                cf.cf.param.set_value('flightmode.stabModeRoll',  '1')
+                cf.cf.param.set_value('flightmode.stabModePitch', '1')
+                cf.cf.param.set_value('flightmode.stabModeYaw',   '1')
+                print('[INFO] Angle mode enabled')
+
+            # ── Circle — stop after exactly one full lap ───────────────────────
+            print('[CIRCLE-REAL] Starting circle ...')
+            START = time.time()
+            i     = 0
+
             while True:
                 obs = real_state_to_obs()
 
@@ -691,9 +693,18 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                          step_offset=step_offset + circle_steps,
                          land_xy=circle_wps[0],
                          logger=logger)
+            is_flying = False
 
         finally:
             print('[INFO] Stopping ...')
+            if is_flying:
+                # Ctrl+C or exception while airborne: land gently before closing
+                print('[INFO] Emergency landing ...')
+                landing_real(cf,
+                             step_offset=0,
+                             land_xy=np.array([_real_state['x'],
+                                               _real_state['y']]),
+                             logger=logger)
             cf.cf.commander.send_setpoint(0, 0, 0, 0)
             time.sleep(0.1)
             for lc in log_cfgs:
