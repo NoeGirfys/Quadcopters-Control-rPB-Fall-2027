@@ -713,7 +713,9 @@ class CrazyflieFirmwarePID:
         # === Rate controller ===
         # [FW] controller_pid.c:124-125
         # NOTE: firmware negates gyro.y because of sensor mounting orientation.
-        # In simulation we already have correct body-frame rates, so no negation.
+        # In simulation, we negate it in obs_to_firmware_state() instead,
+        # to account for the pitch convention difference (pybullet Z-up
+        # vs. firmware aerospace convention).
         roll_cmd, pitch_cmd, yaw_cmd = \
             self.att_ctrl.correct_rate(
                 gyro_x, gyro_y, gyro_z,
@@ -747,6 +749,38 @@ class CrazyflieFirmwarePID:
         self._tick = 0
         self._last_att_roll  = 0.0
         self._last_att_pitch = 0.0
+
+
+# ===================================================================
+#  Motor Dynamics Filter (for simulation only)
+# ===================================================================
+
+class MotorDynamicsFilter:
+    """First-order low-pass filter simulating brushed motor response.
+
+    On the real Crazyflie 2.1+, the brushed coreless motors have a
+    mechanical+electrical time constant of roughly 15–25 ms.  In PyBullet's
+    PYB physics mode, forces are applied instantaneously (zero motor lag),
+    which makes the firmware's high-gain rate PID oscillate in a limit
+    cycle.  This filter restores a realistic motor bandwidth.
+
+    Model:  rpm(t+dt) = α · rpm_cmd + (1-α) · rpm(t)
+            α = dt / (τ + dt)
+
+    With τ = 0.02 s and dt = 0.002 s (500 Hz control):  α ≈ 0.091
+    """
+
+    def __init__(self, n_motors=4, tau=0.02, dt=0.002):
+        self.alpha = dt / (tau + dt)
+        self.rpm = np.zeros(n_motors)
+
+    def apply(self, rpm_cmd):
+        """Filter commanded RPMs through first-order motor dynamics."""
+        self.rpm = self.alpha * rpm_cmd + (1.0 - self.alpha) * self.rpm
+        return self.rpm.copy()
+
+    def reset(self):
+        self.rpm[:] = 0.0
 
 
 # ===================================================================
@@ -835,6 +869,17 @@ def obs_to_firmware_state(obs):
     vel    = obs[10:13]                      # [m/s] global
     ang_v  = obs[13:16]                      # [rad/s] global
 
+    # ── Pitch convention fix ──────────────────────────────────────
+    # pybullet (Z-up frame, right-hand rule about Y):
+    #   positive pitch = nose DOWN
+    # Crazyflie firmware (aerospace convention):
+    #   positive pitch = nose UP
+    #
+    # Roll and yaw conventions match between the two frames.
+    # Only pitch (and the corresponding body-frame pitch rate, gyro_y)
+    # must be negated to convert from pybullet to firmware convention.
+    rpy[1] = -rpy[1]
+
     # Convert angular velocity from world frame to body frame
     # [FW] In reality the gyro measures body-frame rates directly.
     # In pybullet, ang_v is world-frame → we rotate: ω_body = Rᵀ @ ω_world
@@ -851,6 +896,9 @@ def obs_to_firmware_state(obs):
     ])
     gyro_body = R.T @ ang_v          # [rad/s] body frame
     gyro_deg  = np.degrees(gyro_body) # [deg/s] body frame
+
+    # Negate pitch rate for the same convention reason as pitch angle
+    gyro_deg[1] = -gyro_deg[1]
 
     return pos, vel, rpy, gyro_deg
 
@@ -891,6 +939,10 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
     # Initialize controller
     ctrl = CrazyflieFirmwarePID()
 
+    # Motor dynamics filter — simulates real motor response lag
+    # τ ≈ 20 ms is typical for CF2.1+ brushed coreless motors
+    motor_filter = MotorDynamicsFilter(n_motors=4, tau=0.02, dt=1.0/CTRL_FREQ)
+
     # Generate trajectory
     waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
                                     hover_height=hover_height, radius=radius)
@@ -924,6 +976,10 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
 
         # --- Convert PWM to RPM for pybullet ---
         rpms = pwm_to_rpm(motor_pwm, MAX_RPM)
+
+        # --- Apply motor dynamics filter (simulates real motor lag) ---
+        rpms = motor_filter.apply(rpms)
+
         action[0, :] = rpms
 
         # --- Print status periodically ---
