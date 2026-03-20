@@ -585,16 +585,14 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                     )
                     # thrust_pwm [MIN_PWM, MAX_PWM] -> cflib integer [10001, 60000]
                     thrust_cf = int(np.clip(
-                        CF_THRUST_MIN + (thrust_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM)
-                                      * (CF_THRUST_MAX - CF_THRUST_MIN),
+                        CF_THRUST_MIN + (thrust_pwm - MIN_PWM) / (MAX_PWM - MIN_PWM) * (CF_THRUST_MAX - CF_THRUST_MIN),
                         CF_THRUST_MIN, CF_THRUST_MAX
                     ))
                     # target_euler [rad] -> [deg]
                     roll_deg  = float(np.clip(np.degrees(target_euler[0]), -30., 30.))
                     pitch_deg = float(np.clip(np.degrees(target_euler[1]), -30., 30.))
                     yaw_deg   = float(np.clip(np.degrees(target_euler[2]), -30., 30.))
-                    cf.cf.commander.send_setpoint(roll_deg, pitch_deg,
-                                                  yaw_deg, thrust_cf)
+                    cf.cf.commander.send_setpoint(roll_deg, pitch_deg, yaw_deg, thrust_cf)
 
                 else:
                     # ── RATE MODE ─────────────────────────────────────────────
@@ -629,8 +627,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                     F_total   = float(np.sum(forces))
                     F_hover   = MASS * G
                     thrust_cf = int(np.clip(
-                        CF_THRUST_MIN + (F_total / (T2W * F_hover))
-                                      * (CF_THRUST_MAX - CF_THRUST_MIN),
+                        CF_THRUST_MIN + (F_total / (T2W * F_hover)) * (CF_THRUST_MAX - CF_THRUST_MIN),
                         CF_THRUST_MIN, CF_THRUST_MAX
                     ))
 
@@ -651,8 +648,7 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
                                                   -MAX_RATE_DPS, MAX_RATE_DPS))
                     yawrate_dps   = float(np.clip(np.degrees(rates_des[2]),
                                                   -MAX_RATE_DPS, MAX_RATE_DPS))
-                    cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps,
-                                                  yawrate_dps, thrust_cf)
+                    cf.cf.commander.send_setpoint(rollrate_dps, pitchrate_dps, yawrate_dps, thrust_cf)
 
                 logger.log(drone=0,
                            timestamp=(step_offset + i) / CONTROL_FREQ_HZ,
