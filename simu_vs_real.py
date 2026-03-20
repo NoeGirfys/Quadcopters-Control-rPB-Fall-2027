@@ -557,8 +557,8 @@ def run(real: bool = False, uri: str = DEFAULT_URI,
         try:
             cf.cf.platform.send_arming_request(True) # mandatory arming before sending any setpoint, otherwise the firmware will ignore them
             time.sleep(1.0)
-            step_offset = takeoff_real(cf)
             is_flying = True
+            step_offset = takeoff_real(cf)
             time.sleep(0.5)
 
             ctrl.reset()
