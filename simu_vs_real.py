@@ -95,23 +95,28 @@ def build_circle_waypoints():
 _real_state = dict(x=0., y=0., z=0.,
                    vx=0., vy=0., vz=0.,
                    roll=0., pitch=0., yaw=0.,
-                   gx=0., gy=0., gz=0.)
+                   gx=0., gy=0., gz=0.,
+                   qx=0., qy=0., qz=0., qw=1.)
 _state_ready = Event()
 
 
 def _state_cb(timestamp, data, logconf):
-    _real_state['x']     = data.get('stateEstimate.x',     0.) # m, world frame
+    _real_state['x']     = data.get('stateEstimate.x',     0.) # meters, world frame
     _real_state['y']     = data.get('stateEstimate.y',     0.)
     _real_state['z']     = data.get('stateEstimate.z',     0.)
-    _real_state['vx']    = data.get('stateEstimate.vx',    0.) # m/s, world frame
+    _real_state['vx']    = data.get('stateEstimate.vx',    0.) #m/s, world frame
     _real_state['vy']    = data.get('stateEstimate.vy',    0.)
     _real_state['vz']    = data.get('stateEstimate.vz',    0.)
-    _real_state['roll']  = data.get('stateEstimate.roll',  0.)
-    _real_state['pitch'] = data.get('stateEstimate.pitch', 0.) # MAYBE INVERTED SIGN
+    _real_state['roll']  = data.get('stateEstimate.roll',  0.) # degrees
+    _real_state['pitch'] = data.get('stateEstimate.pitch', 0.) # MAYBE INVERTED SIGN ?
     _real_state['yaw']   = data.get('stateEstimate.yaw',   0.)
     _real_state['gx']    = data.get('gyro.x',              0.) # deg/s, body frame
     _real_state['gy']    = data.get('gyro.y',              0.)
     _real_state['gz']    = data.get('gyro.z',              0.)
+    _real_state['qx']    = data.get('stateEstimate.qx',    0.)
+    _real_state['qy']    = data.get('stateEstimate.qy',    0.)
+    _real_state['qz']    = data.get('stateEstimate.qz',    0.)
+    _real_state['qw']    = data.get('stateEstimate.qw',    1.)
     _state_ready.set()
 
 
@@ -135,7 +140,15 @@ def start_logging(cf):
     cf.cf.log.add_config(lc2)
     lc2.start()
 
-    return [lc1, lc2]
+    lc3 = LogConfig('StateQuat', period_in_ms=20)
+    for v in ['stateEstimate.qx', 'stateEstimate.qy',
+              'stateEstimate.qz', 'stateEstimate.qw']:
+        lc3.add_variable(v, 'float')
+    lc3.data_received_cb.add_callback(_state_cb)
+    cf.cf.log.add_config(lc3)
+    lc3.start()
+
+    return [lc1, lc2, lc3]
 
 
 def real_state_to_obs() -> np.ndarray:
@@ -143,21 +156,24 @@ def real_state_to_obs() -> np.ndarray:
 
     Layout (matches _getDroneStateVector in BaseAviary):
         [0:3]   x, y, z          [m]
-        [3:7]   qx, qy, qz, qw
+        [3:7]   qx, qy, qz, qw  (directly from firmware Kalman filter)
         [7:10]  roll, pitch, yaw [rad]
         [10:13] vx, vy, vz       [m/s]  world frame
         [13:16] wx, wy, wz       [rad/s] world frame
-        [16:20] rpm0..3          (hover placeholder) NEVER USED, only to imitate the sim obs
+        [16:20] rpm0..3          (hover placeholder, never used by PID)
     """
+    # Quaternion directly from firmware — no Euler -> quat conversion needed
+    quat = np.array([_real_state['qx'], _real_state['qy'],
+                     _real_state['qz'], _real_state['qw']])  # [qx, qy, qz, qw]
+
+    # Euler angles in rad (still needed for obs[7:10])
     r = math.radians(_real_state['roll'])
     p = math.radians(_real_state['pitch'])
     y = math.radians(_real_state['yaw'])
 
-    rot  = Rotation.from_euler('xyz', [r, p, y])
-    quat = rot.as_quat()   # [qx, qy, qz, qw]
-
     # gyro deg/s -> rad/s, body frame -> world frame
-    w_body  = np.radians([_real_state['gx'], _real_state['gy'], _real_state['gz']])
+    rot    = Rotation.from_quat(quat)
+    w_body = np.radians([_real_state['gx'], _real_state['gy'], _real_state['gz']])
     w_world = rot.as_matrix() @ w_body
 
     return np.concatenate([
