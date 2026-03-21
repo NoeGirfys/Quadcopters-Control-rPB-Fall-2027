@@ -787,18 +787,60 @@ class MotorDynamicsFilter:
 #  PWM → RPM conversion (for pybullet-drones)
 # ===================================================================
 
-def pwm_to_rpm(pwm_values, max_rpm):
+# CF2.1+ per-motor thrust limits (with battery compensation ON by default)
+# [FW] src/platform/interface/platform_defaults_cf2.h:68-75
+# The firmware maps uint16 [0..65535] linearly to [0..THRUST_MAX] in Newtons.
+# Battery compensation adjusts the PWM duty cycle so that the same uint16
+# value produces the same physical thrust regardless of battery voltage.
+CF2_THRUST_MAX_PER_MOTOR = 0.12     # N  (CONFIG_CRAZYFLIE_21_PLUS)
+CF2_THRUST_MIN_PER_MOTOR = 0.01282  # N
+
+# [FW] motors.h:48 — the hardware timer only has 8-bit resolution
+MOTORS_PWM_BITS = 8
+
+
+def pwm_to_rpm(pwm_values, kf, truncate_8bit=True):
     """Convert firmware uint16 PWM [0..65535] to RPM for pybullet.
 
-    Assumption:  thrust ∝ rpm²  and  thrust ∝ PWM  (constant battery voltage)
-    → rpm = sqrt(PWM / 65535) × MAX_RPM
+    Faithfully replicates the real CF2.1+ signal chain:
+      1. (optional) Truncate to 8-bit timer resolution, like the real hardware
+      2. Map uint16 linearly to [0, THRUST_MAX] Newtons (battery compensation)
+      3. Convert thrust to RPM via  thrust = KF × rpm²
 
-    This is the standard approximation used in sim-to-real transfer.
+    Parameters
+    ----------
+    pwm_values : list/array of 4 uint16 PWMs
+    kf         : float — propeller thrust coefficient from the URDF [N/rpm²]
+    truncate_8bit : bool — if True, simulate the 8-bit timer truncation
+                    (default True for maximum fidelity; set False if you want
+                    the "ideal" mapping without quantization noise)
+
+    Returns
+    -------
+    np.ndarray of 4 RPM values
     """
     rpms = []
     for pwm in pwm_values:
-        ratio = max(0.0, min(1.0, pwm / UINT16_MAX))
-        rpms.append(math.sqrt(ratio) * max_rpm)
+        pwm = max(0.0, min(UINT16_MAX, pwm))
+
+        # [FW] motors.c:115  motorsConv16ToBits — 8-bit truncation
+        if truncate_8bit:
+            pwm = float(int(pwm) >> (16 - MOTORS_PWM_BITS)
+                        << (16 - MOTORS_PWM_BITS))
+
+        # [FW] motors.c:165  motorsCompensateBatteryVoltage
+        # With battery compensation ON (default), the firmware ensures
+        # that uint16 maps linearly to thrust:
+        #   thrust_per_motor = (pwm / 65535) * THRUST_MAX
+        thrust = (pwm / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
+
+        # Convert thrust (Newtons) → RPM for pybullet
+        #   thrust = KF × rpm²  →  rpm = sqrt(thrust / KF)
+        if thrust <= 0:
+            rpms.append(0.0)
+        else:
+            rpms.append(math.sqrt(thrust / kf))
+
     return np.array(rpms)
 
 
@@ -935,6 +977,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
 
     # Extract drone constants from the environment
     MAX_RPM = env.MAX_RPM
+    KF = env.KF    # thrust coefficient: thrust_per_prop = KF * rpm²
 
     # Initialize controller
     ctrl = CrazyflieFirmwarePID()
@@ -954,7 +997,9 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
     n_steps = len(waypoints)
 
     print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz")
-    print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {HOVER_RPM:.1f}")
+    print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {HOVER_RPM:.1f}, KF: {KF:.4e}")
+    print(f"[SIM] Firmware THRUST_MAX/motor: {CF2_THRUST_MAX_PER_MOTOR*1000:.1f} mN, "
+          f"RPM at THRUST_MAX: {math.sqrt(CF2_THRUST_MAX_PER_MOTOR/KF):.1f}")
     print(f"[SIM] Trajectory: {n_steps} steps, {duration_sec}s")
     print(f"[SIM] Phases: takeoff 3s → circle {duration_sec-6}s → land 3s")
 
@@ -989,7 +1034,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
         )
 
         # --- Convert PWM to RPM for pybullet ---
-        rpms = pwm_to_rpm(motor_pwm, MAX_RPM)
+        rpms = pwm_to_rpm(motor_pwm, KF)
 
         # --- Apply motor dynamics filter (simulates real motor lag) ---
         rpms = motor_filter.apply(rpms)
