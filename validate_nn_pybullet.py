@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Validate the trained NN controller inside gym-pybullet-drones (DYN mode).
+Validate the trained NN controller inside gym-pybullet-drones.
 
-Loads the weights from  trained_weights_cf2x.pt , builds the MLP policy,
-runs the CF2X simulation with Physics.DYN, and checks whether the drone
-regulates to the origin from various initial positions.
+Loads a saved checkpoint, builds the MLP policy, runs the CF2X simulation
+with a selectable BaseAviary physics mode, and checks whether the drone
+regulates to a chosen target position from various initial positions.
 
 The pipeline at each control step:
     1. Read state from pybullet  →  [pos, vel, rpy, rpy_rates]
@@ -14,8 +14,10 @@ The pipeline at each control step:
     5. Take sqrt, clip           →  RPMs sent to env.step()
 
 Usage:
-    python validate_nn_pybullet.py            # headless
-    python validate_nn_pybullet.py --gui      # with 3D viewer
+    python validate_nn_pybullet.py
+    python validate_nn_pybullet.py --gui
+    python validate_nn_pybullet.py --weights trained_weights_cf2x_nonlinear_h64_ep2000_lr1e-03.pt
+    python validate_nn_pybullet.py --physics pyb_drag
 """
 
 import sys, os, argparse
@@ -31,6 +33,56 @@ if PYB_DIR not in sys.path:
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
+
+
+def rotation_matrix_zyx_np(phi, theta, psi):
+    """Rotation matrix matching the convention used in training."""
+    cphi, sphi = np.cos(phi), np.sin(phi)
+    cth, sth = np.cos(theta), np.sin(theta)
+    cpsi, spsi = np.cos(psi), np.sin(psi)
+    return np.array([
+        [cth * cpsi, sphi * sth * cpsi - cphi * spsi, cphi * sth * cpsi + sphi * spsi],
+        [cth * spsi, sphi * sth * spsi + cphi * cpsi, cphi * sth * spsi - sphi * cpsi],
+        [-sth,       sphi * cth,                          cphi * cth],
+    ], dtype=np.float64)
+
+
+def world_ang_vel_to_body_rates(rpy, ang_v_world):
+    """Convert world-frame angular velocity to body-frame rates [p, q, r].
+
+    In Physics.DYN, gym-pybullet-drones stores body-frame rates in env.rpy_rates.
+    In all other modes, only env.ang_v is available; it is world-frame angular
+    velocity, so we map it back to the body frame with R^T ω_world.
+    """
+    R = rotation_matrix_zyx_np(rpy[0], rpy[1], rpy[2])
+    return R.T @ np.asarray(ang_v_world, dtype=np.float64)
+
+
+def physics_from_string(name):
+    """Map CLI string like 'dyn' or 'pyb_drag' to the Physics enum."""
+    for physics in Physics:
+        if physics.value == name:
+            return physics
+    allowed = ", ".join(p.value for p in Physics)
+    raise ValueError(f"Unknown physics mode '{name}'. Allowed: {allowed}")
+
+
+def resolve_weights_path(script_dir, weights_arg):
+    """Resolve checkpoint path from absolute or script-relative input."""
+    if os.path.isabs(weights_arg):
+        return weights_arg
+    candidate = os.path.join(script_dir, weights_arg)
+    if os.path.isfile(candidate):
+        return candidate
+    return weights_arg
+
+
+def build_plot_filename(weights_path, physics_mode, target_pos, duration):
+    """Create a descriptive plot filename from the checkpoint and validation setup."""
+    stem = os.path.splitext(os.path.basename(weights_path))[0]
+    tz = f"{target_pos[2]:.2f}".replace("-", "m").replace(".", "p")
+    dur = f"{duration:.1f}".replace(".", "p")
+    return f"validation_{stem}_phys-{physics_mode}_targetz-{tz}_T-{dur}s.png"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -114,34 +166,38 @@ def wrench_to_rpm(wrench, M_inv, max_rpm):
 def pybullet_state_to_goffin(env, drone_idx=0, target_pos=np.zeros(3)):
     """Extract the 12-dim ERROR state from pybullet in Goffin's ordering.
 
-    The NN was trained to regulate to origin, so we compute:
-        error_state = measured_state - target_state
-    where target_state has target_pos for positions and 0 for everything else.
+    Training was done on an error-state model centered at the origin. During
+    validation, we can therefore target any absolute hover point by feeding the
+    network the state error relative to ``target_pos``.
 
-    Goffin: [x, xdot, y, ydot, z, zdot, phi, phidot, theta, thetadot, psi, psidot]
+    Goffin ordering:
+        [x, xdot, y, ydot, z, zdot, phi, p, theta, q, psi, r]
 
     Notes
     -----
-    - pos, vel are in world frame (correct for the linearized model).
-    - rpy_rates in DYN mode are body-frame angular velocities,
-      which equal Euler rates at hover (small-angle regime).
+    - Position/velocity are in world frame, as in the training script.
+    - For Physics.DYN we use env.rpy_rates directly (body-frame rates).
+    - For all other BaseAviary physics modes, env.rpy_rates does not exist,
+      so we reconstruct [p, q, r] from env.ang_v.
     """
-    pos = env.pos[drone_idx]            # [x, y, z]
-    vel = env.vel[drone_idx]            # [vx, vy, vz] world frame
-    rpy = env.rpy[drone_idx]            # [φ, θ, ψ]
-    # In DYN mode, body-frame angular velocities ≈ Euler angle rates at hover
-    ang_rates = env.rpy_rates[drone_idx]  # [p, q, r] ≈ [φ_dot, θ_dot, ψ_dot]
+    pos = env.pos[drone_idx]
+    vel = env.vel[drone_idx]
+    rpy = env.rpy[drone_idx]
 
-    # Compute position error relative to target (velocities/angles target = 0)
+    if hasattr(env, "rpy_rates"):
+        body_rates = env.rpy_rates[drone_idx]
+    else:
+        body_rates = world_ang_vel_to_body_rates(rpy, env.ang_v[drone_idx]).astype(np.float32)
+
     err_pos = pos - target_pos
 
     state = np.array([
-        err_pos[0], vel[0],         # x_err, x_dot
-        err_pos[1], vel[1],         # y_err, y_dot
-        err_pos[2], vel[2],         # z_err, z_dot
-        rpy[0], ang_rates[0],       # phi, phi_dot
-        rpy[1], ang_rates[1],       # theta, theta_dot
-        rpy[2], ang_rates[2],       # psi, psi_dot
+        err_pos[0], vel[0],
+        err_pos[1], vel[1],
+        err_pos[2], vel[2],
+        rpy[0], body_rates[0],
+        rpy[1], body_rates[1],
+        rpy[2], body_rates[2],
     ], dtype=np.float32)
     return state
 
@@ -150,7 +206,7 @@ def pybullet_state_to_goffin(env, drone_idx=0, target_pos=np.zeros(3)):
 # 4. Main simulation loop
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_validation(policy, checkpoint, offset_xyz, gui=False, duration=4.0,
-                   target_pos=np.array([0.0, 0.0, 0.5])):
+                   target_pos=np.array([0.0, 0.0, 0.5]), physics_mode=Physics.DYN):
     """Run the NN controller in pybullet-drones and record the trajectory.
 
     Parameters
@@ -192,7 +248,7 @@ def run_validation(policy, checkpoint, offset_xyz, gui=False, duration=4.0,
         num_drones=1,
         initial_xyzs=np.array([[init_xyz[0], init_xyz[1], init_xyz[2]]]),
         initial_rpys=np.array([[0.0, 0.0, 0.0]]),
-        physics=Physics.DYN,
+        physics=physics_mode,
         ctrl_freq=CTRL_FREQ,
         gui=gui,
     )
@@ -207,7 +263,7 @@ def run_validation(policy, checkpoint, offset_xyz, gui=False, duration=4.0,
     rpm_log   = np.zeros((N_steps, 4))
     time_log  = np.zeros(N_steps)
 
-    print(f"  Running {N_steps} steps from offset={offset_xyz}, target={target_pos} ...")
+    print(f"  Running {N_steps} steps from offset={offset_xyz}, target={target_pos}, physics={physics_mode.value} ...")
 
     for k in range(N_steps):
         # 1. Get state (error relative to target)
@@ -258,7 +314,7 @@ def print_results(trajs, labels, target_pos):
               f"{np.linalg.norm(vel_T):10.5f}  {np.rad2deg(rpy_max):10.3f}°")
 
 
-def save_plots(trajs, labels, target_pos, filename="validation_results.png"):
+def save_plots(trajs, labels, target_pos, physics_mode, filename="validation_results.png"):
     """Save position trajectories plot (showing error from target)."""
     try:
         import matplotlib
@@ -286,7 +342,7 @@ def save_plots(trajs, labels, target_pos, filename="validation_results.png"):
     for j in range(3):
         axes[-1, j].set_xlabel("Time (s)")
 
-    fig.suptitle("NN Controller Validation in pybullet-drones (DYN mode)", fontsize=13)
+    fig.suptitle(f"NN Controller Validation in pybullet-drones ({physics_mode.value})", fontsize=13)
     fig.tight_layout()
     fig.savefig(filename, dpi=150)
     plt.close(fig)
@@ -299,16 +355,21 @@ def save_plots(trajs, labels, target_pos, filename="validation_results.png"):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gui", action="store_true", help="Open 3D viewer", default=True)
-    parser.add_argument("--weights", type=str, default="trained_weights_cf2x.pt",
-                        help="Path to saved weights checkpoint")
+    parser.add_argument("--weights", type=str, default="trained_weights_cf2x_nonlinear_h64_ep2000_lr1e-03.pt",
+                        help="Path to saved weights checkpoint (absolute or script-relative)")
+    parser.add_argument("--physics", type=str, default="dyn",
+                        choices=[p.value for p in Physics],
+                        help="BaseAviary physics mode used for validation")
     parser.add_argument("--duration", type=float, default=4.0,
                         help="Simulation duration (s)")
     parser.add_argument("--target_z", type=float, default=0.5,
                         help="Target hover altitude (m)")
     args = parser.parse_args()
 
+    physics_mode = physics_from_string(args.physics)
+
     # ── Load weights ──
-    ckpt_path = os.path.join(SCRIPT_DIR, args.weights)
+    ckpt_path = resolve_weights_path(SCRIPT_DIR, args.weights)
     if not os.path.isfile(ckpt_path):
         print(f"[ERROR] Weights file not found: {ckpt_path}")
         print("        Run  train_nn_cf2x.py  first.")
@@ -324,6 +385,9 @@ if __name__ == "__main__":
     policy.eval()
     print(f"[Loaded] {ckpt_path}")
     print(f"  ctrl_freq={ckpt['ctrl_freq']}, Ts={ckpt['Ts']:.5f}")
+    if "train_dynamics" in ckpt:
+        print(f"  trained_with={ckpt['train_dynamics']}")
+    print(f"  validation_physics={physics_mode.value}")
 
     # ── Target position (hover at this point) ──
     target_pos = np.array([0.0, 0.0, args.target_z])
@@ -331,10 +395,10 @@ if __name__ == "__main__":
     # ── Test offsets from target (same cube as training ±0.3m) ──
     test_offsets = [
         (0.0,  0.0,  0.0),     # already at target (trivial)
-        (0.3,  0.3,  0.3),     # cube corner
-        (-0.3, -0.3, -0.3),    # opposite corner
-        (0.3, -0.3,  0.0),     # edge
-        (0.0,  0.0,  0.3),     # above target
+        (0.5,  0.1,  0.05),     # cube corner
+        (-0.28, -0.1, -0.2),    # opposite corner
+        (0.05, -0.38,  0.0),     # edge
+        (0.0,  0.0,  0.53),     # above target
         (-0.2,  0.1, -0.15),   # random
     ]
 
@@ -343,13 +407,14 @@ if __name__ == "__main__":
     for offset in test_offsets:
         traj = run_validation(policy, ckpt, np.array(offset),
                               gui=args.gui, duration=args.duration,
-                              target_pos=target_pos)
+                              target_pos=target_pos, physics_mode=physics_mode)
         trajs.append(traj)
         labels.append(f"({offset[0]:+.1f}, {offset[1]:+.1f}, {offset[2]:+.1f})")
 
     # ── Print & plot ──
     print_results(trajs, labels, target_pos)
-    save_plots(trajs, labels, target_pos,
-               os.path.join(SCRIPT_DIR, "validation_results.png"))
+    plot_name = build_plot_filename(ckpt_path, physics_mode.value, target_pos, args.duration)
+    save_plots(trajs, labels, target_pos, physics_mode,
+               os.path.join(SCRIPT_DIR, plot_name))
 
     print("\nDone!")
