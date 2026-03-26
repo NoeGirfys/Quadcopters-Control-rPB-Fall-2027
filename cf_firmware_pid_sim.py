@@ -949,7 +949,7 @@ def obs_to_firmware_state(obs):
 #  MAIN — Simulation mode
 # ===================================================================
 
-def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
+def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
     """Run the full firmware PID pipeline in PyBullet simulation."""
     if not HAS_PYBULLET_DRONES:
         print("ERROR: gym-pybullet-drones not found. Install it first.")
@@ -1066,8 +1066,11 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
     env.close()
     print("[SIM] Done.")
 
-    # --- Plots ---
-    _plot_sim(log_t, log_sp, log_pos, log_vel, log_rpy, log_rpms, log_thrust)
+    sim_data = dict(t=log_t, sp=log_sp, pos=log_pos, vel=log_vel,
+                    rpy=log_rpy, rpms=log_rpms, thrust=log_thrust)
+    if plot:
+        _plot_sim(log_t, log_sp, log_pos, log_vel, log_rpy, log_rpms, log_thrust)
+    return sim_data
 
 
 def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
@@ -1146,6 +1149,67 @@ def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
     plt.tight_layout()
     plt.savefig('sim_results.png', dpi=150)
     print("[PLOT] Saved to sim_results.png")
+    plt.show()
+
+
+def _plot_comparison(real, sim):
+    """3×3 grid comparing simulation vs real drone: position (with setpoints),
+    velocity, and attitude (roll/pitch/yaw).
+
+    Parameters
+    ----------
+    real : dict with keys t, pos, vel, rpy  (Nx3 arrays, time in seconds)
+                          sp_t, sp           (setpoint times and positions)
+    sim  : dict returned by run_sim(plot=False) — keys t, pos, vel, rpy, sp
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping comparison plot.")
+        return
+
+    fig, axes = plt.subplots(3, 3, figsize=(16, 10))
+    fig.suptitle('Simulation vs Real Drone — State Comparison', fontsize=14)
+
+    pos_labels = ['x [m]',  'y [m]',  'z [m]']
+    vel_labels = ['vx [m/s]', 'vy [m/s]', 'vz [m/s]']
+    att_labels = ['roll [deg]', 'pitch [deg]', 'yaw [deg]']
+
+    for col in range(3):
+        # ── Row 0 : position ──────────────────────────────────────────
+        ax = axes[0, col]
+        ax.plot(sim['t'],      sim['pos'][:, col],  color='steelblue', label='sim',      lw=1.5)
+        ax.plot(real['t'],     real['pos'][:, col], color='tomato',    label='real',     lw=1.5, alpha=0.85)
+        if len(real['sp_t']) > 0:
+            ax.step(real['sp_t'], real['sp'][:, col],  color='gray',      label='setpoint', lw=1.0,
+                    where='post', linestyle='--', alpha=0.7)
+        ax.set_ylabel(pos_labels[col])
+        ax.set_title(f'Position {["x","y","z"][col]}')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        # ── Row 1 : velocity ──────────────────────────────────────────
+        ax = axes[1, col]
+        ax.plot(sim['t'],  sim['vel'][:, col],  color='steelblue', label='sim',  lw=1.5)
+        ax.plot(real['t'], real['vel'][:, col], color='tomato',    label='real', lw=1.5, alpha=0.85)
+        ax.set_ylabel(vel_labels[col])
+        ax.set_title(f'Velocity {["vx","vy","vz"][col]}')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+        # ── Row 2 : attitude ──────────────────────────────────────────
+        ax = axes[2, col]
+        ax.plot(sim['t'],  sim['rpy'][:, col],  color='steelblue', label='sim',  lw=1.5)
+        ax.plot(real['t'], real['rpy'][:, col], color='tomato',    label='real', lw=1.5, alpha=0.85)
+        ax.set_ylabel(att_labels[col])
+        ax.set_xlabel('Time [s]')
+        ax.set_title(['Roll', 'Pitch', 'Yaw'][col])
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('comparison_results.png', dpi=150)
+    print("[PLOT] Saved to comparison_results.png")
     plt.show()
 
 
@@ -1230,6 +1294,11 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             'gyro_x': 0, 'gyro_y': 0, 'gyro_z': 0
         }
 
+        # Timestamped data logs — filled during flight for comparison plot
+        real_log    = []   # one entry per _state_cb callback (~100 Hz)
+        real_sp_log = []   # one entry per setpoint command sent
+        flight_start = None  # set just before the main flight loop
+
         def _state_cb(timestamp, data, logconf):
             drone_state['x']  = data['stateEstimate.x']
             drone_state['y']  = data['stateEstimate.y']
@@ -1237,6 +1306,14 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             drone_state['vx'] = data['stateEstimate.vx']
             drone_state['vy'] = data['stateEstimate.vy']
             drone_state['vz'] = data['stateEstimate.vz']
+            # Record full state snapshot (attitude values come from last _att_cb)
+            if flight_start is not None:
+                real_log.append({
+                    't':     time.time() - flight_start,
+                    'x':     drone_state['x'],   'y':   drone_state['y'],   'z':   drone_state['z'],
+                    'vx':    drone_state['vx'],  'vy':  drone_state['vy'],  'vz':  drone_state['vz'],
+                    'roll':  drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
+                })
 
         def _att_cb(timestamp, data, logconf):
             drone_state['roll']  = data['stabilizer.roll']
@@ -1258,11 +1335,15 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         print("[REAL] Logging started. Flying trajectory...")
 
         START = time.time()
+        flight_start = START   # enable data logging in _state_cb
         try:
             for i in range(len(waypoints)):
                 sp = waypoints[i]
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
+
+                # Log setpoint for every control step (all modes)
+                real_sp_log.append({'t': time.time() - flight_start, 'pos': sp_pos.copy()})
 
                 if mode == "position":
                     # ─── Mode: position ───────────────────────────
@@ -1352,17 +1433,17 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
                 if z < cutoff_z:
                     break
+                real_sp_log.append({'t': time.time() - flight_start,
+                                    'pos': np.array([land_x, land_y, z])})
                 cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
                 time.sleep(1.0 / land_freq)
 
-            # Cut motors
-            cf.commander.send_setpoint(0, 0, 0, 0)
-            time.sleep(0.1)
             # Notify end of setpoints — this tells the firmware the PC-side
             # commander is stopping cleanly, rather than vanishing (watchdog
             # timeout).  The firmware then idles the motors gracefully without
             # entering a hard-locked state that would require a power cycle.
             cf.commander.send_notify_setpoint_stop()
+            time.sleep(0.1)
 
             log_state.stop()
             log_att.stop()
@@ -1373,6 +1454,25 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 pass
 
             print("[REAL] Landed and cleaned up.")
+
+        # ─── Post-flight: run headless sim + comparison plot ──────────────
+        if real_log:
+            real_t   = np.array([e['t']   for e in real_log])
+            real_pos = np.array([[e['x'],  e['y'],  e['z']]       for e in real_log])
+            real_vel = np.array([[e['vx'], e['vy'], e['vz']]      for e in real_log])
+            real_rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
+            sp_t_arr = np.array([e['t']   for e in real_sp_log])
+            sp_arr   = np.array([e['pos'] for e in real_sp_log])
+            real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
+                             sp_t=sp_t_arr, sp=sp_arr)
+
+            print("[REAL] Running headless simulation for comparison...")
+            if HAS_PYBULLET_DRONES:
+                sim_data = run_sim(duration_sec=duration_sec, gui=False,
+                                   hover_height=hover_height, radius=radius, plot=False)
+                _plot_comparison(real_data, sim_data)
+            else:
+                print("[REAL] pybullet-drones not found — skipping comparison plot.")
 
 
 # ===================================================================
