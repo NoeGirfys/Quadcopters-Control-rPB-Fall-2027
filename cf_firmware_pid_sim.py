@@ -784,6 +784,133 @@ class MotorDynamicsFilter:
 
 
 # ===================================================================
+#  Flow Deck v2 State Estimator Simulator
+# ===================================================================
+
+class FlowDeckSimulator:
+    """Simulates the state estimation pipeline of the Crazyflie Flow deck v2.
+
+    The Flow deck provides two sensors to the onboard Kalman filter (EKF):
+      - PMW3901 optical flow → horizontal velocity at 100 Hz
+      - VL53L1x ToF          → absolute height at ~50 Hz
+
+    Three effects are modelled:
+
+    1. **Correlated velocity noise (Ornstein-Uhlenbeck process)**
+       The raw PMW3901 pixel noise is white, but the onboard EKF smooths it.
+       The resulting velocity estimate drifts slowly, with a correlation time
+       of roughly τ ≈ 0.5–2 s.  A white-noise model (independent sample every
+       10 ms) would make the velocity PID react at 100 Hz — far too fast.
+       With the OU model the noise evolves on a ~1 s timescale, producing the
+       slow, realistic oscillations seen on the real drone.
+
+       OU update at each flow tick (dt = 10 ms):
+         α           = exp(-dt / τ_noise)          ← decay factor
+         σ_drive     = σ_v(h) · √(1 − α²)          ← injected std per step
+         n(t+dt) = α·n(t) + σ_drive · N(0,1)        ← coloured noise state
+
+       Steady-state std of n: σ_v(h) = vel_noise · h / ref_height
+       Source: mirrors EKF velocity estimate bandwidth observed on CF2.1+
+
+    2. **xy position integration drift**
+       x/y are integrated from the noisy velocity (no absolute xy reference).
+       z is replaced each flow update by the ToF measurement (σ ≈ 5 mm).
+       Typical position error after 1 s of OU noise ≈ σ_v · τ_noise ≈ 5 cm.
+
+    3. **Transport delay (~10 ms)**
+       One flow update period of latency between measurement and PID input.
+
+    Parameters
+    ----------
+    ctrl_freq  : int   — simulation control frequency [Hz]       (default 500)
+    vel_noise  : float — velocity noise std at ref_height [m/s]  (default 0.05)
+    ref_height : float — reference height for noise scaling [m]  (default 0.5)
+    tof_noise  : float — ToF height noise std [m]                (default 0.005)
+    noise_tau  : float — OU correlation time [s]                 (default 1.0)
+    """
+
+    FLOW_HZ = 100   # PMW3901 update rate as configured in the CF firmware
+
+    def __init__(self, ctrl_freq=500, vel_noise=0.05, ref_height=0.5,
+                 tof_noise=0.005, noise_tau=0.5):
+        self.ctrl_freq       = ctrl_freq
+        self.vel_noise       = vel_noise
+        self.ref_height      = ref_height
+        self.tof_noise       = tof_noise
+        self.noise_tau       = noise_tau
+        self._steps_per_flow = ctrl_freq // self.FLOW_HZ  # 5 steps at 500 Hz
+        self._dt_flow        = self._steps_per_flow / ctrl_freq  # 0.01 s
+        self._step           = 0
+
+        # Pre-compute OU decay factor (height-independent part)
+        self._ou_alpha = math.exp(-self._dt_flow / noise_tau)
+
+        # OU noise state (x and y channels, independent)
+        self._ou_x = 0.0
+        self._ou_y = 0.0
+
+        # EKF state estimate
+        self._pos_est = np.zeros(3)
+        self._vel_est = np.zeros(3)
+
+        # One-update-period transport delay buffer (~10 ms)
+        self._delayed_pos = np.zeros(3)
+        self._delayed_vel = np.zeros(3)
+
+    def reset(self, true_pos):
+        self._ou_x        = 0.0
+        self._ou_y        = 0.0
+        self._pos_est     = true_pos.copy()
+        self._vel_est     = np.zeros(3)
+        self._delayed_pos = true_pos.copy()
+        self._delayed_vel = np.zeros(3)
+        self._step = 0
+
+    def update(self, true_pos, true_vel):
+        """Advance one control step.
+
+        Returns (pos_est, vel_est) — coloured-noisy, delayed state as seen
+        by the position PID, mirroring stateEstimate.x/y/z on the real drone.
+        """
+        self._step += 1
+
+        if self._step % self._steps_per_flow == 0:
+            h = max(true_pos[2], 0.02)
+
+            # --- ToF z measurement (absolute, low noise) ---
+            z_meas = h + np.random.normal(0, self.tof_noise)
+            z_meas = max(0.01, z_meas)
+
+            # --- OU velocity noise (coloured, ~τ s correlation time) ---
+            # Target steady-state std scales linearly with height.
+            sigma_v    = self.vel_noise * (h / self.ref_height)
+            sigma_drive = sigma_v * math.sqrt(1.0 - self._ou_alpha ** 2)
+            self._ou_x  = self._ou_alpha * self._ou_x + sigma_drive * np.random.randn()
+            self._ou_y  = self._ou_alpha * self._ou_y + sigma_drive * np.random.randn()
+
+            vel_meas = true_vel.copy()
+            vel_meas[0] += self._ou_x
+            vel_meas[1] += self._ou_y
+
+            # --- Integrate xy; replace z with ToF (no z drift) ---
+            pos_new = np.array([
+                self._pos_est[0] + vel_meas[0] * self._dt_flow,
+                self._pos_est[1] + vel_meas[1] * self._dt_flow,
+                z_meas,
+            ])
+
+            # Push current estimate into delay buffer before updating
+            self._delayed_pos = self._pos_est.copy()
+            self._delayed_vel = self._vel_est.copy()
+
+            self._pos_est = pos_new
+            self._vel_est = vel_meas
+
+        # Return the delayed estimate (~10 ms transport delay)
+        return self._delayed_pos.copy(), self._delayed_vel.copy()
+
+
+# ===================================================================
 #  PWM → RPM conversion (for pybullet-drones)
 # ===================================================================
 
@@ -947,8 +1074,17 @@ def obs_to_firmware_state(obs):
 #  MAIN — Simulation mode
 # ===================================================================
 
-def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
-    """Run the full firmware PID pipeline in PyBullet simulation."""
+def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
+            simulate_flow_deck=False):
+    """Run the full firmware PID pipeline in PyBullet simulation.
+
+    Parameters
+    ----------
+    simulate_flow_deck : bool
+        If True, replace the perfect PyBullet state with a simulated Flow
+        deck v2 estimate (noise + delay) before feeding it to the position
+        PID.  This reproduces the oscillations seen on the real drone.
+    """
     if not HAS_PYBULLET_DRONES:
         print("ERROR: gym-pybullet-drones not found. Install it first.")
         sys.exit(1)
@@ -989,6 +1125,17 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
     HOVER_RPM = env.HOVER_RPM
     motor_filter.rpm = np.full(4, HOVER_RPM)
 
+    # Flow deck simulator (optional) — models sensor noise + delay
+    if simulate_flow_deck:
+        flow_deck = FlowDeckSimulator(ctrl_freq=CTRL_FREQ)
+        flow_deck.reset(np.array([0.0, 0.0, 0.02]))
+        print(f"[SIM] Flow deck simulation ON  "
+              f"(vel_noise={flow_deck.vel_noise} m/s @ {flow_deck.ref_height} m, "
+              f"tau={flow_deck.noise_tau} s, "
+              f"delay={1000/flow_deck.FLOW_HZ:.0f} ms)")
+    else:
+        flow_deck = None
+
     # Generate trajectory
     waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
                                     hover_height=hover_height, radius=radius)
@@ -1020,6 +1167,14 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
         # --- Extract state ---
         pos, vel, rpy_deg, gyro_deg = obs_to_firmware_state(obs[0])
 
+        # --- Optionally replace pos/vel with Flow deck estimate ---
+        # Attitude (rpy) and gyro come from the IMU which is much more
+        # accurate; only position and velocity are affected by the flow deck.
+        if flow_deck is not None:
+            pos_ctrl, vel_ctrl = flow_deck.update(pos, vel)
+        else:
+            pos_ctrl, vel_ctrl = pos, vel
+
         # --- Get setpoint ---
         sp = waypoints[i]
         setpoint_pos      = sp[0:3]
@@ -1028,7 +1183,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
         # --- Run firmware controller ---
         motor_pwm = ctrl.update(
             setpoint_pos, setpoint_yaw_rate,
-            pos, vel, rpy_deg, gyro_deg
+            pos_ctrl, vel_ctrl, rpy_deg, gyro_deg
         )
 
         # --- Convert PWM to RPM for pybullet ---
@@ -1040,10 +1195,12 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
         action[0, :] = rpms
 
         # --- Log ---
+        # Log pos_ctrl/vel_ctrl (what the PID sees) so that the comparison
+        # plot is on the same footing as the real drone's stateEstimate.
         log_t[i]      = i / CTRL_FREQ
         log_sp[i]     = setpoint_pos
-        log_pos[i]    = pos
-        log_vel[i]    = vel
+        log_pos[i]    = pos_ctrl
+        log_vel[i]    = vel_ctrl
         log_rpy[i]    = rpy_deg
         log_rpms[i]   = rpms
         log_thrust[i] = ctrl.actuator_thrust
@@ -1051,7 +1208,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True):
         # --- Print status periodically ---
         if i % (CTRL_FREQ * 1) == 0:
             t = i / CTRL_FREQ
-            print(f"  t={t:5.1f}s  pos=[{pos[0]:+.3f}, {pos[1]:+.3f}, {pos[2]:.3f}]  "
+            print(f"  t={t:5.1f}s  pos=[{pos_ctrl[0]:+.3f}, {pos_ctrl[1]:+.3f}, {pos_ctrl[2]:.3f}]  "
                   f"sp=[{sp[0]:+.3f}, {sp[1]:+.3f}, {sp[2]:.3f}]  "
                   f"thrust={ctrl.actuator_thrust:.0f}  "
                   f"rpms=[{rpms[0]:.0f},{rpms[1]:.0f},{rpms[2]:.0f},{rpms[3]:.0f}]")
@@ -1485,10 +1642,11 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
                              sp_t=sp_t_arr, sp=sp_arr)
 
-            print("[REAL] Running headless simulation for comparison...")
+            print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
             if HAS_PYBULLET_DRONES:
                 sim_data = run_sim(duration_sec=duration_sec, gui=False,
-                                   hover_height=hover_height, radius=radius, plot=False)
+                                   hover_height=hover_height, radius=radius, plot=False,
+                                   simulate_flow_deck=True)
                 _plot_comparison(real_data, sim_data)
             else:
                 print("[REAL] pybullet-drones not found — skipping comparison plot.")
@@ -1522,11 +1680,14 @@ MODES:
                         help='PyBullet GUI (default: True)')
     parser.add_argument('--uri', default='radio://0/80/2M/E7E7E7E7E7',
                         help='Crazyflie radio URI (for real modes)')
+    parser.add_argument('--flow-deck-sim', action='store_true',
+                        help='Simulate Flow deck v2 noise+delay in sim mode')
     args = parser.parse_args()
 
     if args.mode == 'sim':
         run_sim(duration_sec=args.duration, gui=args.gui,
-                hover_height=args.height, radius=args.radius)
+                hover_height=args.height, radius=args.radius,
+                simulate_flow_deck=args.flow_deck_sim)
     else:
         run_real(mode=args.mode, uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
