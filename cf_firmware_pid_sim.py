@@ -823,15 +823,15 @@ class FlowDeckSimulator:
     Parameters
     ----------
     ctrl_freq  : int   — simulation control frequency [Hz]       (default 500)
-    vel_noise  : float — velocity noise std at ref_height [m/s]  (default 0.05)
+    vel_noise  : float — velocity noise std at ref_height [m/s]  (default 0.035)
     ref_height : float — reference height for noise scaling [m]  (default 0.5)
     tof_noise  : float — ToF height noise std [m]                (default 0.005)
-    noise_tau  : float — OU correlation time [s]                 (default 1.0)
+    noise_tau  : float — OU correlation time [s]                 (default 0.5)
     """
 
     FLOW_HZ = 100   # PMW3901 update rate as configured in the CF firmware
 
-    def __init__(self, ctrl_freq=500, vel_noise=0.05, ref_height=0.5,
+    def __init__(self, ctrl_freq=500, vel_noise=0.035, ref_height=0.5,
                  tof_noise=0.005, noise_tau=0.5):
         self.ctrl_freq       = ctrl_freq
         self.vel_noise       = vel_noise
