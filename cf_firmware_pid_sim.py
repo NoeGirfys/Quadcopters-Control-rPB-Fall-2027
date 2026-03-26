@@ -788,126 +788,97 @@ class MotorDynamicsFilter:
 # ===================================================================
 
 class FlowDeckSimulator:
-    """Simulates the state estimation pipeline of the Crazyflie Flow deck v2.
+    """Simulates the transport delay of the Crazyflie Flow deck v2.
 
-    The Flow deck provides two sensors to the onboard Kalman filter (EKF):
-      - PMW3901 optical flow → horizontal velocity at 100 Hz
-      - VL53L1x ToF          → absolute height at ~50 Hz
+    The primary effect responsible for PID oscillations is the latency
+    between the physical state and what the position PID receives:
+      - PMW3901 sampling at 100 Hz       → 10 ms per measurement
+      - I2C transfer + EKF update        → ~5 ms
+      - Total round-trip to PID input    → ~15 ms
 
-    Three effects are modelled:
+    This delay reduces the phase margin of the closed-loop system.  The
+    default CF2.1+ gains were tuned for Lighthouse/Loco (<5 ms latency);
+    with the Flow deck the same gains are often marginally stable → oscillations.
 
-    1. **Correlated velocity noise (Ornstein-Uhlenbeck process)**
-       The raw PMW3901 pixel noise is white, but the onboard EKF smooths it.
-       The resulting velocity estimate drifts slowly, with a correlation time
-       of roughly τ ≈ 0.5–2 s.  A white-noise model (independent sample every
-       10 ms) would make the velocity PID react at 100 Hz — far too fast.
-       With the OU model the noise evolves on a ~1 s timescale, producing the
-       slow, realistic oscillations seen on the real drone.
-
-       OU update at each flow tick (dt = 10 ms):
-         α           = exp(-dt / τ_noise)          ← decay factor
-         σ_drive     = σ_v(h) · √(1 − α²)          ← injected std per step
-         n(t+dt) = α·n(t) + σ_drive · N(0,1)        ← coloured noise state
-
-       Steady-state std of n: σ_v(h) = vel_noise · h / ref_height
-       Source: mirrors EKF velocity estimate bandwidth observed on CF2.1+
-
-    2. **xy position integration drift**
-       x/y are integrated from the noisy velocity (no absolute xy reference).
-       z is replaced each flow update by the ToF measurement (σ ≈ 5 mm).
-       Typical position error after 1 s of OU noise ≈ σ_v · τ_noise ≈ 5 cm.
-
-    3. **Transport delay (~10 ms)**
-       One flow update period of latency between measurement and PID input.
+    An optional Ornstein-Uhlenbeck velocity noise model (vel_noise > 0) is
+    available for realism testing, but is disabled by default: deterministic
+    delay-only runs are more useful for systematic PID tuning.
 
     Parameters
     ----------
-    ctrl_freq  : int   — simulation control frequency [Hz]       (default 500)
-    vel_noise  : float — velocity noise std at ref_height [m/s]  (default 0.035)
-    ref_height : float — reference height for noise scaling [m]  (default 0.5)
-    tof_noise  : float — ToF height noise std [m]                (default 0.005)
-    noise_tau  : float — OU correlation time [s]                 (default 0.5)
+    ctrl_freq : int   — simulation control frequency [Hz]           (default 500)
+    delay_ms  : float — total sensor-to-PID latency [ms]           (default 25)
+    vel_noise : float — OU velocity noise std at ref_height [m/s]
+                        Set to 0 (default) to disable noise.
+    ref_height: float — reference height for noise scaling [m]     (default 0.5)
+    noise_tau : float — OU correlation time [s]                    (default 0.5)
     """
 
     FLOW_HZ = 100   # PMW3901 update rate as configured in the CF firmware
 
-    def __init__(self, ctrl_freq=500, vel_noise=0.035, ref_height=0.5,
-                 tof_noise=0.005, noise_tau=0.5):
-        self.ctrl_freq       = ctrl_freq
-        self.vel_noise       = vel_noise
-        self.ref_height      = ref_height
-        self.tof_noise       = tof_noise
-        self.noise_tau       = noise_tau
-        self._steps_per_flow = ctrl_freq // self.FLOW_HZ  # 5 steps at 500 Hz
-        self._dt_flow        = self._steps_per_flow / ctrl_freq  # 0.01 s
-        self._step           = 0
+    def __init__(self, ctrl_freq=500, delay_ms=110,
+                 vel_noise=0.0, ref_height=0.5, noise_tau=0.5):
+        self.ctrl_freq  = ctrl_freq
+        self.delay_ms   = delay_ms
+        self.vel_noise  = vel_noise
+        self.ref_height = ref_height
+        self.noise_tau  = noise_tau
 
-        # Pre-compute OU decay factor (height-independent part)
-        self._ou_alpha = math.exp(-self._dt_flow / noise_tau)
+        # Delay buffer: holds the last `delay_steps` (pos, vel) pairs
+        delay_steps = max(1, round(delay_ms * 1e-3 * ctrl_freq))
+        self._delay_steps = delay_steps
+        self._buf_pos = [np.zeros(3)] * delay_steps
+        self._buf_vel = [np.zeros(3)] * delay_steps
+        self._head = 0   # circular buffer write index
 
-        # OU noise state (x and y channels, independent)
-        self._ou_x = 0.0
-        self._ou_y = 0.0
-
-        # EKF state estimate
-        self._pos_est = np.zeros(3)
-        self._vel_est = np.zeros(3)
-
-        # One-update-period transport delay buffer (~10 ms)
-        self._delayed_pos = np.zeros(3)
-        self._delayed_vel = np.zeros(3)
+        # OU noise state (only used when vel_noise > 0)
+        self._dt_flow  = 1.0 / self.FLOW_HZ
+        self._ou_alpha = math.exp(-self._dt_flow / noise_tau) if noise_tau > 0 else 0.0
+        self._ou_x     = 0.0
+        self._ou_y     = 0.0
+        self._step     = 0
+        self._steps_per_flow = ctrl_freq // self.FLOW_HZ
 
     def reset(self, true_pos):
-        self._ou_x        = 0.0
-        self._ou_y        = 0.0
-        self._pos_est     = true_pos.copy()
-        self._vel_est     = np.zeros(3)
-        self._delayed_pos = true_pos.copy()
-        self._delayed_vel = np.zeros(3)
-        self._step = 0
+        self._buf_pos = [true_pos.copy() for _ in range(self._delay_steps)]
+        self._buf_vel = [np.zeros(3)     for _ in range(self._delay_steps)]
+        self._head  = 0
+        self._ou_x  = 0.0
+        self._ou_y  = 0.0
+        self._step  = 0
 
     def update(self, true_pos, true_vel):
         """Advance one control step.
 
-        Returns (pos_est, vel_est) — coloured-noisy, delayed state as seen
-        by the position PID, mirroring stateEstimate.x/y/z on the real drone.
+        Returns (pos_delayed, vel_delayed) — the state seen by the position
+        PID after the Flow deck's transport delay.  If vel_noise > 0, OU
+        noise is added at 100 Hz before the delay buffer.
         """
         self._step += 1
 
-        if self._step % self._steps_per_flow == 0:
+        pos_in = true_pos.copy()
+        vel_in = true_vel.copy()
+
+        # Optional OU velocity noise (100 Hz ticks only)
+        if self.vel_noise > 0 and self._step % self._steps_per_flow == 0:
             h = max(true_pos[2], 0.02)
-
-            # --- ToF z measurement (absolute, low noise) ---
-            z_meas = h + np.random.normal(0, self.tof_noise)
-            z_meas = max(0.01, z_meas)
-
-            # --- OU velocity noise (coloured, ~τ s correlation time) ---
-            # Target steady-state std scales linearly with height.
-            sigma_v    = self.vel_noise * (h / self.ref_height)
+            sigma_v     = self.vel_noise * (h / self.ref_height)
             sigma_drive = sigma_v * math.sqrt(1.0 - self._ou_alpha ** 2)
             self._ou_x  = self._ou_alpha * self._ou_x + sigma_drive * np.random.randn()
             self._ou_y  = self._ou_alpha * self._ou_y + sigma_drive * np.random.randn()
+            vel_in[0]  += self._ou_x
+            vel_in[1]  += self._ou_y
+            pos_in[0]  += self._ou_x * self._dt_flow
+            pos_in[1]  += self._ou_y * self._dt_flow
 
-            vel_meas = true_vel.copy()
-            vel_meas[0] += self._ou_x
-            vel_meas[1] += self._ou_y
+        # Write current (possibly noisy) state into circular delay buffer
+        self._buf_pos[self._head] = pos_in
+        self._buf_vel[self._head] = vel_in
+        self._head = (self._head + 1) % self._delay_steps
 
-            # --- Integrate xy; replace z with ToF (no z drift) ---
-            pos_new = np.array([
-                self._pos_est[0] + vel_meas[0] * self._dt_flow,
-                self._pos_est[1] + vel_meas[1] * self._dt_flow,
-                z_meas,
-            ])
-
-            # Push current estimate into delay buffer before updating
-            self._delayed_pos = self._pos_est.copy()
-            self._delayed_vel = self._vel_est.copy()
-
-            self._pos_est = pos_new
-            self._vel_est = vel_meas
-
-        # Return the delayed estimate (~10 ms transport delay)
-        return self._delayed_pos.copy(), self._delayed_vel.copy()
+        # Read oldest entry (= state from delay_ms ago)
+        tail = self._head   # after increment, head points to oldest slot
+        return self._buf_pos[tail].copy(), self._buf_vel[tail].copy()
 
 
 # ===================================================================
@@ -1129,10 +1100,9 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
     if simulate_flow_deck:
         flow_deck = FlowDeckSimulator(ctrl_freq=CTRL_FREQ)
         flow_deck.reset(np.array([0.0, 0.0, 0.02]))
-        print(f"[SIM] Flow deck simulation ON  "
-              f"(vel_noise={flow_deck.vel_noise} m/s @ {flow_deck.ref_height} m, "
-              f"tau={flow_deck.noise_tau} s, "
-              f"delay={1000/flow_deck.FLOW_HZ:.0f} ms)")
+        noise_str = (f", vel_noise={flow_deck.vel_noise} m/s (OU τ={flow_deck.noise_tau}s)"
+                     if flow_deck.vel_noise > 0 else ", noise OFF")
+        print(f"[SIM] Flow deck simulation ON — delay={flow_deck.delay_ms} ms{noise_str}")
     else:
         flow_deck = None
 
@@ -1695,7 +1665,7 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             if HAS_PYBULLET_DRONES:
                 sim_data = run_sim(duration_sec=duration_sec, gui=False,
                                    hover_height=hover_height, radius=radius, plot=False,
-                                   simulate_flow_deck=False)
+                                   simulate_flow_deck=True)
                 _plot_comparison(real_data, sim_data)
             else:
                 print("[REAL] pybullet-drones not found — skipping comparison plot.")
