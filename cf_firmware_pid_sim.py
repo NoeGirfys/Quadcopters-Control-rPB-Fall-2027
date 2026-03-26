@@ -966,7 +966,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
         num_drones=1,
         initial_xyzs=np.array([[0.0, 0.0, 0.02]]),
         initial_rpys=np.array([[0.0, 0.0, 0.0]]),
-        physics=Physics.PYB,
+        physics=Physics.PYB_GND_DRAG_DW,
         pyb_freq=PYB_FREQ,
         ctrl_freq=CTRL_FREQ,
         gui=gui,
