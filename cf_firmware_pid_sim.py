@@ -858,7 +858,7 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     n_steps = int(ctrl_freq * duration_sec)
     waypoints = np.zeros((n_steps, 4))
 
-    takeoff_time   = 5    # seconds
+    takeoff_time   = 2    # seconds
     circle_time    = duration_sec - 2 * takeoff_time   # seconds of circling
 
     takeoff_steps  = int(ctrl_freq * takeoff_time)
@@ -1514,8 +1514,8 @@ MODES:
                         help='Control mode (default: sim)')
     parser.add_argument('--duration', default=15, type=float,
                         help='Flight duration in seconds (default: 15)')
-    parser.add_argument('--height', default=0.5, type=float,
-                        help='Hover height in meters (default: 0.5)')
+    parser.add_argument('--height', default=1.0, type=float,
+                        help='Hover height in meters (default: 1.0)')
     parser.add_argument('--radius', default=0.5, type=float,
                         help='Circle radius in meters (default: 0.5)')
     parser.add_argument('--gui', default=True, type=lambda x: x.lower() == 'true',
