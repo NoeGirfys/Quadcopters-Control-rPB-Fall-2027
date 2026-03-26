@@ -1059,7 +1059,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
                   f"rpms=[{rpms[0]:.0f},{rpms[1]:.0f},{rpms[2]:.0f},{rpms[3]:.0f}]")
 
         # --- Render & sync ---
-        env.render()
+        #env.render()
         if gui:
             sync(i, START, 1.0 / CTRL_FREQ)
 
