@@ -858,9 +858,8 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     n_steps = int(ctrl_freq * duration_sec)
     waypoints = np.zeros((n_steps, 4))
 
-    takeoff_time   = 3.0    # seconds
-    circle_time    = duration_sec - 6.0   # seconds of circling
-    landing_time   = 3.0
+    takeoff_time   = 5    # seconds
+    circle_time    = duration_sec - 2 * takeoff_time   # seconds of circling
 
     takeoff_steps  = int(ctrl_freq * takeoff_time)
     circle_steps   = int(ctrl_freq * circle_time)
@@ -869,8 +868,7 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     # --- Phase 1: Takeoff (vertical climb to hover_height) ---
     for i in range(takeoff_steps):
         t = i / takeoff_steps
-        # Smooth cubic interpolation
-        z = hover_height * (3 * t**2 - 2 * t**3)
+        z = hover_height * t
         waypoints[i] = [0.0, 0.0, z, 0.0]
 
     # --- Phase 2: Circle at hover_height ---
@@ -885,7 +883,7 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     # First, the circle ends near (0, 0).  Descend smoothly.
     for i in range(landing_steps):
         t = i / landing_steps
-        z = hover_height * (1.0 - (3 * t**2 - 2 * t**3))
+        z = hover_height * (1.0 - t)
         waypoints[takeoff_steps + circle_steps + i] = [0.0, 0.0, z, 0.0]
 
     return waypoints
@@ -1331,8 +1329,29 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.start()
         log_att.start()
 
-        time.sleep(1.0)  # wait for first log data
-        print("[REAL] Logging started. Flying trajectory...")
+        # ── Reset Kalman estimator ────────────────────────────────────
+        # Without this, the drone's position estimate keeps the value from
+        # the previous flight (or wherever the estimator drifted to).
+        # All trajectory setpoints are in the estimator frame, so if the
+        # estimator thinks the drone is at (1, 0, 0) the first setpoint
+        # (0, 0, z) will make it fly sideways — the drift you observe.
+        # After reset the estimator restarts from (0, 0, 0), which becomes
+        # the origin for the whole trajectory.
+        print("[REAL] Resetting Kalman estimator...")
+        cf.param.set_value('kalman.resetEstimation', '1')
+        time.sleep(0.1)
+        cf.param.set_value('kalman.resetEstimation', '0')
+        time.sleep(2.0)   # let filter converge and receive first log packets
+        print(f"[REAL] Estimator ready — pos=({drone_state['x']:.3f}, "
+              f"{drone_state['y']:.3f}, {drone_state['z']:.3f})")
+
+        # ── Unlock commander watchdog ─────────────────────────────────
+        # The firmware requires receiving setpoints before it accepts real
+        # commands (and after each re-arm following a landing).
+        for _ in range(50):
+            cf.commander.send_setpoint(0, 0, 0, 0)
+            time.sleep(0.02)
+        print("[REAL] Commander unlocked. Flying trajectory...")
 
         START = time.time()
         flight_start = START   # enable data logging in _state_cb
