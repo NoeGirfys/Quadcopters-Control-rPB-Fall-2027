@@ -1059,7 +1059,7 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5):
                   f"rpms=[{rpms[0]:.0f},{rpms[1]:.0f},{rpms[2]:.0f},{rpms[3]:.0f}]")
 
         # --- Render & sync ---
-        #env.render()
+        env.render()
         if gui:
             sync(i, START, 1.0 / CTRL_FREQ)
 
@@ -1321,19 +1321,51 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 sync(i, START, 1.0 / CTRL_FREQ)
 
         except KeyboardInterrupt:
-            print("\n[REAL] Interrupted!")
+            print("\n[REAL] Interrupted! Soft landing...")
         finally:
-            # Stop motors
-            cf.commander.send_setpoint(0, 0, 0, 0)
-            time.sleep(0.1)
-            log_state.stop()
-            log_att.stop()
-
-            # Restore normal flight mode if we changed it
+            # ─── Smooth landing ───────────────────────────────
+            # Descend from current position to ~5 cm, then cut motors.
+            # Uses position mode for simplicity and safety (the onboard
+            # PIDs handle attitude even if we were in rate mode before).
+            #
+            # First, restore normal stabilization so send_position_setpoint works.
             if mode == "rate":
                 cf.param.set_value('flightmode.stabModeRoll',  '1')
                 cf.param.set_value('flightmode.stabModePitch', '1')
                 cf.param.set_value('flightmode.stabModeYaw',   '1')
+                time.sleep(0.05)
+
+            land_x = drone_state['x']
+            land_y = drone_state['y']
+            land_z = drone_state['z']
+            land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
+            land_freq = 20  # Hz — position setpoints don't need high rate
+            land_steps = int(land_freq * land_duration)
+            cutoff_z = 0.05  # m — cut motors below this height
+
+            print(f"[REAL] Landing from z={land_z:.2f}m over {land_duration:.1f}s...")
+
+            land_start = time.time()
+            for j in range(land_steps):
+                frac = (j + 1) / land_steps
+                # Smooth cubic descent
+                z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
+                if z < cutoff_z:
+                    break
+                cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
+                time.sleep(1.0 / land_freq)
+
+            # Cut motors
+            cf.commander.send_setpoint(0, 0, 0, 0)
+            time.sleep(0.1)
+
+            log_state.stop()
+            log_att.stop()
+
+            # Restore normal flight mode (if not already done above)
+            if mode == "rate":
+                # Already restored above before landing
+                pass
 
             print("[REAL] Landed and cleaned up.")
 
