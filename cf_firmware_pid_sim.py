@@ -1695,7 +1695,7 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             if HAS_PYBULLET_DRONES:
                 sim_data = run_sim(duration_sec=duration_sec, gui=False,
                                    hover_height=hover_height, radius=radius, plot=False,
-                                   simulate_flow_deck=True)
+                                   simulate_flow_deck=False)
                 _plot_comparison(real_data, sim_data)
             else:
                 print("[REAL] pybullet-drones not found — skipping comparison plot.")
