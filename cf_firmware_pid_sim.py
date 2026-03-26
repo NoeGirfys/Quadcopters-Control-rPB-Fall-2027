@@ -1358,6 +1358,11 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             # Cut motors
             cf.commander.send_setpoint(0, 0, 0, 0)
             time.sleep(0.1)
+            # Notify end of setpoints — this tells the firmware the PC-side
+            # commander is stopping cleanly, rather than vanishing (watchdog
+            # timeout).  The firmware then idles the motors gracefully without
+            # entering a hard-locked state that would require a power cycle.
+            cf.commander.send_notify_setpoint_stop()
 
             log_state.stop()
             log_att.stop()
