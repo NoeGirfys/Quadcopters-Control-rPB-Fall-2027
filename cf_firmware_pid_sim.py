@@ -1369,11 +1369,54 @@ def _plot_comparison(real, sim):
 
 
 # ===================================================================
+#  Push Python PID constants → real Crazyflie firmware via cflib
+# ===================================================================
+
+def push_pid_gains_to_drone(cf):
+    """Write the Python PID constants to the drone's onboard firmware.
+
+    All gains defined at the top of this file are sent via cf.param.set_value()
+    so that the real drone uses the exact same tuning as the simulation.
+    Changes are volatile: they reset to firmware defaults on power-cycle.
+
+    Firmware parameter groups (from platform_defaults_cf2.h):
+      posCtlPid   — position PID  (x/y/z)
+      velCtlPid   — velocity PID  (vx/vy/vz)
+      pid_attitude — attitude PID (roll/pitch/yaw)
+      pid_rate    — angular rate PID (roll/pitch/yaw)
+    """
+    gains = {
+        # ── Position PID ────────────────────────────────────────────
+        'posCtlPid.xKp': PID_POS_X_KP,  'posCtlPid.xKi': PID_POS_X_KI,  'posCtlPid.xKd': PID_POS_X_KD,
+        'posCtlPid.yKp': PID_POS_Y_KP,  'posCtlPid.yKi': PID_POS_Y_KI,  'posCtlPid.yKd': PID_POS_Y_KD,
+        'posCtlPid.zKp': PID_POS_Z_KP,  'posCtlPid.zKi': PID_POS_Z_KI,  'posCtlPid.zKd': PID_POS_Z_KD,
+        # ── Velocity PID ────────────────────────────────────────────
+        'velCtlPid.vxKp': PID_VEL_X_KP,  'velCtlPid.vxKi': PID_VEL_X_KI,  'velCtlPid.vxKd': PID_VEL_X_KD,
+        'velCtlPid.vyKp': PID_VEL_Y_KP,  'velCtlPid.vyKi': PID_VEL_Y_KI,  'velCtlPid.vyKd': PID_VEL_Y_KD,
+        'velCtlPid.vzKp': PID_VEL_Z_KP,  'velCtlPid.vzKi': PID_VEL_Z_KI,  'velCtlPid.vzKd': PID_VEL_Z_KD,
+        # ── Attitude PID ────────────────────────────────────────────
+        'pid_attitude.roll_kp':  PID_ROLL_KP,   'pid_attitude.roll_ki':  PID_ROLL_KI,   'pid_attitude.roll_kd':  PID_ROLL_KD,
+        'pid_attitude.pitch_kp': PID_PITCH_KP,  'pid_attitude.pitch_ki': PID_PITCH_KI,  'pid_attitude.pitch_kd': PID_PITCH_KD,
+        'pid_attitude.yaw_kp':   PID_YAW_KP,    'pid_attitude.yaw_ki':   PID_YAW_KI,    'pid_attitude.yaw_kd':   PID_YAW_KD,
+        # ── Rate PID ────────────────────────────────────────────────
+        'pid_rate.roll_kp':  PID_ROLL_RATE_KP,   'pid_rate.roll_ki':  PID_ROLL_RATE_KI,   'pid_rate.roll_kd':  PID_ROLL_RATE_KD,
+        'pid_rate.pitch_kp': PID_PITCH_RATE_KP,  'pid_rate.pitch_ki': PID_PITCH_RATE_KI,  'pid_rate.pitch_kd': PID_PITCH_RATE_KD,
+        'pid_rate.yaw_kp':   PID_YAW_RATE_KP,    'pid_rate.yaw_ki':   PID_YAW_RATE_KI,    'pid_rate.yaw_kd':   PID_YAW_RATE_KD,
+    }
+
+    print("[GAINS] Pushing PID gains to drone...")
+    for param, value in gains.items():
+        cf.param.set_value(param, str(value))
+    print(f"[GAINS] Done — {len(gains)} parameters written.")
+
+
+# ===================================================================
 #  MAIN — Real drone modes
 # ===================================================================
 
 def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
-             duration_sec=15, hover_height=0.5, radius=0.5):
+             duration_sec=15, hover_height=0.5, radius=0.5,
+             push_gains=False):
     """Run with a real Crazyflie drone.
 
     Parameters
@@ -1384,6 +1427,9 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         'position' — Sends position setpoint, drone runs all PIDs
     uri : str
         Crazyflie radio URI
+    push_gains : bool
+        If True, overwrite the drone's onboard PID gains with the Python
+        constants defined at the top of this file before flying.
     """
     if not HAS_CFLIB:
         print("ERROR: cflib not found. pip install cflib")
@@ -1410,6 +1456,9 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
     with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
         cf = scf.cf
         print("[REAL] Connected!")
+
+        if push_gains:
+            push_pid_gains_to_drone(cf)
 
         # For rate mode, disable the onboard stabilizer's attitude PID
         # so send_setpoint sends rate commands directly.
@@ -1682,6 +1731,8 @@ MODES:
                         help='Crazyflie radio URI (for real modes)')
     parser.add_argument('--flow-deck-sim', action='store_true',
                         help='Simulate Flow deck v2 noise+delay in sim mode')
+    parser.add_argument('--push-gains', action='store_true',
+                        help='Overwrite drone PID gains with Python constants before flying')
     args = parser.parse_args()
 
     if args.mode == 'sim':
@@ -1691,7 +1742,7 @@ MODES:
     else:
         run_real(mode=args.mode, uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
-                 radius=args.radius)
+                 radius=args.radius, push_gains=args.push_gains)
 
 
 if __name__ == "__main__":
