@@ -1427,6 +1427,13 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         cf = scf.cf
         print("[REAL] Connected!")
 
+        # On s'assure de désactiver l'écart-type adaptatif
+        cf.param.set_value('motion.adaptive', '0')
+
+        # On augmente l'écart-type fixe du Flowdeck (par défaut à 2.0)
+        # La valeur de 10.0 est un bon point de départ pour lisser les oscillations selon les tests de Bitcraze
+        cf.param.set_value('motion.flowStdFixed', '10.0')
+
         if push_gains:
             push_pid_gains_to_drone(cf)
 

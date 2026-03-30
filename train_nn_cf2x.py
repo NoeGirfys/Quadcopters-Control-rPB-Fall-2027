@@ -2,13 +2,15 @@
 """
 Train a neural network controller for the Crazyflie 2.x (CF2X) quadcopter.
 
-Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with
-CF2X physical parameters from gym-pybullet-drones.
+Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
+  - CF2X physical parameters from gym-pybullet-drones
+  - Nonlinear dynamics matching pybullet's DYN mode exactly:
+      * full rotation matrix (no small-angle approximation for translation)
+      * gyroscopic coupling  tau_net = tau - omega x (J*omega)
+      * semi-implicit Euler integration (velocity first, then position)
+      * same sub-stepping structure (5 sub-steps at 1/240 s per ctrl step)
 
-Two dynamics modes (--linear flag):
-  - Nonlinear (default): EXACT replica of pybullet's DYN mode, including
-    quaternion integration, gyroscopic coupling, semi-implicit Euler.
-  - Linear (--linear): affine linearized model with ZOH discretization.
+The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
     python train_nn_cf2x.py                          # nonlinear dynamics (default)
@@ -83,11 +85,10 @@ T_SIM      = 4.0                    # simulation duration [s]
 T_STEPS    = int(T_SIM / DT_CTRL)  # = 192 control steps
 
 print(f"[CF2X] m={M}, g={G}, Ixx={I_X}, Iyy={I_Y}, Izz={I_Z}")
-print(f"[CF2X] F_max={F_MAX:.4f} N, tau_xy_max={TAU_XY_MAX:.6f} N*m, "
-      f"tau_z_max={TAU_Z_MAX:.6f} N*m")
+print(f"[CF2X] F_max={F_MAX:.4f} N, tau_xy_max={TAU_XY_MAX:.6f} N*m, tau_z_max={TAU_Z_MAX:.6f} N*m")
 print(f"[CF2X] HOVER_RPM={HOVER_RPM:.1f}, MAX_RPM={MAX_RPM:.1f}")
 print(f"[CF2X] DT_pyb={DT_PYB:.6f}s, DT_ctrl={DT_CTRL:.5f}s, "
-      f"sub_steps={PYB_STEPS_PER_CTRL}, T_steps={T_STEPS}")
+      f"sub-steps={PYB_STEPS_PER_CTRL}, T_steps={T_STEPS}")
 
 
 # =====================================================================
@@ -162,10 +163,10 @@ def rotation_matrix_zyx(phi, theta, psi):
     r22 = cphi * cth
 
     R = torch.stack([
-        torch.stack([1-2*(yy+zz), 2*(xy-wz),   2*(xz+wy)  ], dim=-1),
-        torch.stack([2*(xy+wz),   1-2*(xx+zz), 2*(yz-wx)   ], dim=-1),
-        torch.stack([2*(xz-wy),   2*(yz+wx),   1-2*(xx+yy) ], dim=-1),
-    ], dim=-2)
+        torch.stack([r00, r01, r02], dim=-1),
+        torch.stack([r10, r11, r12], dim=-1),
+        torch.stack([r20, r21, r22], dim=-1),
+    ], dim=-2)  # (B, 3, 3)
     return R
 
 
@@ -244,8 +245,11 @@ def dynamics_substep(state, wrench, dt):
     theta_new = theta + dt * q_new
     psi_new   = psi   + dt * r_new
 
-    return torch.stack([x_n,vx_n, y_n,vy_n, z_n,vz_n,
-                        qx_n,qy_n,qz_n,qw_n, p_n,q_n,r_n], dim=-1)
+    state_new = torch.stack([
+        x_new, vx_new, y_new, vy_new, z_new, vz_new,
+        phi_new, p_new, theta_new, q_new, psi_new, r_new
+    ], dim=-1)
+    return state_new
 
 
 def dynamics_one_ctrl_step(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
@@ -262,8 +266,8 @@ def dynamics_one_ctrl_step(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
     """
     dt = DT_CTRL / n_substeps  # duration of each sub-step
     for _ in range(n_substeps):
-        s13 = dynamics_substep(s13, wrench, dt)
-    return s13
+        state = dynamics_substep(state, wrench, dt)
+    return state
 
 
 # =====================================================================
@@ -275,31 +279,32 @@ def dynamics_one_ctrl_step(state, wrench, n_substeps=PYB_STEPS_PER_CTRL):
 def _build_linear_model_for_lqr():
     """Linearized model + ZOH discretization (only for the LQR baseline)."""
     from scipy.signal import cont2discrete
-    A = np.zeros((12,12))
-    A[0,1]=1; A[2,3]=1; A[4,5]=1; A[6,7]=1; A[8,9]=1; A[10,11]=1
-    A[1,8]=G; A[3,6]=-G
-    B = np.zeros((12,4))
-    B[5,0]=1/M; B[7,1]=1/I_X; B[9,2]=1/I_Y; B[11,3]=1/I_Z
-    c = np.zeros((12,1)); c[5,0]=-G
 
+    A = np.zeros((12, 12))
+    A[0,1]=1; A[2,3]=1; A[4,5]=1; A[6,7]=1; A[8,9]=1; A[10,11]=1
+    A[1,8] = G;  A[3,6] = -G
+    B = np.zeros((12, 4))
+    B[5,0]=1/M; B[7,1]=1/I_X; B[9,2]=1/I_Y; B[11,3]=1/I_Z
+
+    c = np.zeros((12,1)); c[5,0] = -G
     n, m = 12, 4
     A_aug = np.zeros((n+1,n+1)); A_aug[:n,:n]=A; A_aug[:n,n]=c.squeeze()
-    B_aug = np.zeros((n+1,m));   B_aug[:n,:]=B
-    C_aug = np.zeros((n,n+1));   C_aug[:,:n]=np.eye(n)
+    B_aug = np.zeros((n+1,m)); B_aug[:n,:]=B
+    C_aug = np.zeros((n,n+1)); C_aug[:,:n]=np.eye(n)
     D_aug = np.zeros((n,m))
-    Ad_a, Bd_a, _, _, _ = cont2discrete((A_aug,B_aug,C_aug,D_aug), DT_CTRL, method='zoh')
-    Ad = Ad_a[:n,:n]; Bd = Bd_a[:n,:]; d = Ad_a[:n,n]
+    Ad_aug,Bd_aug,_,_,_ = cont2discrete((A_aug,B_aug,C_aug,D_aug), DT_CTRL, method='zoh')
+    Ad = Ad_aug[:n,:n]; Bd = Bd_aug[:n,:]; d = Ad_aug[:n,n]
 
-    Q_d = np.array([1/X_MAX**2, 1/X_DMAX**2, 1/Y_MAX**2, 1/Y_DMAX**2,
-                     1/Z_MAX**2, 1/Z_DMAX**2, 1/PHI_MAX**2, 1/PHI_DMAX**2,
-                     1/THETA_MAX**2, 1/THETA_DMAX**2, 1/PSI_MAX**2, 1/PSI_DMAX**2])
-    R_d = np.array([1/F_MAX**2, 1/TAU_XY_MAX**2, 1/TAU_XY_MAX**2, 1/TAU_Z_MAX**2])
-    P = la.solve_discrete_are(Ad, Bd, np.diag(Q_d), np.diag(R_d))
-    K = np.linalg.inv(Bd.T@P@Bd + np.diag(R_d)) @ (Bd.T@P@Ad)
+    Q_diag = np.array([1/X_MAX**2, 1/X_DMAX**2, 1/Y_MAX**2, 1/Y_DMAX**2,
+                        1/Z_MAX**2, 1/Z_DMAX**2, 1/PHI_MAX**2, 1/PHI_DMAX**2,
+                        1/THETA_MAX**2, 1/THETA_DMAX**2, 1/PSI_MAX**2, 1/PSI_DMAX**2])
+    R_diag = np.array([1/F_MAX**2, 1/TAU_XY_MAX**2, 1/TAU_XY_MAX**2, 1/TAU_Z_MAX**2])
+    P = la.solve_discrete_are(Ad, Bd, np.diag(Q_diag), np.diag(R_diag))
+    K = np.linalg.inv(Bd.T@P@Bd + np.diag(R_diag)) @ (Bd.T@P@Ad)
     u_eq = -np.linalg.pinv(Bd) @ d
-    return Ad, Bd, d, K, u_eq
+    return K, u_eq, Ad, Bd, d
 
-Ad_lin, Bd_lin, d_lin, K_LQR, U_EQ = _build_linear_model()
+K_LQR, U_EQ, Ad_lqr, Bd_lqr, d_lqr = _build_linear_model_for_lqr()
 print(f"\n[LQR] u_eq[0] (hover thrust) = {U_EQ[0]:.6f} N  (mg = {M*G:.6f} N)")
 
 
@@ -349,7 +354,7 @@ class PolicyMLP(nn.Module):
     """
     def __init__(self, x_scale, u_max, hidden=64):
         super().__init__()
-        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32)) # register_buffer makes them part of the state_dict but not trainable parameters
+        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32))
         self.register_buffer("u_max",   torch.tensor(u_max,   dtype=torch.float32))
         self.net = nn.Sequential(
             nn.Linear(12, hidden),
@@ -402,10 +407,11 @@ def rollout(policy, x0, T_steps, n_substeps=1):
     dev = x0.device
     X = torch.zeros(B, T_steps, 12, device=dev)
     U = torch.zeros(B, T_steps, 4,  device=dev)
-    state = x0_12
+    state = x0
+
     for k in range(T_steps):
         wrench = policy(state)
-        state  = (state @ Ad_t.T) + (wrench @ Bd_t.T) + d_t
+        state  = dynamics_one_ctrl_step(state, wrench, n_substeps)
         X[:, k, :] = state
         U[:, k, :] = wrench
     return X, U
@@ -421,17 +427,26 @@ Q_DIAG = np.array([
     1/PSI_MAX**2,   1/PSI_DMAX**2,
 ], dtype=np.float32)
 
-R_DIAG = np.array([1/F_MAX**2, 1/TAU_XY_MAX**2,
-                    1/TAU_XY_MAX**2, 1/TAU_Z_MAX**2], dtype=np.float32)
+R_DIAG = np.array([
+    1/F_MAX**2,
+    1/TAU_XY_MAX**2,
+    1/TAU_XY_MAX**2,
+    1/TAU_Z_MAX**2,
+], dtype=np.float32)
 
 
 def traj_cost(X, U, terminal_weight=0.0):
     """Quadratic cost: sum_k (x'Qx + u'Ru), averaged over the batch."""
     Q = torch.as_tensor(Q_DIAG, dtype=X.dtype, device=X.device)
     R = torch.as_tensor(R_DIAG, dtype=U.dtype, device=U.device)
-    L = (X**2 * Q).sum(2).mean(0).sum() + (U**2 * R).sum(2).mean(0).sum()
-    if terminal_weight > 0:
-        L += terminal_weight * (X[:, -1, [0,2,4]]**2).mean()
+
+    cost_x = (X**2 * Q).sum(dim=2).mean(dim=0).sum()
+    cost_u = (U**2 * R).sum(dim=2).mean(dim=0).sum()
+    L = cost_x + cost_u
+
+    if terminal_weight > 0.0:
+        pT = X[:, -1, [0, 2, 4]]   # terminal [x, y, z]
+        L += terminal_weight * (pT**2).mean()
     return L
 
 
@@ -444,7 +459,9 @@ def make_x0_batch(xyz_list, device="cpu"):
     All velocities and angles are zero."""
     X0 = torch.zeros(len(xyz_list), 12, dtype=torch.float32, device=device)
     for b, (x, y, z) in enumerate(xyz_list):
-        X0[b,0]=x; X0[b,2]=y; X0[b,4]=z
+        X0[b, 0] = x
+        X0[b, 2] = y
+        X0[b, 4] = z
     return X0
 
 
@@ -468,15 +485,18 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
-    x0_batch = make_x0_batch(generate_cube_points(half_side), device=device) # initialize x, y, z of the state, the rest is zero (hover with no rotation), in a batch of 27 states
+    cube_pts = generate_cube_points(half_side)
+    x0_batch = make_x0_batch(cube_pts, device=device)
 
     # Check hover initialization
     with torch.no_grad():
-        u0 = policy(torch.zeros(1, 12, device=device)) # check the initial output of the policy at the origin (should be hover thrust)
-        print(f"\n[Init] NN(0) = F={u0[0,0]:.4f} N (mg={M*G:.4f}), tau={u0[0,1:]}")
+        u_test = policy(torch.zeros(1, 12, device=device))
+        print(f"\n[Init] NN output at x=0: F={u_test[0,0]:.4f} N (mg={M*G:.4f}), "
+              f"tau={u_test[0,1:]}")
 
-    dyn = "LINEAR" if linearized else "NONLINEAR (quaternion, pybullet-exact)"
-    print(f"[Train] {x0_batch.shape[0]} pts, {epochs} epochs, lr={lr}, dyn={dyn}")
+    dyn_label = "LINEAIRE" if linearized else "NON-LINEAIRE"
+    print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr}")
+    print(f"[Train] dynamique {dyn_label}, horizon={T_STEPS} steps ({T_SIM}s)")
 
     # Choose the rollout function
     rollout_fn = rollout_linear if linearized else rollout
@@ -491,17 +511,18 @@ def train(epochs=2000, lr=1e-3, hidden=64, terminal_weight=10.0,
         opt.step()
         scheduler.step()
 
-        if (ep+1) % 50 == 0 or ep == 0:
+        if (ep + 1) % 100 == 0 or ep == 0:
             with torch.no_grad():
-                err = X[:, -1, [0,2,4]].norm(dim=1)
+                pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
                 print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
-                      f"|x_T|_mean={err.mean().item():.4f}  "
-                      f"|x_T|_max={err.max().item():.4f}")
+                      f"|x_T|_mean={pos_end.mean().item():.4f}  "
+                      f"|x_T|_max={pos_end.max().item():.4f}")
+
     return policy
 
 
 # =====================================================================
-# 7. Evaluation
+# 7. Evaluation (NN vs LQR)
 # =====================================================================
 
 @torch.no_grad()
@@ -525,12 +546,13 @@ def evaluate(policy, test_pts, device="cpu"):
     ueq_t = torch.tensor(U_EQ,   dtype=torch.float32, device=device).unsqueeze(0)
 
     x = x0.clone()
+    X_lqr = torch.zeros_like(X_nn)
     for k in range(T_STEPS):
         u = ueq_t - (x @ K_t.T)
-        u[:,0] = torch.clamp(u[:,0], 0, F_MAX)
-        u[:,1] = torch.clamp(u[:,1], -TAU_XY_MAX, TAU_XY_MAX)
-        u[:,2] = torch.clamp(u[:,2], -TAU_XY_MAX, TAU_XY_MAX)
-        u[:,3] = torch.clamp(u[:,3], -TAU_Z_MAX,  TAU_Z_MAX)
+        u[:, 0] = torch.clamp(u[:, 0], 0, F_MAX)
+        u[:, 1] = torch.clamp(u[:, 1], -TAU_XY_MAX, TAU_XY_MAX)
+        u[:, 2] = torch.clamp(u[:, 2], -TAU_XY_MAX, TAU_XY_MAX)
+        u[:, 3] = torch.clamp(u[:, 3], -TAU_Z_MAX,  TAU_Z_MAX)
         x = (x @ Ad_t.T) + (u @ Bd_t.T) + d_t
         X_lqr[:, k, :] = x
     err_lqr = X_lqr[:, -1, [0, 2, 4]].norm(dim=1)
@@ -559,8 +581,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--linear", action="store_true",
-                        help="Use linearized dynamics (faster)")
-    parser.add_argument("--epochs", type=int, default=600)
+                        help="Use linearized dynamics (faster, less accurate)")
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--tag", type=str, default="",
@@ -576,8 +598,9 @@ if __name__ == "__main__":
 
     # Test on 20 random points
     rng = np.random.default_rng(42)
-    test_pts = [(rng.uniform(-0.3,0.3), rng.uniform(-0.3,0.3),
-                 rng.uniform(-0.3,0.3)) for _ in range(20)]
+    test_pts = [(rng.uniform(-0.3, 0.3),
+                 rng.uniform(-0.3, 0.3),
+                 rng.uniform(-0.3, 0.3)) for _ in range(20)]
     evaluate(policy, test_pts, device=device)
 
     # Save
@@ -590,8 +613,10 @@ if __name__ == "__main__":
     torch.save({
         "state_dict": policy.state_dict(),
         "hidden": args.hidden,
-        "x_scale": X_SCALE, "u_max": U_MAX,
-        "ctrl_freq": CTRL_FREQ, "Ts": DT_CTRL,
+        "x_scale": X_SCALE,
+        "u_max": U_MAX,
+        "ctrl_freq": CTRL_FREQ,
+        "Ts": DT_CTRL,
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
         "MAX_RPM": MAX_RPM,
         "linearized": args.linear,
