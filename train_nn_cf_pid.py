@@ -136,6 +136,24 @@ X_SCALE = np.array([X_MAX, X_DMAX, Y_MAX, Y_DMAX, Z_MAX, Z_DMAX,
                     PHI_MAX, PHI_DMAX, THETA_MAX, THETA_DMAX,
                     PSI_MAX, PSI_DMAX], dtype=np.float32)
 
+STATE_CLIP_MIN = np.array([
+    -5.0 * X_MAX, -5.0 * X_DMAX, 
+    -5.0 * Y_MAX, -5.0 * Y_DMAX, 
+    -2.0 * Z_MAX, -5.0 * Z_DMAX, # On autorise le drone à tomber un peu (z < 0)
+    -np.pi, -10.0 * PHI_DMAX, 
+    -np.pi, -10.0 * THETA_DMAX, 
+    -np.pi, -10.0 * PSI_DMAX
+], dtype=np.float32)
+
+STATE_CLIP_MAX = np.array([
+     5.0 * X_MAX,  5.0 * X_DMAX, 
+     5.0 * Y_MAX,  5.0 * Y_DMAX, 
+     5.0 * Z_MAX,  5.0 * Z_DMAX, 
+     np.pi,  10.0 * PHI_DMAX, 
+     np.pi,  10.0 * THETA_DMAX, 
+     np.pi,  10.0 * PSI_DMAX
+], dtype=np.float32)
+
 Q_DIAG = np.array([
     1/X_MAX**2,     1/X_DMAX**2,
     1/Y_MAX**2,     1/Y_DMAX**2,
@@ -144,6 +162,30 @@ Q_DIAG = np.array([
     1/THETA_MAX**2, 1/THETA_DMAX**2,
     1/PSI_MAX**2,   1/PSI_DMAX**2,
 ], dtype=np.float32)
+
+def get_action_cost_weights(setpoint_mode):
+    """Renvoie les poids de la pénalité quadratique pour la sortie du NN."""
+    if setpoint_mode == 'pos_sp':
+        # Pénalise les grands setpoints de position (en mètres)
+        return np.array([1/X_MAX**2, 1/Y_MAX**2, 1/Z_MAX**2], dtype=np.float32)
+    elif setpoint_mode == 'vel_sp':
+        # Pénalise les grandes vitesses demandées
+        return np.array([1/X_DMAX**2, 1/Y_DMAX**2, 1/Z_DMAX**2], dtype=np.float32)
+    elif setpoint_mode == 'att_sp':
+        # roll(deg), pitch(deg), yaw_rate(deg/s), thrust(u16)
+        return np.array([
+            1 / PolicyMLPPID.ATT_RP_SCALE**2,
+            1 / PolicyMLPPID.ATT_RP_SCALE**2,
+            1 / PolicyMLPPID.ATT_YR_SCALE**2,
+            1 / PolicyMLPPID.THRUST_HOVER**2  # Pénalise l'écart par rapport à 0, à ajuster si besoin
+        ], dtype=np.float32)
+    else: # rate_sp
+        return np.array([
+            1 / PolicyMLPPID.RATE_SCALE**2,
+            1 / PolicyMLPPID.RATE_SCALE**2,
+            1 / PolicyMLPPID.RATE_SCALE**2,
+            1 / PolicyMLPPID.THRUST_HOVER**2
+        ], dtype=np.float32)
 
 
 # =====================================================================
@@ -943,8 +985,10 @@ def rollout_pid(
         init_vel = x0[:, [1, 3, 5]]   # (B, 3)
         flowdeck.reset(init_pos, init_vel)
 
-    # --- Q matrix for cost ---
+    # --- matrices for cost ---
     Q = torch.tensor(Q_DIAG, dtype=torch.float32, device=dev)
+    R_diag = get_action_cost_weights(setpoint_mode)
+    R = torch.tensor(R_diag, dtype=torch.float32, device=dev)
 
     state = x0.clone()
     cost_sum = torch.zeros(1, device=dev)
@@ -1070,10 +1114,17 @@ def rollout_pid(
         else:
             state = dynamics_substep(state, wrench, DT_INNER)
 
+        # ---- State clipping (to stabilize training and avoid NaN) ----
+        clip_min_t = torch.tensor(STATE_CLIP_MIN, device=dev)
+        clip_max_t = torch.tensor(STATE_CLIP_MAX, device=dev)
+        state = torch.max(torch.min(state, clip_max_t), clip_min_t)
+
         # ---- Sample trajectory & accumulate cost (every POS_EVERY steps) ----
         if (k + 1) % POS_EVERY == 0:
             X[:, sample_idx, :] = state
-            cost_step = (state ** 2 * Q).sum(dim=1).mean()
+            cost_state = (state ** 2 * Q).sum(dim=1).mean()
+            cost_input = (nn_out ** 2 * R).sum(dim=1).mean()
+            cost_step = cost_state + cost_input
             cost_sum = cost_sum + cost_step
             sample_idx += 1
 
@@ -1162,12 +1213,12 @@ def train(
         opt.step()
         scheduler.step()
 
-        if (ep + 1) % 50 == 0 or ep == 0:
-            with torch.no_grad():
-                pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
-                print(f"  [ep {ep+1:4d}/{epochs}]  cost={cost.item():.4e}  "
-                      f"|x_T|_mean={pos_end.mean().item():.4f}  "
-                      f"|x_T|_max={pos_end.max().item():.4f}")
+        #if (ep + 1) % 50 == 0 or ep == 0:
+        with torch.no_grad():
+            pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+            print(f"  [ep {ep+1:4d}/{epochs}]  cost={cost.item():.4e}  "
+                    f"|x_T|_mean={pos_end.mean().item():.4f}  "
+                    f"|x_T|_max={pos_end.max().item():.4f}")
 
     return policy
 
