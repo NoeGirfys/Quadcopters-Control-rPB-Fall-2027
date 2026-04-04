@@ -667,7 +667,7 @@ def pwm_to_rpm_torch(motor_pwm: torch.Tensor) -> torch.Tensor:
     Skips 8-bit truncation (non-differentiable) for training.
     """
     thrust = (motor_pwm / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
-    thrust = torch.clamp(thrust, min=1e-12)
+    thrust = torch.clamp(thrust, min=1e-5)
     return torch.sqrt(thrust / KF)
 
 
@@ -1009,6 +1009,9 @@ def rollout_pid(
     rate_r_cached    = torch.zeros(B, device=dev)
     rate_p_cached    = torch.zeros(B, device=dev)
 
+    nn_out_prev = None
+    smoothness_weight = 0.5  # Poids de la pénalité de variation
+
     for k in range(inner_steps):
 
         # Extract state components
@@ -1029,45 +1032,44 @@ def rollout_pid(
         if use_flowdeck:
             flowdeck.push(pos, vel)
 
-        # ---- Position/NN step (every POS_EVERY inner steps = 100 Hz) ----
-        if k % POS_EVERY == 0:
-            # Get position/velocity (possibly delayed by FlowDeck)
-            if use_flowdeck:
-                pos_pid, vel_pid = flowdeck.read_delayed()
-            else:
-                pos_pid, vel_pid = pos, vel
+        # =========================================================
+        # INFERENCE DU NN
+        # =========================================================
+        # Si on est en mode 'pos_sp' ou 'vel_sp', la consigne (et la boucle pos) tourne à 100 Hz
+        if setpoint_mode in ('pos_sp', 'vel_sp'):
+            if k % POS_EVERY == 0:
+                if use_flowdeck:
+                    pos_pid, vel_pid = flowdeck.read_delayed()
+                else:
+                    pos_pid, vel_pid = pos, vel
 
-            # NN forward pass
-            nn_out = policy(state)   # (B, 3 or 4)
-
-            if setpoint_mode == 'pos_sp':
-                sp_pos = nn_out                   # (B, 3) meters
-                thrust_cached, roll_d_cached, pitch_d_cached, pid_state = \
-                    position_controller_update(
-                        pid_state, pos_pid, vel_pid, sp_pos, psi)
+                nn_out = policy(state)
+                
+                if setpoint_mode == 'pos_sp':
+                    thrust_cached, roll_d_cached, pitch_d_cached, pid_state = \
+                        position_controller_update(pid_state, pos_pid, vel_pid, nn_out, psi)
+                else:
+                    thrust_cached, roll_d_cached, pitch_d_cached, pid_state = \
+                        velocity_controller_update(pid_state, vel_pid, nn_out, psi)
+                        
                 pid_state = _set_scalar(pid_state, IDX_THRUST, thrust_cached)
                 pid_state = _set_scalar(pid_state, IDX_LAST_ROLL, roll_d_cached)
                 pid_state = _set_scalar(pid_state, IDX_LAST_PITCH, pitch_d_cached)
 
-            elif setpoint_mode == 'vel_sp':
-                sp_vel = nn_out                   # (B, 3) m/s
-                thrust_cached, roll_d_cached, pitch_d_cached, pid_state = \
-                    velocity_controller_update(
-                        pid_state, vel_pid, sp_vel, psi)
-                pid_state = _set_scalar(pid_state, IDX_THRUST, thrust_cached)
-                pid_state = _set_scalar(pid_state, IDX_LAST_ROLL, roll_d_cached)
-                pid_state = _set_scalar(pid_state, IDX_LAST_PITCH, pitch_d_cached)
-
-            elif setpoint_mode == 'att_sp':
+        # Si on est en mode 'att_sp' ou 'rate_sp', le NN tourne à 500 Hz !
+        else:
+            nn_out = policy(state) # Appelé à chaque itération k
+            
+            if setpoint_mode == 'att_sp':
                 roll_d_cached  = nn_out[:, 0]
                 pitch_d_cached = nn_out[:, 1]
                 yaw_rate_cached = nn_out[:, 2]
                 thrust_cached  = nn_out[:, 3]
+                
                 pid_state = _set_scalar(pid_state, IDX_THRUST, thrust_cached)
                 pid_state = _set_scalar(pid_state, IDX_LAST_ROLL, roll_d_cached)
                 pid_state = _set_scalar(pid_state, IDX_LAST_PITCH, pitch_d_cached)
-
-            else:  # rate_sp
+            else: # rate_sp
                 rate_r_cached   = nn_out[:, 0]
                 rate_p_cached   = nn_out[:, 1]
                 yaw_rate_cached = nn_out[:, 2]
@@ -1119,12 +1121,26 @@ def rollout_pid(
         clip_max_t = torch.tensor(STATE_CLIP_MAX, device=dev)
         state = torch.max(torch.min(state, clip_max_t), clip_min_t)
 
+        # /!\ NOUVEAU : Le remède anti-explosion de gradient
+        # On force les gradients à rester entre -10 et +10 lorsqu'ils remontent le temps
+        if state.requires_grad:
+            state.register_hook(lambda grad: torch.clamp(grad, min=-10.0, max=10.0))
+            
+        if pid_state.requires_grad:
+            pid_state.register_hook(lambda grad: torch.clamp(grad, min=-10.0, max=10.0))
+
         # ---- Sample trajectory & accumulate cost (every POS_EVERY steps) ----
         if (k + 1) % POS_EVERY == 0:
             X[:, sample_idx, :] = state
             cost_state = (state ** 2 * Q).sum(dim=1).mean()
             cost_input = (nn_out ** 2 * R).sum(dim=1).mean()
-            cost_step = cost_state + cost_input
+            # 3. NOUVEAU : Coût de lissage (Smoothness)
+            cost_smooth = torch.zeros_like(cost_input)
+            if nn_out_prev is not None:
+                # Pénalise la différence au carré entre la consigne actuelle et la précédente
+                cost_smooth = smoothness_weight * ((nn_out - nn_out_prev) ** 2 * R).sum(dim=1).mean()
+            nn_out_prev = nn_out
+            cost_step = cost_state + cost_input + cost_smooth
             cost_sum = cost_sum + cost_step
             sample_idx += 1
 
