@@ -4,7 +4,9 @@
       "WebSearch",
       "Bash(gh api:*)",
       "WebFetch(domain:www.bitcraze.io)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(python:*)"
     ]
   }
 }

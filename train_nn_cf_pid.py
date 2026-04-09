@@ -1,467 +1,386 @@
 #!/usr/bin/env python3
 """
-Train a neural network controller for the Crazyflie 2.x using the real
-firmware PID as a differentiable inner loop.
+Train a concurrent NN high-level controller for Crazyflie 2.x.
 
-The NN outputs an attitude rate setpoint and a thrust setpoint,
-which is then fed through a fully differentiable PyTorch reimplementation of
-the CF2.1+ firmware last PID.  End-to-end gradients flow: NN weights →
-setpoint → PID states → RPMs → dynamics → trajectory cost.
+Implements Analytic Policy Gradient (APG) from Wiedemann et al. (ICRA 2023).
+The NN replaces the position + velocity PIDs and is queried ONCE per chunk,
+outputting all T future actions concurrently.
 
-NN outputs (p, q, r [deg/s], thrust [u16])
-→ bypass pos+vel+att PIDs
+Pipeline (per 500 Hz step):
+  NN action (100 Hz) -> Attitude PID (500 Hz) -> Rate PID (500 Hz)
+  -> Power Distribution -> PWM -> Wrench -> Nonlinear Dynamics
 
-Physics: nonlinear (default) - full rotation-matrix dynamics, semi-implicit Euler
+- Attitude + Rate PIDs: exact CF2.1+ firmware gains (cf_firmware_pid_sim.py)
+- Dynamics: pybullet-drones DYN mode (train_nn_cf2x.py), semi-implicit Euler
+- Curriculum learning: state reset + detach when error > tau_div
 
 Usage:
     python train_nn_cf_pid.py
-    python train_nn_cf_pid.py --flowdeck --flowdeck_delay_ms 110
-    python train_nn_cf_pid.py --epochs 1000 --lr 5e-4 --tag exp1
+    python train_nn_cf_pid.py --epochs 1000 --lr 5e-4 --t_sim 4.0
+    python train_nn_cf_pid.py --t_chunk 0.4 --hidden 128 --tag exp1
 """
 
 import argparse
 import itertools
+import math
 import os
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-
 # =====================================================================
-# 1. Physical Parameters  (CF2X — matches gym-pybullet-drones URDF)
-# =====================================================================
-
-M       = 0.027          # mass [kg]
-G       = 9.8            # gravity [m/s²]
-I_X     = 1.4e-5         # Ixx [kg·m²]
-I_Y     = 1.4e-5         # Iyy [kg·m²]
-I_Z     = 2.17e-5        # Izz [kg·m²]
-L       = 0.0397         # arm length [m]
-KF      = 3.16e-10       # thrust coeff [N/RPM²]
-KM      = 7.94e-12       # torque coeff [N·m/RPM²]
-T2W     = 2.25           # thrust-to-weight ratio
-
-GRAVITY    = M * G
-HOVER_RPM  = np.sqrt(GRAVITY / (4 * KF))
-MAX_RPM    = np.sqrt((T2W * GRAVITY) / (4 * KF))
-F_MAX      = 4 * KF * MAX_RPM**2
-TAU_XY_MAX = (2 * L * KF * MAX_RPM**2) / np.sqrt(2)
-TAU_Z_MAX  = 2 * KM * MAX_RPM**2
-
-U_MAX = np.array([F_MAX, TAU_XY_MAX, TAU_XY_MAX, TAU_Z_MAX], dtype=np.float32)
-
-
-# =====================================================================
-# 2. CF Firmware PID Gains  (platform_defaults_cf2.h)
+# 1. Physical Constants  (CF2X — from gym-pybullet-drones URDF)
 # =====================================================================
 
-# --- Rate PIDs ---
-PID_ROLL_RATE_KP  = 250.0;  PID_ROLL_RATE_KI  = 500.0;  PID_ROLL_RATE_KD  = 2.5; PID_ROLL_RATE_INTEGRATION_LIMIT  = 33.3
-PID_PITCH_RATE_KP = 250.0;  PID_PITCH_RATE_KI = 500.0;  PID_PITCH_RATE_KD = 2.5; PID_PITCH_RATE_INTEGRATION_LIMIT = 33.3
-PID_YAW_RATE_KP   = 120.0;  PID_YAW_RATE_KI   = 16.7;   PID_YAW_RATE_KD   = 0.0; PID_YAW_RATE_INTEGRATION_LIMIT   = 166.7
+M   = 0.027        # mass [kg]
+G   = 9.8          # gravity [m/s^2]
+I_X = 1.4e-5       # Ixx [kg*m^2]
+I_Y = 1.4e-5       # Iyy
+I_Z = 2.17e-5      # Izz
+L   = 0.0397       # arm length [m]
+KF  = 3.16e-10     # thrust coeff [N/RPM^2]
+KM  = 7.94e-12     # torque coeff [N*m/RPM^2]
+T2W = 2.25
 
-# --- Limits ---
-PID_VEL_THRUST_BASE  = 36000.0
-PID_VEL_THRUST_MIN   = 20000.0
-THRUST_SCALE         = 1000.0
-PID_POS_VEL_X_MAX    = 1.0     # m/s
-PID_POS_VEL_Y_MAX    = 1.0
-PID_POS_VEL_Z_MAX    = 1.0
-VEL_MAX_OVERHEAD     = 1.10
-RP_LIMIT_OVERHEAD    = 1.10
-UINT16_MAX           = 65535.0
+GRAVITY   = M * G
+HOVER_RPM = np.sqrt(GRAVITY / (4 * KF))
+MAX_RPM   = np.sqrt((T2W * GRAVITY) / (4 * KF))
+UINT16_MAX = 65535.0
 
-# --- Motor conversion ---
+# CF2.1+ per-motor thrust with battery compensation
 CF2_THRUST_MAX_PER_MOTOR = 0.12  # N
 
-# --- Firmware rates ---
-ATTITUDE_RATE      = 500       # Hz
-ATTITUDE_UPDATE_DT = 1.0 / ATTITUDE_RATE   # 0.002 s
+# ---- PID Gains (from cf_firmware_pid_sim.py / platform_defaults_cf2.h) ----
 
-# Motor dynamics filter
-MOTOR_TAU = 0.02   # s  (brushed motor time constant)
-MOTOR_ALPHA = ATTITUDE_UPDATE_DT / (MOTOR_TAU + ATTITUDE_UPDATE_DT)
+# Attitude PID
+ATT_KP   = torch.tensor([6.0, 6.0, 6.0])    # roll, pitch, yaw
+ATT_KI   = torch.tensor([3.0, 3.0, 1.0])
+ATT_KD   = torch.tensor([0.0, 0.0, 0.35])
+ATT_ILIM = torch.tensor([20.0, 20.0, 360.0])
 
+# Rate PID
+RATE_KP   = torch.tensor([250.0, 250.0, 120.0])
+RATE_KI   = torch.tensor([500.0, 500.0, 16.7])
+RATE_KD   = torch.tensor([2.5, 2.5, 0.0])
+RATE_ILIM = torch.tensor([33.3, 33.3, 166.7])
 
-# =====================================================================
-# 3. State scaling and cost matrices
-# =====================================================================
+# Velocity PID output limits (NN output bounds)
+PID_VEL_ROLL_MAX  = 20.0   # deg
+PID_VEL_PITCH_MAX = 20.0   # deg
+YAW_RATE_MAX      = 200.0  # deg/s
 
-X_MAX    = 2.0;   X_DMAX    = 1.0
-Y_MAX    = 2.0;   Y_DMAX    = 1.0
-Z_MAX    = 2.0;   Z_DMAX    = 1.0
-PHI_MAX  = np.deg2rad(30);  PHI_DMAX  = np.deg2rad(200)
-THETA_MAX= np.deg2rad(30);  THETA_DMAX= np.deg2rad(200)
-PSI_MAX  = np.deg2rad(45);  PSI_DMAX  = np.deg2rad(120)
+# ---- Timing ----
+NN_FREQ       = 100    # Hz (replaces position controller)
+ATTITUDE_RATE = 500    # Hz
+ATT_DT        = 1.0 / ATTITUDE_RATE   # 0.002 s
+PID_STEPS_PER_NN = ATTITUDE_RATE // NN_FREQ  # 5
 
-X_SCALE = np.array([X_MAX, X_DMAX, Y_MAX, Y_DMAX, Z_MAX, Z_DMAX,
-                    PHI_MAX, PHI_DMAX, THETA_MAX, THETA_DMAX,
-                    PSI_MAX, PSI_DMAX], dtype=np.float32)
-
-RATE_SCALE      = 720.0  # deg/s
-
-Q_DIAG = np.array([
-    1/X_MAX**2,     1/X_DMAX**2,
-    1/Y_MAX**2,     1/Y_DMAX**2,
-    1/Z_MAX**2,     1/Z_DMAX**2,
-    1/PHI_MAX**2,   1/PHI_DMAX**2,
-    1/THETA_MAX**2, 1/THETA_DMAX**2,
-    1/PSI_MAX**2,   1/PSI_DMAX**2,
+# ---- State scaling (same as train_nn_cf2x.py) ----
+X_SCALE = np.array([
+    1.0, 1.0,                            # x, vx
+    1.0, 1.0,                            # y, vy
+    1.0, 1.0,                            # z, vz
+    np.deg2rad(30), np.deg2rad(200),     # phi, p
+    np.deg2rad(30), np.deg2rad(200),     # theta, q
+    np.deg2rad(45), np.deg2rad(120),     # psi, r
 ], dtype=np.float32)
 
-THRUST_HOVER    = PID_VEL_THRUST_BASE  # = 36000
+POS_SCALE = 1.0  # for relative targets [m]
 
-R_DIAG = np.array([
-        1 / RATE_SCALE**2,
-        1 / RATE_SCALE**2,
-        1 / RATE_SCALE**2,
-        1 / THRUST_HOVER**2
-    ], dtype=np.float32)
+# ---- Cost weights ----
+Q_DIAG = np.array([
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0,                  # pos & vel (1/max^2, max=1)
+    1/np.deg2rad(30)**2, 1/np.deg2rad(200)**2,       # phi, p
+    1/np.deg2rad(30)**2, 1/np.deg2rad(200)**2,       # theta, q
+    1/np.deg2rad(45)**2, 1/np.deg2rad(120)**2,       # psi, r
+], dtype=np.float32)
 
-
-
-# =====================================================================
-# 4. Simulation timing
-# =====================================================================
-T_SIM      = 4.0                       # simulation duration [s]
-INNER_STEPS = int(T_SIM * ATTITUDE_RATE)  # = 2000
-
-print(f"[CF2X] m={M}, Ixx={I_X}, KF={KF}, KM={KM}")
-print(f"[CF2X] HOVER_RPM={HOVER_RPM:.1f}, MAX_RPM={MAX_RPM:.1f}")
-print(f"[Timing] dt={ATTITUDE_UPDATE_DT*1000:.1f}ms, inner_steps={INNER_STEPS}")
+# Hover thrust in uint16 units
+# At hover: each motor PWM = thrust_u16, physical thrust = (pwm/65535)*0.12 N
+# 4 motors: 4*(thrust_u16/65535)*0.12 = mg → thrust_u16 = mg*65535/(4*0.12)
+HOVER_THRUST_U16 = GRAVITY * UINT16_MAX / (4 * CF2_THRUST_MAX_PER_MOTOR)
+# ≈ 36118
 
 
 # =====================================================================
-# 5. PID State Layout
-# =====================================================================
-#
-# pid_state: (B, 8)
-#
-#  Indices  PID (integ, prevMeas)
-#  [0:2]  pidRollRate
-#  [2:4]  pidPitchRate
-#  [4:6]  pidYawRate
-#  [6]     attitude_desired_yaw  (deg)
-#  [7]     actuator_thrust       (uint16)
-
-
-IDX_PRR  = (0, 2)  # pidRollRate
-IDX_PPR  = (2, 4)  # pidPitchRate
-IDX_PYR  = (4, 6)  # pidYawRate
-IDX_YAW_DES = 6
-IDX_THRUST = 7
-
-PID_STATE_DIM = 8
-
-# motor_filter_state: (B, 4)
-
-
-# =====================================================================
-# 6. Differentiable PID Update
-# =====================================================================
-
-def pid_update_batch(
-    integ: torch.Tensor,        # (B,)
-    prev_meas: torch.Tensor,    # (B,)
-    measured: torch.Tensor,     # (B,)
-    desired: torch.Tensor,      # (B,) or scalar tensor
-    kp: float, ki: float, kd: float,
-    dt: float,
-    i_limit: float,
-    output_limit: float = 0.0,
-    is_yaw: bool = False,
-):
-    """Batched single-axis PID update.  Pure function (no in-place ops).
-
-    Returns (output, integ_new, measured_new).
-    Derivative acts on measurement (not error) to avoid derivative kick.
-    """
-    error = desired - measured
-    if is_yaw:
-        # wrap to ±180 deg
-        error = error - 360.0 * torch.round(error / 360.0)
-
-    # P term
-    out_p = kp * error
-
-    # D term (on measurement)
-    delta = -(measured - prev_meas)
-    if is_yaw:
-        delta = delta - 360.0 * torch.round(delta / 360.0)
-    deriv = delta / dt
-    out_d = kd * deriv
-
-    # I term
-    integ_new = torch.clamp(integ + error * dt, -i_limit, i_limit)
-    out_i = ki * integ_new
-
-    output = out_p + out_d + out_i
-
-    if output_limit > 0.0:
-        output = torch.clamp(output, -output_limit, output_limit)
-
-    return output, integ_new, measured
-
-
-# =====================================================================
-# 7. PID State Helpers  (must precede the controller functions)
-# =====================================================================
-
-DEFAULT_ILIM = 5000.0  # default integral limit (same as firmware)
-
-
-def _set_pid(ps: torch.Tensor, idx: tuple, integ_new: torch.Tensor,
-             prev_meas_new: torch.Tensor) -> torch.Tensor:
-    """Return a new pid_state tensor with updated (integ, prevMeas) for one PID.
-
-    Uses torch.cat to avoid in-place ops that would break autograd.
-    """
-    i, j = idx
-    parts = []
-    if i > 0:
-        parts.append(ps[:, :i])
-    parts.append(integ_new.unsqueeze(1))
-    parts.append(prev_meas_new.unsqueeze(1))
-    if j < ps.shape[1]:
-        parts.append(ps[:, j:])
-    return torch.cat(parts, dim=1)
-
-
-def _set_scalar(ps: torch.Tensor, idx: int,
-                value: torch.Tensor) -> torch.Tensor:
-    """Return a new pid_state tensor with ps[:, idx] replaced by value."""
-    parts = []
-    if idx > 0:
-        parts.append(ps[:, :idx])
-    parts.append(value.unsqueeze(1))
-    if idx + 1 < ps.shape[1]:
-        parts.append(ps[:, idx+1:])
-    return torch.cat(parts, dim=1)
-
-
-def rate_controller_update(
-    pid_state: torch.Tensor,          # (B, 8)
-    state_gyro_deg: torch.Tensor,     # (B, 3)  [p, q, r] deg/s
-    desired_roll_rate: torch.Tensor,  # (B,)  deg/s
-    desired_pitch_rate: torch.Tensor, # (B,)
-    desired_yaw_rate: torch.Tensor,   # (B,)
-) -> tuple:
-    """Run only the rate PID (bypasses attitude PID).
-
-    Returns (roll_cmd, pitch_cmd, yaw_cmd, pid_state_new).
-    """
-    ps = pid_state.clone()
-
-    gyro_x = state_gyro_deg[:, 0]
-    gyro_y = state_gyro_deg[:, 1]
-    gyro_z = state_gyro_deg[:, 2]
-
-    roll_cmd, integ_prr, _ = pid_update_batch(
-        ps[:, IDX_PRR[0]], ps[:, IDX_PRR[0]+1],
-        gyro_x, desired_roll_rate,
-        PID_ROLL_RATE_KP, PID_ROLL_RATE_KI, PID_ROLL_RATE_KD,
-        ATTITUDE_UPDATE_DT, PID_ROLL_RATE_INTEGRATION_LIMIT)
-    ps = _set_pid(ps, IDX_PRR, integ_prr, gyro_x)
-    roll_cmd = torch.clamp(roll_cmd, -32767.0, 32767.0)
-
-    pitch_cmd, integ_ppr, _ = pid_update_batch(
-        ps[:, IDX_PPR[0]], ps[:, IDX_PPR[0]+1],
-        gyro_y, desired_pitch_rate,
-        PID_PITCH_RATE_KP, PID_PITCH_RATE_KI, PID_PITCH_RATE_KD,
-        ATTITUDE_UPDATE_DT, PID_PITCH_RATE_INTEGRATION_LIMIT)
-    ps = _set_pid(ps, IDX_PPR, integ_ppr, gyro_y)
-    pitch_cmd = torch.clamp(pitch_cmd, -32767.0, 32767.0)
-
-    yaw_cmd, integ_pyr, _ = pid_update_batch(
-        ps[:, IDX_PYR[0]], ps[:, IDX_PYR[0]+1],
-        gyro_z, desired_yaw_rate,
-        PID_YAW_RATE_KP, PID_YAW_RATE_KI, PID_YAW_RATE_KD,
-        ATTITUDE_UPDATE_DT, PID_YAW_RATE_INTEGRATION_LIMIT)
-    ps = _set_pid(ps, IDX_PYR, integ_pyr, gyro_z)
-    yaw_cmd = torch.clamp(yaw_cmd, -32767.0, 32767.0)
-
-    yaw_cmd = -yaw_cmd
-    return roll_cmd, pitch_cmd, yaw_cmd, ps
-
-
-# =====================================================================
-# 8. Power Distribution  (thrust + roll/pitch/yaw → 4 motor PWMs)
-# =====================================================================
-
-def power_distribute(
-    thrust: torch.Tensor,     # (B,)  uint16
-    roll_cmd: torch.Tensor,   # (B,)  int16
-    pitch_cmd: torch.Tensor,  # (B,)
-    yaw_cmd: torch.Tensor,    # (B,)
-) -> torch.Tensor:            # (B, 4)  PWM in [0, 65535]
-    """Differentiable motor mixing (CF2X X-config).
-
-    Mirrors power_distribution_quadrotor.c:84-93 + cap logic.
-    """
-    r = roll_cmd  / 2.0
-    p = pitch_cmd / 2.0
-
-    m1 = thrust - r + p + yaw_cmd
-    m2 = thrust - r - p - yaw_cmd
-    m3 = thrust + r - p + yaw_cmd
-    m4 = thrust + r + p - yaw_cmd
-
-    motor_pwm = torch.stack([m1, m2, m3, m4], dim=-1)  # (B, 4)
-
-    # Cap: shift all down if any exceeds 65535
-    highest = motor_pwm.max(dim=-1, keepdim=True).values
-    reduction = torch.clamp(highest - UINT16_MAX, min=0.0)
-    motor_pwm = torch.clamp(motor_pwm - reduction, min=0.0, max=UINT16_MAX)
-
-    return motor_pwm
-
-
-# =====================================================================
-# 9. PWM → RPM  (differentiable)
-# =====================================================================
-
-def pwm_to_rpm_torch(motor_pwm: torch.Tensor) -> torch.Tensor:
-    """Convert uint16 PWM → RPM via thrust = (pwm/65535)*0.12 N.
-
-    Skips 8-bit truncation (non-differentiable) for training.
-    """
-    thrust = (motor_pwm / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
-    thrust = torch.clamp(thrust, min=1e-5)
-    return torch.sqrt(thrust / KF)
-
-
-# =====================================================================
-# 10. Motor Dynamics Filter  (1st-order LP, differentiable)
-# =====================================================================
-
-def motor_filter_step(
-    rpm_prev: torch.Tensor,  # (B, 4)
-    rpm_cmd: torch.Tensor,   # (B, 4)
-) -> torch.Tensor:           # (B, 4)
-    return MOTOR_ALPHA * rpm_cmd + (1.0 - MOTOR_ALPHA) * rpm_prev
-
-
-# =====================================================================
-# 11. Nonlinear Dynamics  (reused from train_nn_cf2x.py)
+# 2. Nonlinear Dynamics  (exact copy from train_nn_cf2x.py)
 # =====================================================================
 
 def rotation_matrix_zyx(phi, theta, psi):
-    """Intrinsic ZYX rotation matrix. Parameters: (B,) tensors."""
+    """Intrinsic ZYX rotation matrix. (B,) -> (B,3,3)."""
     cphi = torch.cos(phi);   sphi = torch.sin(phi)
     cth  = torch.cos(theta); sth  = torch.sin(theta)
     cpsi = torch.cos(psi);   spsi = torch.sin(psi)
-
-    r00 = cth * cpsi
-    r01 = sphi * sth * cpsi - cphi * spsi
-    r02 = cphi * sth * cpsi + sphi * spsi
-    r10 = cth * spsi
-    r11 = sphi * sth * spsi + cphi * cpsi
-    r12 = cphi * sth * spsi - sphi * cpsi
-    r20 = -sth
-    r21 = sphi * cth
-    r22 = cphi * cth
-
     R = torch.stack([
-        torch.stack([r00, r01, r02], dim=-1),
-        torch.stack([r10, r11, r12], dim=-1),
-        torch.stack([r20, r21, r22], dim=-1),
+        torch.stack([cth*cpsi, sphi*sth*cpsi - cphi*spsi, cphi*sth*cpsi + sphi*spsi], -1),
+        torch.stack([cth*spsi, sphi*sth*spsi + cphi*cpsi, cphi*sth*spsi - sphi*cpsi], -1),
+        torch.stack([-sth,     sphi*cth,                   cphi*cth],                  -1),
     ], dim=-2)
     return R
 
 
-def dynamics_substep(state: torch.Tensor, rpm: torch.Tensor, dt: float) -> torch.Tensor:
+def dynamics_substep(state, wrench, dt):
+    """One semi-implicit Euler step. Replicates BaseAviary._dynamics().
+
+    state  : (B, 12)  [x, vx, y, vy, z, vz, phi, p, theta, q, psi, r]
+    wrench : (B, 4)   [F, tau_x, tau_y, tau_z]
     """
-    Intégration d'Euler semi-implicite.
-    Prend directement les RPMs des moteurs en entrée (match exact avec PyBullet DYN).
-    state: (B, 12), rpm: (B, 4)
-    """
-    x     = state[:, 0];  vx = state[:, 1]
-    y     = state[:, 2];  vy = state[:, 3]
-    z     = state[:, 4];  vz = state[:, 5]
-    phi   = state[:, 6];  p  = state[:, 7]
-    theta = state[:, 8];  q  = state[:, 9]
-    psi   = state[:, 10]; r  = state[:, 11]
+    x, vx     = state[:, 0], state[:, 1]
+    y, vy     = state[:, 2], state[:, 3]
+    z, vz     = state[:, 4], state[:, 5]
+    phi, p    = state[:, 6], state[:, 7]
+    theta, q  = state[:, 8], state[:, 9]
+    psi, r    = state[:, 10], state[:, 11]
 
-    # --- 1. Calcul des forces et couples à partir des RPMs ---
-    # Équivalent de: forces = np.array(rpm**2) * self.KF
-    forces = (rpm ** 2) * KF
-    
-    # Équivalent de: z_torques = np.array(rpm**2)*self.KM
-    z_torques = (rpm ** 2) * KM
+    F, tau_x, tau_y, tau_z = wrench[:, 0], wrench[:, 1], wrench[:, 2], wrench[:, 3]
 
-    # Poussée totale (Thrust) sur l'axe Z local
-    F = forces.sum(dim=-1)
-
-    # Configuration CF2X (Match exact avec les lignes de PyBullet)
-    _a = L / np.sqrt(2)
-    tau_x = -(forces[:, 0] + forces[:, 1] - forces[:, 2] - forces[:, 3]) * _a
-    tau_y = (-forces[:, 0] + forces[:, 1] + forces[:, 2] - forces[:, 3]) * _a
-    tau_z = -z_torques[:, 0] + z_torques[:, 1] - z_torques[:, 2] + z_torques[:, 3]
-
-    # --- 2. Projection de la poussée dans le repère Monde ---
+    # (a) Thrust in world frame
     R = rotation_matrix_zyx(phi, theta, psi)
-    # thrust_world_frame = np.dot(rotation, thrust)
     thrust_world = F.unsqueeze(-1) * R[:, :, 2]
-
-    # Accélérations linéaires (force_world_frame / self.M)
     ax = thrust_world[:, 0] / M
     ay = thrust_world[:, 1] / M
     az = thrust_world[:, 2] / M - G
 
-    # --- 3. Couplage gyroscopique ---
-    # torques = torques - np.cross(rpy_rates, np.dot(self.J, rpy_rates))
+    # (b) Gyroscopic coupling
     gyro_x = (I_Z - I_Y) * q * r
     gyro_y = (I_X - I_Z) * p * r
     gyro_z = (I_Y - I_X) * p * q
-
-    # rpy_rates_deriv = np.dot(self.J_INV, torques)
     p_dot = (tau_x - gyro_x) / I_X
     q_dot = (tau_y - gyro_y) / I_Y
     r_dot = (tau_z - gyro_z) / I_Z
 
-    # --- 4. Intégration d'Euler ---
-    # vel = vel + self.PYB_TIMESTEP * no_pybullet_dyn_accs
-    vx_new = vx + dt * ax;   vy_new = vy + dt * ay;   vz_new = vz + dt * az
-    
-    # rpy_rates = rpy_rates + self.PYB_TIMESTEP * rpy_rates_deriv
-    p_new  = p  + dt * p_dot; q_new = q + dt * q_dot; r_new  = r + dt * r_dot
+    # (c) Semi-implicit Euler: velocities first, then positions
+    vx_n = vx + dt * ax;  vy_n = vy + dt * ay;  vz_n = vz + dt * az
+    p_n  = p  + dt * p_dot;  q_n = q + dt * q_dot;  r_n = r + dt * r_dot
+    x_n     = x     + dt * vx_n;  y_n     = y     + dt * vy_n;  z_n     = z     + dt * vz_n
+    phi_n   = phi   + dt * p_n;   theta_n = theta + dt * q_n;   psi_n   = psi   + dt * r_n
 
-    # pos = pos + self.PYB_TIMESTEP * vel
-    x_new     = x     + dt * vx_new
-    y_new     = y     + dt * vy_new
-    z_new     = z     + dt * vz_new
-    
-    # Intégration des angles (Différence PyBullet/PyTorch)
-    phi_new   = phi   + dt * p_new
-    theta_new = theta + dt * q_new
-    psi_new   = psi   + dt * r_new
+    return torch.stack([x_n, vx_n, y_n, vy_n, z_n, vz_n,
+                        phi_n, p_n, theta_n, q_n, psi_n, r_n], dim=-1)
 
-    return torch.stack([
-        x_new, vx_new, y_new, vy_new, z_new, vz_new,
-        phi_new, p_new, theta_new, q_new, psi_new, r_new
+
+# =====================================================================
+# 3. Differentiable PID Functions
+# =====================================================================
+
+def pid_update_vec(desired, measured, prev_measured, integral,
+                   kp, ki, kd, dt, i_limit, yaw_mask=None):
+    """Vectorised PID update over (B, 3) tensors — all axes at once.
+
+    yaw_mask: (3,) bool tensor, True for the yaw axis (angle wrapping).
+    Returns (output, new_integral, new_prev_measured) each (B, 3).
+    """
+    error = desired - measured
+    delta = -(measured - prev_measured)
+
+    # Yaw angle wrapping for axis 2 only
+    if yaw_mask is not None:
+        ym = yaw_mask.unsqueeze(0)  # (1, 3)
+        error = torch.where(ym, error - 360.0 * torch.round(error / 360.0), error)
+        delta = torch.where(ym, delta - 360.0 * torch.round(delta / 360.0), delta)
+
+    out_p = kp * error
+    out_d = kd * (delta / dt)
+
+    new_integral = integral + error * dt
+    new_integral = torch.clamp(new_integral, -i_limit, i_limit)
+    out_i = ki * new_integral
+
+    return out_p + out_d + out_i, new_integral, measured
+
+
+# Pre-compute allocation coefficients (constants)
+_L_SQRT2 = L / math.sqrt(2)
+_KM_KF   = KM / KF
+_THRUST_SCALE = CF2_THRUST_MAX_PER_MOTOR / UINT16_MAX
+
+
+# =====================================================================
+# 4. Full Simulation Step (NN action -> PIDs -> motors -> dynamics)
+# =====================================================================
+
+# Cache for PID gains on the right device
+_pid_cache = {}
+
+def _get_pid_gains(dev):
+    """Cache PID gain tensors on the target device."""
+    if dev not in _pid_cache:
+        yaw_mask = torch.tensor([False, False, True], device=dev)
+        _pid_cache[dev] = {
+            'att_kp': ATT_KP.to(dev), 'att_ki': ATT_KI.to(dev),
+            'att_kd': ATT_KD.to(dev), 'att_il': ATT_ILIM.to(dev),
+            'rate_kp': RATE_KP.to(dev), 'rate_ki': RATE_KI.to(dev),
+            'rate_kd': RATE_KD.to(dev), 'rate_il': RATE_ILIM.to(dev),
+            'yaw_mask': yaw_mask,
+        }
+    return _pid_cache[dev]
+
+
+def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
+                 state_12, pid_state):
+    """One 500 Hz step: attitude PID -> rate PID -> power dist -> dynamics.
+
+    Fully vectorised over the 3 PID axes (roll, pitch, yaw).
+    pid_state = (att_integ (B,3), att_prev (B,3),
+                 rate_integ (B,3), rate_prev (B,3),
+                 yaw_setpoint (B,))
+    """
+    att_integ, att_prev, rate_integ, rate_prev, yaw_sp = pid_state
+    g = _get_pid_gains(state_12.device)
+
+    # --- Extract state in firmware convention (pitch & pitch-rate negated) ---
+    RAD2DEG = 180.0 / math.pi
+    actual_att = torch.stack([
+        state_12[:, 6] * RAD2DEG,       # roll
+        -state_12[:, 8] * RAD2DEG,      # pitch (negated for firmware)
+        state_12[:, 10] * RAD2DEG,      # yaw
+    ], dim=-1)  # (B, 3)
+
+    actual_gyro = torch.stack([
+        state_12[:, 7] * RAD2DEG,       # gyro roll
+        -state_12[:, 9] * RAD2DEG,      # gyro pitch (negated)
+        state_12[:, 11] * RAD2DEG,      # gyro yaw
+    ], dim=-1)  # (B, 3)
+
+    # --- Yaw setpoint accumulation ---
+    new_yaw_sp = yaw_sp + yaw_rate_deg * ATT_DT
+    new_yaw_sp = new_yaw_sp - 360.0 * torch.round(new_yaw_sp / 360.0)
+
+    # --- Attitude PID (vectorised over 3 axes) ---
+    desired_att = torch.stack([roll_des_deg, pitch_des_deg, new_yaw_sp], dim=-1)
+
+    rate_desired, new_att_integ, new_att_prev = pid_update_vec(
+        desired_att, actual_att, att_prev, att_integ,
+        g['att_kp'], g['att_ki'], g['att_kd'], ATT_DT, g['att_il'],
+        yaw_mask=g['yaw_mask'])
+
+    # --- Rate PID (vectorised over 3 axes) ---
+    motor_cmds, new_rate_integ, new_rate_prev = pid_update_vec(
+        rate_desired, actual_gyro, rate_prev, rate_integ,
+        g['rate_kp'], g['rate_ki'], g['rate_kd'], ATT_DT, g['rate_il'])
+    motor_cmds = torch.clamp(motor_cmds, -32767, 32767)
+
+    roll_cmd  = motor_cmds[:, 0]
+    pitch_cmd = motor_cmds[:, 1]
+    yaw_cmd   = -motor_cmds[:, 2]   # firmware negates yaw output
+
+    # --- Power distribution (CF2X, firmware ordering) ---
+    r_half = roll_cmd * 0.5
+    p_half = pitch_cmd * 0.5
+    motor_pwms = torch.stack([
+        thrust_u16 - r_half + p_half + yaw_cmd,   # M1 front-right
+        thrust_u16 - r_half - p_half - yaw_cmd,   # M2 rear-right
+        thrust_u16 + r_half - p_half + yaw_cmd,   # M3 rear-left
+        thrust_u16 + r_half + p_half - yaw_cmd,   # M4 front-left
+    ], dim=-1)  # (B, 4)
+
+    # Cap: preserve attitude authority
+    highest = motor_pwms.max(dim=-1, keepdim=True).values
+    reduction = torch.clamp(highest - UINT16_MAX, min=0)
+    motor_pwms = torch.clamp(motor_pwms - reduction, min=0, max=UINT16_MAX)
+
+    # --- PWMs -> wrench -> dynamics ---
+    motor_thrusts = motor_pwms * _THRUST_SCALE  # (B, 4)  [N per motor]
+    t0, t1, t2, t3 = motor_thrusts[:, 0], motor_thrusts[:, 1], motor_thrusts[:, 2], motor_thrusts[:, 3]
+    wrench = torch.stack([
+        t0 + t1 + t2 + t3,                         # F
+        -(t0 + t1 - t2 - t3) * _L_SQRT2,           # tau_x
+        (-t0 + t1 + t2 - t3) * _L_SQRT2,           # tau_y
+        (-t0 + t1 - t2 + t3) * _KM_KF,             # tau_z
     ], dim=-1)
 
+    new_state = dynamics_substep(state_12, wrench, ATT_DT)
+    new_pid_state = (new_att_integ, new_att_prev, new_rate_integ,
+                     new_rate_prev, new_yaw_sp)
+    return new_state, new_pid_state
 
 
-# =====================================================================
-# 12. Neural Network  (setpoint-mode-specific head)
-# =====================================================================
+def one_nn_step(state, nn_action, pid_state):
+    """Execute one NN step (100 Hz) = 5 PID steps (500 Hz).
 
-class PolicyMLPPID(nn.Module):
-    """MLP controller outputting setpoints for the PID cascade.
-
-    output : (roll_rate_deg_s, pitch_rate_deg_s, yaw_rate_deg_s, thrust_u16)
+    nn_action: (B, 4) [thrust_u16, roll_deg, pitch_deg, yaw_rate_deg_s]
     """
+    thrust    = nn_action[:, 0]
+    roll_deg  = nn_action[:, 1]
+    pitch_deg = nn_action[:, 2]
+    yaw_rate  = nn_action[:, 3]
 
-    def __init__(self, x_scale: np.ndarray, hidden: int = 64):
+    for _ in range(PID_STEPS_PER_NN):
+        state, pid_state = one_pid_step(
+            thrust, roll_deg, pitch_deg, yaw_rate, state, pid_state)
+    return state, pid_state
+
+
+# =====================================================================
+# 5. PID State Initialization
+# =====================================================================
+
+def init_pid_state(state_12):
+    """Create initial PID state from dynamics state."""
+    B = state_12.shape[0]
+    dev = state_12.device
+
+    roll_deg  = torch.rad2deg(state_12[:, 6])
+    pitch_deg = -torch.rad2deg(state_12[:, 8])
+    yaw_deg   = torch.rad2deg(state_12[:, 10])
+    gyro_r = torch.rad2deg(state_12[:, 7])
+    gyro_p = -torch.rad2deg(state_12[:, 9])
+    gyro_y = torch.rad2deg(state_12[:, 11])
+
+    att_integ  = torch.zeros(B, 3, device=dev)
+    att_prev   = torch.stack([roll_deg, pitch_deg, yaw_deg], dim=-1)
+    rate_integ = torch.zeros(B, 3, device=dev)
+    rate_prev  = torch.stack([gyro_r, gyro_p, gyro_y], dim=-1)
+    yaw_sp     = yaw_deg.clone()
+
+    return (att_integ, att_prev, rate_integ, rate_prev, yaw_sp)
+
+
+def reset_pid_diverged(pid_state, diverged_mask):
+    """Zero PID state for diverged drones (detached)."""
+    att_integ, att_prev, rate_integ, rate_prev, yaw_sp = pid_state
+    m = diverged_mask.unsqueeze(1)   # (B, 1)
+    m1 = diverged_mask               # (B,)
+    zero3 = torch.zeros_like(att_integ)
+    zero1 = torch.zeros_like(yaw_sp)
+    return (
+        torch.where(m, zero3, att_integ),
+        torch.where(m, zero3, att_prev),
+        torch.where(m, zero3, rate_integ),
+        torch.where(m, zero3, rate_prev),
+        torch.where(m1, zero1, yaw_sp),
+    )
+
+
+# =====================================================================
+# 6. Concurrent Neural Network
+# =====================================================================
+
+class ConcurrentPolicyMLP(nn.Module):
+    """Concurrent NN controller (Wiedemann et al. architecture).
+
+    Queried once per chunk. Outputs all T future actions simultaneously.
+
+    Input:  12D state + T*3D relative targets = (12 + T*3)
+    Output: T * (thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s) = T*4
+
+    Hover initialization: last-layer bias so initial output is
+    [hover_thrust, 0, 0, 0] regardless of input.
+    """
+    def __init__(self, T, hidden=128):
         super().__init__()
+        self.T = T
+        input_dim = 12 + T * 3
+        output_dim = T * 4
 
-        output_dim = 4
+        self.register_buffer("x_scale",
+            torch.tensor(X_SCALE, dtype=torch.float32))
+        self.register_buffer("pos_scale",
+            torch.tensor(POS_SCALE, dtype=torch.float32))
 
-        self.register_buffer("x_scale", torch.tensor(x_scale, dtype=torch.float32))
         self.net = nn.Sequential(
-            nn.Linear(12, hidden),
+            nn.Linear(input_dim, hidden),
             nn.Tanh(),
             nn.Linear(hidden, hidden),
             nn.Tanh(),
@@ -470,352 +389,336 @@ class PolicyMLPPID(nn.Module):
         self._init_hover()
 
     def _init_hover(self):
+        """Initialize last layer: small weights + hover bias."""
         last = self.net[-1]
-        nn.init.zeros_(last.weight)
+        # Small random weights so hidden layers get gradients from epoch 1
+        nn.init.normal_(last.weight, std=0.01)
         nn.init.zeros_(last.bias)
 
-        # Initialize thrust to hover: sigmoid(b) * 65535 = THRUST_HOVER
-        ratio = self.THRUST_HOVER / UINT16_MAX
-        last.bias.data[3] = float(np.log(ratio / (1.0 - ratio)))
+        # thrust bias: sigmoid(b) * 65535 = hover_thrust
+        hover_ratio = HOVER_THRUST_U16 / UINT16_MAX
+        thrust_bias = float(np.log(hover_ratio / (1.0 - hover_ratio)))
+        for t in range(self.T):
+            last.bias.data[t * 4 + 0] = thrust_bias
+            # roll, pitch, yaw_rate biases stay 0 -> tanh(0)*max = 0
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_n = x / self.x_scale
-        raw = self.net(x_n)
+    def forward(self, state, targets_rel):
+        """
+        state       : (B, 12)
+        targets_rel : (B, T, 3)
+        Returns     : (B, T, 4) [thrust_u16, roll_deg, pitch_deg, yaw_rate]
+        """
+        B = state.shape[0]
+        state_n = state / self.x_scale
+        targets_n = targets_rel / self.pos_scale
+        targets_flat = targets_n.reshape(B, -1)
 
-        # rate_sp
-        p_rate = torch.tanh(raw[..., [0]]) * RATE_SCALE
-        q_rate = torch.tanh(raw[..., [1]]) * RATE_SCALE
-        r_rate = torch.tanh(raw[..., [2]]) * RATE_SCALE
-        thr    = torch.sigmoid(raw[..., [3]]) * UINT16_MAX
-        return torch.cat([p_rate, q_rate, r_rate, thr], dim=-1)
+        x = torch.cat([state_n, targets_flat], dim=-1)
+        raw = self.net(x).reshape(B, self.T, 4)
+
+        thrust  = torch.sigmoid(raw[..., 0]) * UINT16_MAX
+        roll    = torch.tanh(raw[..., 1]) * PID_VEL_ROLL_MAX
+        pitch   = torch.tanh(raw[..., 2]) * PID_VEL_PITCH_MAX
+        yaw_r   = torch.tanh(raw[..., 3]) * YAW_RATE_MAX
+
+        return torch.stack([thrust, roll, pitch, yaw_r], dim=-1)
 
 
 # =====================================================================
-# 13. FlowDeck Delay Buffer  (differentiable)
+# 7. Rollout with Curriculum
 # =====================================================================
 
-class FlowDeckDelay:
-    """Circular delay buffer for position and velocity (runs at ATTITUDE_RATE).
+def compute_relative_targets(state, T, target_pos=None):
+    """Compute T relative 3D targets for the regulation-to-origin task.
 
-    push() must be called every inner step (500 Hz).
-    read_delayed() returns the state from ~delay_ms ms ago.
-    Gradients flow through all stored tensors (no in-place ops on leaf data).
+    target_pos: (3,) or None (defaults to origin).
+    Returns: (B, T, 3)
     """
+    B = state.shape[0]
+    dev = state.device
+    current_pos = state[:, [0, 2, 4]]  # (B, 3) [x, y, z]
 
-    def __init__(self, delay_ms: float, ctrl_freq: int = ATTITUDE_RATE):
-        # delay in inner steps (500 Hz)
-        self.delay_steps = max(1, round(delay_ms * 1e-3 * ctrl_freq))
-        self._buf: list = []   # list of (pos (B,3), vel (B,3)) tuples
+    if target_pos is None:
+        target = torch.zeros(1, 3, device=dev)
+    else:
+        target = target_pos.unsqueeze(0).to(dev)
 
-    def reset(self, init_pos: torch.Tensor, init_vel: torch.Tensor):
-        """Fill buffer with the starting position/velocity."""
-        self._buf = [(init_pos.clone(), init_vel.clone())
-                     for _ in range(self.delay_steps)]
-
-    def push(self, pos: torch.Tensor, vel: torch.Tensor):
-        """Push current (pos, vel) into the buffer (call every inner step)."""
-        self._buf.append((pos, vel))
-        self._buf.pop(0)   # drop oldest
-
-    def read_delayed(self) -> tuple:
-        """Return the delayed (pos, vel) — the oldest entry in the buffer."""
-        return self._buf[0]
+    # All T targets are the same for regulation
+    rel = (target - current_pos).unsqueeze(1).expand(B, T, 3)
+    return rel
 
 
-# =====================================================================
-# 14. Yaw accumulator helper
-# =====================================================================
+def rollout(policy, x0, n_chunks, tau_div=None):
+    """Full rollout: n_chunks * T NN steps, each = 5 PID steps.
 
-def _wrap_deg(x: torch.Tensor) -> torch.Tensor:
-    return x - 360.0 * torch.round(x / 360.0)
-
-
-def _accumulate_yaw(pid_state: torch.Tensor,
-                    yaw_rate_deg_s: torch.Tensor) -> torch.Tensor:
-    """Update attitude_desired_yaw in pid_state from a yaw rate command."""
-    yaw_des = pid_state[:, IDX_YAW_DES]
-    yaw_des_new = _wrap_deg(yaw_des + yaw_rate_deg_s * ATTITUDE_UPDATE_DT)
-    return _set_scalar(pid_state, IDX_YAW_DES, yaw_des_new)
-
-
-# =====================================================================
-# 15. Main Rollout Function
-# =====================================================================
-
-def rollout_pid(
-    policy: PolicyMLPPID,
-    x0: torch.Tensor,               # (B, 12)
-    inner_steps: int = INNER_STEPS,
-    use_flowdeck: bool = False,
-    flowdeck_delay_ms: float = 110.0,
-    use_motor_filter: bool = True
-) -> tuple:
-    """Roll out the policy through the differentiable PID cascade.
-
-    Returns (X, cost_sum) where:
-      X: (B, inner_steps, 12) state trajectory sampled at 500 Hz
-      cost_sum: scalar (sum of quadratic costs)
+    Returns X: (B, n_chunks*T, 12) state trajectory at 100 Hz.
     """
+    T = policy.T
     B = x0.shape[0]
     dev = x0.device
+    total_nn_steps = n_chunks * T
 
-    # --- Initialize PID state ---
-    pid_state = torch.zeros(B, PID_STATE_DIM, device=dev, dtype=torch.float32)
+    X = torch.zeros(B, total_nn_steps, 12, device=dev)
+    state = x0
+    pid_state = init_pid_state(state)
+    step_idx = 0
 
-    # Initial thrust = hover
-    pid_state = _set_scalar(
-        pid_state, IDX_THRUST,
-        torch.full((B,), PID_VEL_THRUST_BASE, device=dev))
+    for chunk in range(n_chunks):
+        # Compute relative targets from current position
+        targets_rel = compute_relative_targets(state, T)
 
-    # attitude_desired_yaw = initial yaw (in degrees)
-    init_yaw_deg = torch.rad2deg(x0[:, 10])
-    pid_state = _set_scalar(pid_state, IDX_YAW_DES, init_yaw_deg)
+        # Query NN once for the entire chunk
+        actions = policy(state, targets_rel)   # (B, T, 4)
 
-    # --- Motor filter state ---
-    motor_rpm = torch.full((B, 4), HOVER_RPM, device=dev, dtype=torch.float32)
+        for t in range(T):
+            nn_action = actions[:, t, :]
+            state, pid_state = one_nn_step(state, nn_action, pid_state)
+            X[:, step_idx, :] = state
+            step_idx += 1
 
-    # --- FlowDeck delay buffer ---
-    flowdeck = None
-    if use_flowdeck:
-        flowdeck = FlowDeckDelay(flowdeck_delay_ms)
-        init_pos = x0[:, [0, 2, 4]]   # (B, 3)
-        init_vel = x0[:, [1, 3, 5]]   # (B, 3)
-        flowdeck.reset(init_pos, init_vel)
+            # Curriculum reset
+            if tau_div is not None:
+                pos_err = state[:, [0, 2, 4]].norm(dim=1)
+                diverged = pos_err > tau_div
+                if diverged.any():
+                    mask = diverged.unsqueeze(1).expand_as(state)
+                    state = torch.where(mask, torch.zeros_like(state), state)
+                    pid_state = reset_pid_diverged(pid_state, diverged)
 
-    # --- matrices for cost ---
-    Q = torch.tensor(Q_DIAG, dtype=torch.float32, device=dev)
-    R = torch.tensor(R_DIAG, dtype=torch.float32, device=dev)
-
-    state = x0.clone()
-    cost_sum = torch.zeros(1, device=dev)
-
-    # Storage for sampled trajectory
-    n_samples = inner_steps
-    X = torch.zeros(B, n_samples, 12, device=dev)
-    sample_idx = 0
-
-    # Cached setpoints (updated every step)
-    # Initialized to values that produce hover
-    thrust_cached   = torch.full((B,), PID_VEL_THRUST_BASE, device=dev)
-
-    # For att_sp / rate_sp: yaw_rate and rates cached
-    yaw_rate_cached  = torch.zeros(B, device=dev)
-    rate_r_cached    = torch.zeros(B, device=dev)
-    rate_p_cached    = torch.zeros(B, device=dev)
-
-    for k in range(inner_steps):
-
-        # Extract state components
-        pos   = state[:, [0, 2, 4]]              # (B, 3)
-        vel   = state[:, [1, 3, 5]]              # (B, 3)
-        phi   = state[:, 6];   p_rate = state[:, 7]
-        theta = state[:, 8];   q_rate = state[:, 9]
-        psi   = state[:, 10];  r_rate = state[:, 11]
-
-        gyro_deg = torch.stack([
-            torch.rad2deg(p_rate), torch.rad2deg(q_rate), torch.rad2deg(r_rate)
-        ], dim=-1)
-
-        # ---- FlowDeck push (every inner step = 500 Hz) ----
-        if use_flowdeck:
-            flowdeck.push(pos, vel)
-
-        # =========================================================
-        # INFERENCE DU NN
-        # =========================================================
-        nn_out = policy(state) # Appelé à chaque itération k
-        rate_r_cached   = nn_out[:, 0]
-        rate_p_cached   = nn_out[:, 1]
-        yaw_rate_cached = nn_out[:, 2]
-        thrust_cached   = nn_out[:, 3]
-        pid_state = _set_scalar(pid_state, IDX_THRUST, thrust_cached)
-
-        # ---- Yaw accumulation (every inner step, from yaw_rate) ----
-        pid_state = _accumulate_yaw(pid_state, yaw_rate_cached)
-
-        # ---- Attitude + Rate PIDs (every inner step = 500 Hz) ----
-        thrust = pid_state[:, IDX_THRUST]
-
-        roll_cmd, pitch_cmd, yaw_cmd, pid_state = rate_controller_update(pid_state,
-                                                                         gyro_deg,
-                                                                         rate_r_cached, 
-                                                                         rate_p_cached,
-                                                                         yaw_rate_cached)
-
-        # ---- Power distribution ----
-        motor_pwm = power_distribute(thrust, roll_cmd, pitch_cmd, yaw_cmd)
-
-        # ---- PWM → RPM ----
-        rpm_cmd = pwm_to_rpm_torch(motor_pwm)
-
-        # ---- Motor dynamics filter ----
-        if use_motor_filter:
-            motor_rpm = motor_filter_step(motor_rpm, rpm_cmd)
-        else:
-            motor_rpm = rpm_cmd
-
-        # ---- Physics step ----
-        state = dynamics_substep(state, motor_rpm, ATTITUDE_UPDATE_DT)
-
-        X[:, sample_idx, :] = state
-        cost_state = (state ** 2 * Q).sum(dim=1).mean()
-        cost_input = (nn_out ** 2 * R).sum(dim=1).mean()
-        cost_step = cost_state + cost_input
-        cost_sum = cost_sum + cost_step
-        sample_idx += 1
-
-    return X, cost_sum
+    return X
 
 
 # =====================================================================
-# 16. Training Utilities
+# 8. Cost Function
+# =====================================================================
+
+def trajectory_cost(X, terminal_weight=10.0, pos_weight=10.0):
+    """Quadratic cost: position-dominant + small state penalty.
+
+    pos_weight scales the position terms relative to velocity/angle terms.
+    This encourages the NN to actually move toward target, not just hover.
+    """
+    Q = torch.as_tensor(Q_DIAG, dtype=X.dtype, device=X.device)
+
+    # Scale position terms more heavily
+    Q_scaled = Q.clone()
+    Q_scaled[[0, 2, 4]] *= pos_weight   # x, y, z positions
+
+    cost_running = (X**2 * Q_scaled).sum(dim=2).mean(dim=0).sum()
+
+    if terminal_weight > 0:
+        pos_T = X[:, -1, [0, 2, 4]]
+        cost_running += terminal_weight * (pos_T**2).sum(dim=1).mean()
+
+    return cost_running
+
+
+# =====================================================================
+# 9. Training
 # =====================================================================
 
 def make_x0_batch(xyz_list, device="cpu"):
+    """Create (B, 12) initial states from list of (x, y, z). All rest = 0."""
     X0 = torch.zeros(len(xyz_list), 12, dtype=torch.float32, device=device)
     for b, (x, y, z) in enumerate(xyz_list):
-        X0[b, 0] = x
-        X0[b, 2] = y
-        X0[b, 4] = z
+        X0[b, 0] = x;  X0[b, 2] = y;  X0[b, 4] = z
     return X0
 
 
 def generate_cube_points(half_side=0.3):
+    """27 initial positions: vertices + edges + faces + center."""
     vals = [-half_side, 0.0, half_side]
     return list(itertools.product(vals, repeat=3))
 
 
-def build_run_name(setpoint_mode, linearized, epochs, lr, hidden,
-                   flowdeck, tag=""):
-    dyn   = "linear" if linearized else "nonlinear"
-    fd    = "_flowdeck" if flowdeck else ""
-    lr_str = f"{lr:.0e}" if lr < 1e-2 else str(lr).replace(".", "p")
-    name  = f"cf_pid_{setpoint_mode}_{dyn}_h{hidden}_ep{epochs}_lr{lr_str}{fd}"
-    if tag:
-        name += f"_{tag.replace(' ', '_')}"
-    return name
+def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
+          half_side=0.3, terminal_weight=10.0,
+          tau_start=0.5, tau_end=2.0, device="cpu"):
+    """Train the concurrent NN controller with curriculum learning."""
 
+    T = int(t_chunk * NN_FREQ)          # NN steps per chunk
+    n_chunks = int(t_sim / t_chunk)     # number of chunks
+    total_steps = T * n_chunks
 
-# =====================================================================
-# 17. Training Loop
-# =====================================================================
+    print(f"[Config] T_chunk={T} steps ({t_chunk}s), "
+          f"n_chunks={n_chunks}, total={total_steps} NN steps ({t_sim}s)")
+    print(f"[Config] PID substeps per NN step: {PID_STEPS_PER_NN}")
+    print(f"[Config] Total dynamics steps: {total_steps * PID_STEPS_PER_NN}")
 
-def train(
-    epochs: int = 500,
-    lr: float = 1e-3,
-    hidden: int = 64,
-    use_flowdeck: bool = False,
-    flowdeck_delay_ms: float = 110.0,
-    use_motor_filter: bool = True,
-    half_side: float = 0.3,
-    t_sim: float = T_SIM,
-    device: str = "cpu",
-):
-    inner_steps = int(t_sim * ATTITUDE_RATE)
-
-    policy = PolicyMLPPID(X_SCALE, hidden).to(device)
+    policy = ConcurrentPolicyMLP(T=T, hidden=hidden).to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     cube_pts = generate_cube_points(half_side)
-    x0_batch = make_x0_batch(cube_pts, device=device)
+    x0 = make_x0_batch(cube_pts, device=device)
+    print(f"[Train] {len(cube_pts)} initial points, ±{half_side}m cube")
 
-    # Verify hover init
+    # Verify hover initialization
     with torch.no_grad():
-        nn_test = policy(torch.zeros(1, 12, device=device))
-        print(f"\n[Init] NN output at x=0: {nn_test[0].cpu().numpy()}")
-
-    fd_label  = f" + FlowDeck({flowdeck_delay_ms}ms)" if use_flowdeck else ""
-    print(f"[Train] {len(cube_pts)} pts, epochs={epochs}, lr={lr},"
-          f"t_sim={t_sim}s ({inner_steps} inner steps)")
+        test_state = torch.zeros(1, 12, device=device)
+        test_targets = torch.zeros(1, T, 3, device=device)
+        test_out = policy(test_state, test_targets)
+        print(f"[Init] NN at x=0: thrust={test_out[0,0,0]:.0f} "
+              f"(hover≈{HOVER_THRUST_U16:.0f}), "
+              f"roll={test_out[0,0,1]:.2f}°, pitch={test_out[0,0,2]:.2f}°, "
+              f"yaw_r={test_out[0,0,3]:.2f}°/s")
 
     for ep in range(epochs):
-        X, cost = rollout_pid(
-            policy, x0_batch,
-            inner_steps=inner_steps,
-            use_flowdeck=use_flowdeck,
-            flowdeck_delay_ms=flowdeck_delay_ms,
-            use_motor_filter=use_motor_filter
-        )
+        # Curriculum: tau_div linearly increases over epochs
+        progress = ep / max(epochs - 1, 1)
+        tau_div = tau_start + (tau_end - tau_start) * progress
+
+        X = rollout(policy, x0, n_chunks, tau_div=tau_div)
+        loss = trajectory_cost(X, terminal_weight)
 
         opt.zero_grad()
-        cost.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
         opt.step()
         scheduler.step()
 
-        with torch.no_grad():
-            pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
-            print(f"  [ep {ep+1:4d}/{epochs}]  cost={cost.item():.4e}  "
-                    f"|x_T|_mean={pos_end.mean().item():.4f}  "
-                    f"|x_T|_max={pos_end.max().item():.4f}")
+        if (ep + 1) % 50 == 0 or ep == 0:
+            with torch.no_grad():
+                pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+                pos_mid = X[:, total_steps // 2, [0, 2, 4]].norm(dim=1)
+                print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
+                      f"|pos_T|={pos_end.mean():.4f} (max {pos_end.max():.4f})  "
+                      f"|pos_mid|={pos_mid.mean():.4f}  tau={tau_div:.3f}")
 
     return policy
 
 
 # =====================================================================
-# 18. Main
+# 10. Evaluation
+# =====================================================================
+
+@torch.no_grad()
+def evaluate(policy, test_pts, n_chunks, device="cpu"):
+    """Evaluate the trained NN on test positions."""
+    T = policy.T
+    x0 = make_x0_batch(test_pts, device=device)
+    X = rollout(policy, x0, n_chunks, tau_div=None)
+
+    pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+    vel_end = X[:, -1, [1, 3, 5]].norm(dim=1)
+    print(f"\n[Eval] {len(test_pts)} test points, "
+          f"{n_chunks * T} NN steps ({n_chunks * T / NN_FREQ:.1f}s):")
+    print(f"  Terminal pos error  mean={pos_end.mean():.5f} m  "
+          f"max={pos_end.max():.5f} m")
+    print(f"  Terminal velocity   mean={vel_end.mean():.5f} m/s  "
+          f"max={vel_end.max():.5f} m/s")
+
+    return X
+
+
+def save_plots(X, labels, filename="training_result.png"):
+    """Plot position trajectories."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not available, skipping plots.")
+        return
+
+    X_np = X.cpu().numpy()
+    B = X_np.shape[0]
+    T_total = X_np.shape[1]
+    t_axis = np.arange(1, T_total + 1) / NN_FREQ
+
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+    coord_idx = [0, 2, 4]
+    coord_names = ["x (m)", "y (m)", "z (m)"]
+
+    for j, (idx, name) in enumerate(zip(coord_idx, coord_names)):
+        for b in range(min(B, 10)):
+            axes[j].plot(t_axis, X_np[b, :, idx], linewidth=0.8, alpha=0.7,
+                         label=labels[b] if j == 0 else None)
+        axes[j].axhline(0, color="k", linewidth=0.5, linestyle="--")
+        axes[j].set_xlabel("Time (s)")
+        axes[j].set_ylabel(name)
+        axes[j].set_title(f"Position {name}")
+        axes[j].grid(True, alpha=0.3)
+
+    axes[0].legend(fontsize=6, ncol=2)
+    fig.suptitle("Concurrent NN Controller with CF Firmware PID", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(filename, dpi=150)
+    plt.close(fig)
+    print(f"[Saved] {filename}")
+
+
+# =====================================================================
+# 11. Main
 # =====================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--flowdeck", action="store_true",
-                        help="Simulate FlowDeck delay during training")
-    parser.add_argument("--flowdeck_delay_ms", type=float, default=110.0)
-    parser.add_argument("--no_motor_filter", action="store_true",
-                        help="Disable motor dynamics filter")
+    parser = argparse.ArgumentParser(
+        description="Train concurrent NN controller with CF firmware PID")
     parser.add_argument("--epochs", type=int, default=500)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden", type=int, default=64)
-    parser.add_argument("--t_sim", type=float, default=T_SIM)
-    parser.add_argument("--half_side", type=float, default=0.3)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--t_chunk", type=float, default=0.2,
+                        help="Chunk duration in seconds (T = t_chunk * 100)")
+    parser.add_argument("--t_sim", type=float, default=2.0,
+                        help="Total simulation duration in seconds")
+    parser.add_argument("--half_side", type=float, default=0.3,
+                        help="Half-side of initial position cube [m]")
+    parser.add_argument("--tau_start", type=float, default=0.5,
+                        help="Curriculum: initial divergence threshold [m]")
+    parser.add_argument("--tau_end", type=float, default=2.0,
+                        help="Curriculum: final divergence threshold [m]")
     parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n[Device] {device}")
+    print(f"[Device] {device}")
+    print(f"[Hover thrust] {HOVER_THRUST_U16:.0f} / {UINT16_MAX:.0f} "
+          f"({HOVER_THRUST_U16/UINT16_MAX*100:.1f}%)")
 
     policy = train(
-        epochs=args.epochs,
-        lr=args.lr,
-        hidden=args.hidden,
-        use_flowdeck=args.flowdeck,
-        flowdeck_delay_ms=args.flowdeck_delay_ms,
-        use_motor_filter=not args.no_motor_filter,
-        half_side=args.half_side,
-        t_sim=args.t_sim,
-        device=device,
-    )
+        epochs=args.epochs, lr=args.lr, hidden=args.hidden,
+        t_chunk=args.t_chunk, t_sim=args.t_sim,
+        half_side=args.half_side, terminal_weight=10.0,
+        tau_start=args.tau_start, tau_end=args.tau_end,
+        device=device)
 
-    # Save
-    out_dir  = os.path.dirname(os.path.abspath(__file__))
-    run_name = build_run_name(args.epochs, args.lr, args.hidden,
-                              args.flowdeck, args.tag)
-    path_full = os.path.join(out_dir, f"trained_policy_{run_name}.pt")
-    path_dict = os.path.join(out_dir, f"trained_weights_{run_name}.pt")
+    # Evaluate on random test points
+    T = int(args.t_chunk * NN_FREQ)
+    n_chunks = int(args.t_sim / args.t_chunk)
+    rng = np.random.default_rng(42)
+    test_pts = [(rng.uniform(-0.3, 0.3),
+                 rng.uniform(-0.3, 0.3),
+                 rng.uniform(-0.3, 0.3)) for _ in range(20)]
+    X_eval = evaluate(policy, test_pts, n_chunks, device=device)
 
-    torch.save(policy.cpu(), path_full)
+    # Plot
+    labels = [f"({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f})" for p in test_pts]
+    tag = f"_{args.tag}" if args.tag else ""
+    plot_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             f"train_cf_pid_result{tag}.png")
+    save_plots(X_eval, labels, plot_file)
+
+    # Save checkpoint
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    ckpt_name = (f"trained_cf_pid_T{T}_ch{n_chunks}_h{args.hidden}"
+                 f"_ep{args.epochs}{tag}.pt")
+    ckpt_path = os.path.join(out_dir, ckpt_name)
     torch.save({
-        "state_dict":       policy.state_dict(),
-        "hidden":           args.hidden,
-        "x_scale":          X_SCALE,
-        "ctrl_freq":        ATTITUDE_RATE,
-        "Ts":               ATTITUDE_UPDATE_DT,
+        "state_dict": policy.cpu().state_dict(),
+        "T": T,
+        "n_chunks": n_chunks,
+        "hidden": args.hidden,
+        "x_scale": X_SCALE,
+        "pos_scale": POS_SCALE,
+        "nn_freq": NN_FREQ,
+        "att_rate": ATTITUDE_RATE,
+        "t_chunk": args.t_chunk,
+        "t_sim": args.t_sim,
+        "epochs": args.epochs,
+        "lr": args.lr,
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
-        "MAX_RPM":          MAX_RPM,
-        "use_flowdeck":     args.flowdeck,
-        "flowdeck_delay_ms": args.flowdeck_delay_ms,
-        "use_motor_filter": not args.no_motor_filter,
-        "pid_gains": {
-            "roll_rate":  (PID_ROLL_RATE_KP,  PID_ROLL_RATE_KI,  PID_ROLL_RATE_KD),
-            "pitch_rate": (PID_PITCH_RATE_KP, PID_PITCH_RATE_KI, PID_PITCH_RATE_KD),
-            "yaw_rate":   (PID_YAW_RATE_KP,   PID_YAW_RATE_KI,   PID_YAW_RATE_KD)
-        },
-        "run_name":         run_name,
-        "epochs":           args.epochs,
-        "lr":               args.lr,
-    }, path_dict)
-
-    print(f"\n[Saved] {path_full}")
-    print(f"[Saved] {path_dict}")
-    print(f"\nDone! Run  validate_nn_cf_pid_pybullet.py --weights {os.path.basename(path_dict)}  to validate.")
+        "MAX_RPM": MAX_RPM,
+    }, ckpt_path)
+    print(f"[Saved] {ckpt_path}")
+    print("\nDone!")
