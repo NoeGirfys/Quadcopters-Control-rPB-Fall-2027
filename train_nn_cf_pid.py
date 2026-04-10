@@ -76,6 +76,10 @@ ATTITUDE_RATE = 500    # Hz
 ATT_DT        = 1.0 / ATTITUDE_RATE   # 0.002 s
 PID_STEPS_PER_NN = ATTITUDE_RATE // NN_FREQ  # 5
 
+# ---- Constantes du filtre moteur ----
+MOTOR_TAU = 0.02  # 20ms de délai mécanique/électrique
+MOTOR_ALPHA = ATT_DT / (MOTOR_TAU + ATT_DT)
+
 # ---- State scaling (same as train_nn_cf2x.py) ----
 X_SCALE = np.array([
     1.0, 1.0,                            # x, vx
@@ -246,7 +250,7 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
                  rate_integ (B,3), rate_prev (B,3),
                  yaw_setpoint (B,))
     """
-    att_integ, att_prev, rate_integ, rate_prev, yaw_sp = pid_state
+    att_integ, att_prev, rate_integ, rate_prev, yaw_sp, motor_rpm = pid_state
     g = _get_pid_gains(state_12.device)
 
     # --- Extract state in firmware convention (pitch & pitch-rate negated) ---
@@ -302,12 +306,13 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
 
     # --- PWMs -> wrench -> dynamics ---
     # --- PWMs -> RPMs -> dynamics ---
-    rpms = pwm_to_rpm_torch(motor_pwms)
+    rpm_cmd = pwm_to_rpm_torch(motor_pwms)
+    new_motor_rpm = MOTOR_ALPHA * rpm_cmd + (1.0 - MOTOR_ALPHA) * motor_rpm
     
-    new_state = dynamics_substep(state_12, rpms, ATT_DT)
+    new_state = dynamics_substep(state_12, new_motor_rpm, ATT_DT)
     
     new_pid_state = (new_att_integ, new_att_prev, new_rate_integ,
-                     new_rate_prev, new_yaw_sp)
+                     new_rate_prev, new_yaw_sp, new_motor_rpm)
     
     return new_state, new_pid_state
 
@@ -349,23 +354,33 @@ def init_pid_state(state_12):
     rate_integ = torch.zeros(B, 3, device=dev)
     rate_prev  = torch.stack([gyro_r, gyro_p, gyro_y], dim=-1)
     yaw_sp     = yaw_deg.clone()
+    
+    # NOUVEAU: Initialiser la vitesse des moteurs au stationnaire
+    motor_rpm  = torch.full((B, 4), HOVER_RPM, device=dev, dtype=torch.float32)
 
-    return (att_integ, att_prev, rate_integ, rate_prev, yaw_sp)
+    return (att_integ, att_prev, rate_integ, rate_prev, yaw_sp, motor_rpm)
 
 
 def reset_pid_diverged(pid_state, diverged_mask):
     """Zero PID state for diverged drones (detached)."""
-    att_integ, att_prev, rate_integ, rate_prev, yaw_sp = pid_state
+    # NOUVEAU: Récupérer motor_rpm
+    att_integ, att_prev, rate_integ, rate_prev, yaw_sp, motor_rpm = pid_state
+    
     m = diverged_mask.unsqueeze(1)   # (B, 1)
     m1 = diverged_mask               # (B,)
+    
     zero3 = torch.zeros_like(att_integ)
     zero1 = torch.zeros_like(yaw_sp)
+    # NOUVEAU: Moteurs au stationnaire pour les drones reset
+    hover4 = torch.full_like(motor_rpm, HOVER_RPM) 
+    
     return (
         torch.where(m, zero3, att_integ),
         torch.where(m, zero3, att_prev),
         torch.where(m, zero3, rate_integ),
         torch.where(m, zero3, rate_prev),
         torch.where(m1, zero1, yaw_sp),
+        torch.where(m, hover4, motor_rpm), # NOUVEAU
     )
 
 
