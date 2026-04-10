@@ -561,11 +561,32 @@ def generate_cube_points(half_side=0.3):
     vals = [-half_side, 0.0, half_side]
     return list(itertools.product(vals, repeat=3))
 
+import signal
+import sys
+class GracefulKiller:
+    """Intercepte Ctrl+C pour arrêter l'entraînement proprement à la fin d'un epoch."""
+    def __init__(self):
+        self.kill_now = False
+        self.interrupt_count = 0
+        signal.signal(signal.SIGINT, self.exit_gracefully)
+        signal.signal(signal.SIGTERM, self.exit_gracefully)
+
+    def exit_gracefully(self, *args):
+        self.interrupt_count += 1
+        if self.interrupt_count == 1:
+            print("\n[Interruption] Ctrl+C détecté ! L'entraînement s'arrêtera à la fin de cet epoch pour sauvegarder proprement.")
+            print("Appuyez à nouveau sur Ctrl+C pour forcer un arrêt immédiat (sans sauvegarde).")
+            self.kill_now = True
+        else:
+            print("\n[Arrêt Forcé] Double Ctrl+C détecté. Arrêt immédiat !")
+            sys.exit(1)
 
 def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
           half_side=0.3, terminal_weight=10.0,
           tau_start=0.5, tau_end=2.0, device="cpu"):
     """Train the concurrent NN controller with curriculum learning."""
+
+    killer = GracefulKiller()
 
     T = int(t_chunk * NN_FREQ)          # NN steps per chunk
     n_chunks = int(t_sim / t_chunk)     # number of chunks
@@ -644,6 +665,10 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
             # Nom du fichier : epoch_0001.png, epoch_0002.png...
             plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
             save_plots(X_eval, eval_labels, plot_file, verbose=False)
+        
+        if killer.kill_now:
+            print(f"\n[Arrêt Propre] Fin prématurée demandée à l'epoch {ep+1}.")
+            break  # On sort de la boucle for
 
     return policy
 
