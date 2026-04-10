@@ -120,11 +120,11 @@ def rotation_matrix_zyx(phi, theta, psi):
     return R
 
 
-def dynamics_substep(state, wrench, dt):
+def dynamics_substep(state, rpm, dt):
     """One semi-implicit Euler step. Replicates BaseAviary._dynamics().
 
-    state  : (B, 12)  [x, vx, y, vy, z, vz, phi, p, theta, q, psi, r]
-    wrench : (B, 4)   [F, tau_x, tau_y, tau_z]
+    state : (B, 12)  [x, vx, y, vy, z, vz, phi, p, theta, q, psi, r]
+    rpm   : (B, 4)   [M1, M2, M3, M4]
     """
     x, vx     = state[:, 0], state[:, 1]
     y, vy     = state[:, 2], state[:, 3]
@@ -133,26 +133,40 @@ def dynamics_substep(state, wrench, dt):
     theta, q  = state[:, 8], state[:, 9]
     psi, r    = state[:, 10], state[:, 11]
 
-    F, tau_x, tau_y, tau_z = wrench[:, 0], wrench[:, 1], wrench[:, 2], wrench[:, 3]
+    # --- 1. Calcul des forces et couples à partir des RPMs ---
+    # Correspond à: forces = np.array(rpm**2) * self.KF
+    forces = (rpm ** 2) * KF
+    z_torques = (rpm ** 2) * KM
 
-    # (a) Thrust in world frame
+    F = forces.sum(dim=-1)
+
+    # Mixage CF2X (Identique à pybullet-drones DroneModel.CF2X)
+    _a = L / math.sqrt(2)
+    tau_x = -(forces[:, 0] + forces[:, 1] - forces[:, 2] - forces[:, 3]) * _a
+    tau_y = (-forces[:, 0] + forces[:, 1] + forces[:, 2] - forces[:, 3]) * _a
+    tau_z = -z_torques[:, 0] + z_torques[:, 1] - z_torques[:, 2] + z_torques[:, 3]
+
+    # --- 2. Poussée dans le repère monde ---
     R = rotation_matrix_zyx(phi, theta, psi)
     thrust_world = F.unsqueeze(-1) * R[:, :, 2]
+    
     ax = thrust_world[:, 0] / M
     ay = thrust_world[:, 1] / M
     az = thrust_world[:, 2] / M - G
 
-    # (b) Gyroscopic coupling
+    # --- 3. Couplage gyroscopique ---
     gyro_x = (I_Z - I_Y) * q * r
     gyro_y = (I_X - I_Z) * p * r
     gyro_z = (I_Y - I_X) * p * q
+    
     p_dot = (tau_x - gyro_x) / I_X
     q_dot = (tau_y - gyro_y) / I_Y
     r_dot = (tau_z - gyro_z) / I_Z
 
-    # (c) Semi-implicit Euler: velocities first, then positions
+    # --- 4. Euler Semi-implicite ---
     vx_n = vx + dt * ax;  vy_n = vy + dt * ay;  vz_n = vz + dt * az
     p_n  = p  + dt * p_dot;  q_n = q + dt * q_dot;  r_n = r + dt * r_dot
+    
     x_n     = x     + dt * vx_n;  y_n     = y     + dt * vy_n;  z_n     = z     + dt * vz_n
     phi_n   = phi   + dt * p_n;   theta_n = theta + dt * q_n;   psi_n   = psi   + dt * r_n
 
@@ -216,6 +230,12 @@ def _get_pid_gains(dev):
         }
     return _pid_cache[dev]
 
+def pwm_to_rpm_torch(motor_pwm: torch.Tensor) -> torch.Tensor:
+    """Convertit les PWM (0-65535) en RPM avec sécurité pour le gradient."""
+    thrust = (motor_pwm / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
+    # SÉCURITÉ CRITIQUE : Empêche un gradient infini si thrust = 0
+    thrust = torch.clamp(thrust, min=1e-3) 
+    return torch.sqrt(thrust / KF)
 
 def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
                  state_12, pid_state):
@@ -281,18 +301,14 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
     motor_pwms = torch.clamp(motor_pwms - reduction, min=0, max=UINT16_MAX)
 
     # --- PWMs -> wrench -> dynamics ---
-    motor_thrusts = motor_pwms * _THRUST_SCALE  # (B, 4)  [N per motor]
-    t0, t1, t2, t3 = motor_thrusts[:, 0], motor_thrusts[:, 1], motor_thrusts[:, 2], motor_thrusts[:, 3]
-    wrench = torch.stack([
-        t0 + t1 + t2 + t3,                         # F
-        -(t0 + t1 - t2 - t3) * _L_SQRT2,           # tau_x
-        (-t0 + t1 + t2 - t3) * _L_SQRT2,           # tau_y
-        (-t0 + t1 - t2 + t3) * _KM_KF,             # tau_z
-    ], dim=-1)
-
-    new_state = dynamics_substep(state_12, wrench, ATT_DT)
+    # --- PWMs -> RPMs -> dynamics ---
+    rpms = pwm_to_rpm_torch(motor_pwms)
+    
+    new_state = dynamics_substep(state_12, rpms, ATT_DT)
+    
     new_pid_state = (new_att_integ, new_att_prev, new_rate_integ,
                      new_rate_prev, new_yaw_sp)
+    
     return new_state, new_pid_state
 
 
@@ -553,6 +569,20 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
     x0 = make_x0_batch(cube_pts, device=device)
     print(f"[Train] {len(cube_pts)} initial points, ±{half_side}m cube")
 
+    # ==========================================================
+    # PRÉPARATION POUR LES PLOTS
+    # ==========================================================
+    # Création du dossier
+    plot_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "NN_training_plots")
+    os.makedirs(plot_dir, exist_ok=True)
+
+    # Génération d'un set fixe de points de test pour toute la durée de l'entraînement
+    rng = np.random.default_rng(42)
+    # 10 points c'est un bon compromis pour que le plot reste lisible
+    test_pts = [(rng.uniform(-0.3, 0.3), rng.uniform(-0.3, 0.3), rng.uniform(-0.3, 0.3)) for _ in range(10)]
+    eval_labels = [f"({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f})" for p in test_pts]
+    # ==========================================================
+
     # Verify hover initialization
     with torch.no_grad():
         test_state = torch.zeros(1, 12, device=device)
@@ -574,16 +604,31 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
         opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
-        opt.step()
-        scheduler.step()
+        # PARE-FEU ANTI-NAN
+        has_nan = any(torch.isnan(p.grad).any() for p in policy.parameters() if p.grad is not None)
+        if not has_nan:
+            opt.step()
+            scheduler.step()
+        else:
+            print(f"  [Alerte] Gradient NaN à l'epoch {ep}, pas ignoré.")
 
-        if (ep + 1) % 50 == 0 or ep == 0:
-            with torch.no_grad():
-                pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
-                pos_mid = X[:, total_steps // 2, [0, 2, 4]].norm(dim=1)
-                print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
-                      f"|pos_T|={pos_end.mean():.4f} (max {pos_end.max():.4f})  "
-                      f"|pos_mid|={pos_mid.mean():.4f}  tau={tau_div:.3f}")
+        with torch.no_grad():
+            pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+            pos_mid = X[:, total_steps // 2, [0, 2, 4]].norm(dim=1)
+            print(f"  [ep {ep+1:4d}/{epochs}]  loss={loss.item():.4e}  "
+                    f"|pos_T|={pos_end.mean():.4f} (max {pos_end.max():.4f})  "
+                    f"|pos_mid|={pos_mid.mean():.4f}  tau={tau_div:.3f}")
+
+        # ==========================================================
+        # ÉVALUATION ET SAUVEGARDE DU PLOT
+        # ==========================================================
+        
+        with torch.no_grad():
+            X_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=False)
+            
+            # Nom du fichier : epoch_0001.png, epoch_0002.png...
+            plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
+            save_plots(X_eval, eval_labels, plot_file, verbose=False)
 
     return policy
 
@@ -593,25 +638,23 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
 # =====================================================================
 
 @torch.no_grad()
-def evaluate(policy, test_pts, n_chunks, device="cpu"):
-    """Evaluate the trained NN on test positions."""
+def evaluate(policy, test_pts, n_chunks, device="cpu", verbose=True):
     T = policy.T
     x0 = make_x0_batch(test_pts, device=device)
     X = rollout(policy, x0, n_chunks, tau_div=None)
 
-    pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
-    vel_end = X[:, -1, [1, 3, 5]].norm(dim=1)
-    print(f"\n[Eval] {len(test_pts)} test points, "
-          f"{n_chunks * T} NN steps ({n_chunks * T / NN_FREQ:.1f}s):")
-    print(f"  Terminal pos error  mean={pos_end.mean():.5f} m  "
-          f"max={pos_end.max():.5f} m")
-    print(f"  Terminal velocity   mean={vel_end.mean():.5f} m/s  "
-          f"max={vel_end.max():.5f} m/s")
+    if verbose:
+        pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
+        vel_end = X[:, -1, [1, 3, 5]].norm(dim=1)
+        print(f"\n[Eval] {len(test_pts)} test points, "
+              f"{n_chunks * T} NN steps ({n_chunks * T / NN_FREQ:.1f}s):")
+        print(f"  Terminal pos error  mean={pos_end.mean():.5f} m  max={pos_end.max():.5f} m")
+        print(f"  Terminal velocity   mean={vel_end.mean():.5f} m/s  max={vel_end.max():.5f} m/s")
 
     return X
 
 
-def save_plots(X, labels, filename="training_result.png"):
+def save_plots(X, labels, filename="training_result.png", verbose=True):
     """Plot position trajectories."""
     try:
         import matplotlib
@@ -645,7 +688,8 @@ def save_plots(X, labels, filename="training_result.png"):
     fig.tight_layout()
     fig.savefig(filename, dpi=150)
     plt.close(fig)
-    print(f"[Saved] {filename}")
+    if verbose:
+        print(f"[Saved] {filename}")
 
 
 # =====================================================================
@@ -690,14 +734,14 @@ if __name__ == "__main__":
     test_pts = [(rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3)) for _ in range(20)]
-    X_eval = evaluate(policy, test_pts, n_chunks, device=device)
+    X_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=True)
 
     # Plot
     labels = [f"({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f})" for p in test_pts]
     tag = f"_{args.tag}" if args.tag else ""
     plot_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"train_cf_pid_result{tag}.png")
-    save_plots(X_eval, labels, plot_file)
+    save_plots(X_eval, labels, plot_file, verbose=True)
 
     # Save checkpoint
     out_dir = os.path.dirname(os.path.abspath(__file__))
