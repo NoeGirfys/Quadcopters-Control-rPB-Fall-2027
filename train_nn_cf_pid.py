@@ -512,6 +512,7 @@ def rollout(policy, x0, n_chunks, tau_div=None):
                 pos_err = state[:, [0, 2, 4]].norm(dim=1)
                 diverged = pos_err > tau_div
                 if diverged.any():
+                    print(f"  [Curriculum] Resetting {diverged.sum().item()}/{B} drones at step {step_idx} (pos_err > {tau_div:.2f})")
                     mask = diverged.unsqueeze(1).expand_as(state)
                     state = torch.where(mask, torch.zeros_like(state), state)
                     pid_state = reset_pid_diverged(pid_state, diverged)
@@ -646,7 +647,7 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
             opt.step()
             scheduler.step()
         else:
-            print(f"  [Alerte] Gradient NaN à l'epoch {ep}, pas ignoré.")
+            print(f"[Warning] NaN detected in gradients at epoch {ep+1}. Skipping optimizer step to prevent corruption.")
 
         with torch.no_grad():
             pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
@@ -664,7 +665,7 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
             
             # Nom du fichier : epoch_0001.png, epoch_0002.png...
             plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
-            save_plots(X_eval, eval_labels, plot_file, verbose=False)
+            #save_plots(X_eval, eval_labels, plot_file, verbose=False)
         
         if killer.kill_now:
             print(f"\n[Arrêt Propre] Fin prématurée demandée à l'epoch {ep+1}.")
