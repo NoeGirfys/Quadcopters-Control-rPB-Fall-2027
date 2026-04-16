@@ -271,6 +271,9 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     log_nn_cmd = np.zeros((n_steps, 4))
     log_phase = np.zeros(n_steps, dtype=int)
 
+    # --- NOUVEAU : Liste pour les temps d'inférence ---
+    inference_times = []
+
     action = np.full((1, 4), HOVER_RPM)
     START = time.time()
 
@@ -309,7 +312,10 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             else:
                 # Phase 2: NN controller — query at 100 Hz, use first action
                 nn_state = obs_to_nn_state(obs[0])
+                t_start = time.perf_counter()
                 a = query_nn_chunk(policy, nn_state, nn_target, device)[0]
+                t_end = time.perf_counter()
+                inference_times.append(t_end - t_start)
                 thrust_cmd, roll_des, pitch_des, yaw_rate_cmd = \
                     float(a[0]), float(a[1]), float(a[2]), float(a[3])
 
@@ -369,6 +375,16 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
     env.close()
     print("[SIM] Done.")
+
+    # --- NOUVEAU : Affichage des statistiques ---
+    if inference_times:
+        inf_ms = np.array(inference_times) * 1000.0  # Conversion en ms
+        print("\n" + "="*40)
+        print("[NN INFERENCE TIME STATS (100 Hz)]")
+        print(f"  Min  : {np.min(inf_ms):.3f} ms")
+        print(f"  Mean : {np.mean(inf_ms):.3f} ms")
+        print(f"  Max  : {np.max(inf_ms):.3f} ms")
+        print("="*40 + "\n")
 
     data = dict(t=log_t, pos=log_pos, vel=log_vel, rpy=log_rpy,
                 rpms=log_rpms, thrust=log_thrust, nn_cmd=log_nn_cmd,
@@ -492,8 +508,7 @@ def _plot_nn_sim(data: dict, takeoff_max_duration: float):
 #  REAL mode
 # ===================================================================
 
-def run_real_nn(ckpt_path: str, target_pos=(0, 0, 1),
-                takeoff_pos=(0, 0, 0.5),
+def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 uri: str = "radio://0/80/2M/E7E7E7E7E7",
                 duration_sec: float = 15, takeoff_max_duration: float = 3.0,
                 device: str = "cpu"):
@@ -522,8 +537,8 @@ def run_real_nn(ckpt_path: str, target_pos=(0, 0, 1),
         print("[REAL] Connected!")
 
         # ---- Flow deck settings -----
-        cf.param.set_value('motion.adaptive', '0')
-        cf.param.set_value('motion.flowStdFixed', '10.0')
+        #cf.param.set_value('motion.adaptive', '0')
+        #cf.param.set_value('motion.flowStdFixed', '10.0')
 
         # ---- Logging setup -----
         from cflib.crazyflie.log import LogConfig
@@ -636,7 +651,7 @@ def run_real_nn(ckpt_path: str, target_pos=(0, 0, 1),
             for i in range(nn_steps):
                 nn_state = drone_state_to_nn_state(drone_state)
                 thrust, roll_deg, pitch_deg, yaw_rate = \
-                    query_nn(policy, nn_state, nn_target, device)
+                    query_nn_chunk(policy, nn_state, nn_target, device)[0]
 
                 # send_setpoint: (roll_deg, pitch_deg, yaw_rate_deg/s,
                 #                 thrust_uint16)
@@ -779,8 +794,8 @@ MODES:
     parser.add_argument('--mode', default='sim',
                         choices=['sim', 'attitude'],
                         help='Control mode (default: sim)')
-    parser.add_argument('--duration', default=10, type=float,
-                        help='Total flight duration [s] (default: 10)')
+    parser.add_argument('--duration', default=5, type=float,
+                        help='Total flight duration [s] (default: 5)')
     parser.add_argument('--takeoff-max-duration', default=3.0, type=float,
                         help='PID takeoff duration [s] (default: 3)')
     parser.add_argument('--PID-target', nargs=3, type=float,
@@ -810,8 +825,7 @@ MODES:
                    duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
                    gui=args.gui, plot=args.plot, device=device)
     elif args.mode == 'attitude':
-        run_real_nn(args.weights, target_pos=target_pos,
-                    takeoff_pos=takeoff_pos,
+        run_real_nn(args.weights, takeoff_pos=takeoff_pos, target_pos=target_pos,
                     uri=args.uri,
                     duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
                     device=device)
