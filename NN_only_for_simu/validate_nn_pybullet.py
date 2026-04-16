@@ -14,6 +14,7 @@ The pipeline at each control step:
     5. Take sqrt, clip           →  RPMs sent to env.step()
 
 Usage:
+    cd NN_only_for_simu
     python validate_nn_pybullet.py
     python validate_nn_pybullet.py --gui
     python validate_nn_pybullet.py --weights trained_weights_cf2x_nonlinear_h64_ep2000_lr1e-03.pt
@@ -25,11 +26,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# ─── Make sure gym-pybullet-drones is importable ───
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PYB_DIR = os.path.join(SCRIPT_DIR, "gym-pybullet-drones-main")
-if PYB_DIR not in sys.path:
-    sys.path.insert(0, PYB_DIR)
 
 from gym_pybullet_drones.envs.CtrlAviary import CtrlAviary
 from gym_pybullet_drones.utils.enums import DroneModel, Physics
@@ -71,9 +68,15 @@ def resolve_weights_path(script_dir, weights_arg):
     """Resolve checkpoint path from absolute or script-relative input."""
     if os.path.isabs(weights_arg):
         return weights_arg
-    candidate = os.path.join(script_dir, weights_arg)
-    if os.path.isfile(candidate):
-        return candidate
+    candidate_direct = os.path.join(script_dir, weights_arg)
+    if os.path.isfile(candidate_direct):
+        return candidate_direct
+    
+    # 2. AUTOMATISATION : On teste en ajoutant "checkpoint/" automatiquement
+    candidate_folder = os.path.join(script_dir, "saved_policies_and_weights", weights_arg)
+    if os.path.isfile(candidate_folder):
+        return candidate_folder
+    
     return weights_arg
 
 
@@ -413,8 +416,19 @@ if __name__ == "__main__":
 
     # ── Print & plot ──
     print_results(trajs, labels, target_pos)
+
+
+    # 1. Définir le nom du nouveau dossier (ici "plots", mais tu peux l'appeler "results" etc.)
+    PLOT_DIR = os.path.join(SCRIPT_DIR, "plots")
+    
+    # 2. Créer le dossier automatiquement s'il n'existe pas encore
+    os.makedirs(PLOT_DIR, exist_ok=True)
+    
+    # 3. Générer le nom du fichier
     plot_name = build_plot_filename(ckpt_path, physics_mode.value, target_pos, args.duration)
+    
+    # 4. Sauvegarder dans PLOT_DIR au lieu de SCRIPT_DIR
     save_plots(trajs, labels, target_pos, physics_mode,
-               os.path.join(SCRIPT_DIR, plot_name))
+               os.path.join(PLOT_DIR, plot_name))
 
     print("\nDone!")

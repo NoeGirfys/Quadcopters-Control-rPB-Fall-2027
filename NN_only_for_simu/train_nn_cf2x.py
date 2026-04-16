@@ -13,6 +13,7 @@ Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
 The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
+    cd NN_only_for_simu
     python train_nn_cf2x.py                          # nonlinear dynamics (default)
     python train_nn_cf2x.py --linear                 # linearized dynamics (faster)
     python train_nn_cf2x.py --epochs 3000 --lr 5e-4
@@ -603,9 +604,20 @@ if __name__ == "__main__":
                  rng.uniform(-0.3, 0.3)) for _ in range(20)]
     evaluate(policy, test_pts, device=device)
 
+
+
+
+
     # Save
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    # On définit le nom du nouveau dossier (ex: "checkpoints" ou "saved_models")
+    out_dir = os.path.join(base_dir, "saved_policies_and_weights") 
+    
+    # On crée le dossier s'il n'existe pas déjà
+    os.makedirs(out_dir, exist_ok=True)
+
     run_name = build_run_name(args.linear, args.epochs, args.lr, args.hidden, args.tag)
+
     path_full = os.path.join(out_dir, f"trained_policy_{run_name}.pt")
     path_dict = os.path.join(out_dir, f"trained_weights_{run_name}.pt")
 
