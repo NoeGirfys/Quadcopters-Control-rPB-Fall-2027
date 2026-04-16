@@ -46,13 +46,13 @@ T2W = 2.25
 GRAVITY   = M * G
 HOVER_RPM = np.sqrt(GRAVITY / (4 * KF))
 MAX_RPM   = np.sqrt((T2W * GRAVITY) / (4 * KF))
-from crazyflie_firmware.constants import UINT16_MAX
+from ..crazyflie_firmware.constants import UINT16_MAX
 
 # CF2.1+ per-motor thrust with battery compensation
 CF2_THRUST_MAX_PER_MOTOR = 0.12  # N
 
 # ---- PID Gains (from cf_firmware_pid_sim.py / platform_defaults_cf2.h) ----
-from crazyflie_firmware.constants import (
+from ..crazyflie_firmware.constants import (
     PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD, PID_ROLL_INTEGRATION_LIMIT,
     PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD, PID_PITCH_INTEGRATION_LIMIT,
     PID_YAW_KP, PID_YAW_KI, PID_YAW_KD, PID_YAW_INTEGRATION_LIMIT,
@@ -75,11 +75,11 @@ RATE_KD   = torch.tensor([PID_ROLL_RATE_KD, PID_PITCH_RATE_KD, PID_YAW_RATE_KD])
 RATE_ILIM = torch.tensor([PID_ROLL_RATE_INTEGRATION_LIMIT, PID_PITCH_RATE_INTEGRATION_LIMIT, PID_YAW_RATE_INTEGRATION_LIMIT])
 
 # Velocity PID output limits (NN output bounds)
-from crazyflie_firmware.constants import PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX
+from ..crazyflie_firmware.constants import PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX
 YAW_RATE_MAX      = 200.0  # deg/s
 
 # ---- Timing ----
-from crazyflie_firmware.constants import POSITION_RATE, ATTITUDE_RATE, ATTITUDE_UPDATE_DT
+from ..crazyflie_firmware.constants import POSITION_RATE, ATTITUDE_RATE, ATTITUDE_UPDATE_DT
 NN_FREQ       = POSITION_RATE    # Hz (replaces position controller)
 PID_STEPS_PER_NN = ATTITUDE_RATE // NN_FREQ  # 5
 

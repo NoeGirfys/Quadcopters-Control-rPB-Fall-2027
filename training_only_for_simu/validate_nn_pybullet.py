@@ -14,7 +14,7 @@ The pipeline at each control step:
     5. Take sqrt, clip           →  RPMs sent to env.step()
 
 Usage:
-    cd NN_only_for_simu
+    cd training_only_for_simu
     python validate_nn_pybullet.py
     python validate_nn_pybullet.py --gui
     python validate_nn_pybullet.py --weights trained_weights_cf2x_nonlinear_h64_ep2000_lr1e-03.pt

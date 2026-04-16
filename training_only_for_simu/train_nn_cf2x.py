@@ -13,7 +13,7 @@ Reproduces Goffin's section 4.1 sanity check (regulation to origin) but with:
 The NN outputs absolute wrench [F, tau_x, tau_y, tau_z].
 
 Usage:
-    cd NN_only_for_simu
+    cd training_only_for_simu
     python train_nn_cf2x.py                          # nonlinear dynamics (default)
     python train_nn_cf2x.py --linear                 # linearized dynamics (faster)
     python train_nn_cf2x.py --epochs 3000 --lr 5e-4
