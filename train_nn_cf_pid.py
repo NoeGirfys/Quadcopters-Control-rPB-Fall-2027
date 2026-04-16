@@ -46,39 +46,46 @@ T2W = 2.25
 GRAVITY   = M * G
 HOVER_RPM = np.sqrt(GRAVITY / (4 * KF))
 MAX_RPM   = np.sqrt((T2W * GRAVITY) / (4 * KF))
-UINT16_MAX = 65535.0
+from crazyflie_firmware.constants import UINT16_MAX
 
 # CF2.1+ per-motor thrust with battery compensation
 CF2_THRUST_MAX_PER_MOTOR = 0.12  # N
 
 # ---- PID Gains (from cf_firmware_pid_sim.py / platform_defaults_cf2.h) ----
+from crazyflie_firmware.constants import (
+    PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD, PID_ROLL_INTEGRATION_LIMIT,
+    PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD, PID_PITCH_INTEGRATION_LIMIT,
+    PID_YAW_KP, PID_YAW_KI, PID_YAW_KD, PID_YAW_INTEGRATION_LIMIT,
+
+    PID_ROLL_RATE_KP, PID_ROLL_RATE_KI, PID_ROLL_RATE_KD, PID_ROLL_RATE_INTEGRATION_LIMIT,
+    PID_PITCH_RATE_KP, PID_PITCH_RATE_KI, PID_PITCH_RATE_KD, PID_PITCH_RATE_INTEGRATION_LIMIT,
+    PID_YAW_RATE_KP, PID_YAW_RATE_KI, PID_YAW_RATE_KD, PID_YAW_RATE_INTEGRATION_LIMIT,
+)
 
 # Attitude PID
-ATT_KP   = torch.tensor([6.0, 6.0, 6.0])    # roll, pitch, yaw
-ATT_KI   = torch.tensor([3.0, 3.0, 1.0])
-ATT_KD   = torch.tensor([0.0, 0.0, 0.35])
-ATT_ILIM = torch.tensor([20.0, 20.0, 360.0])
+ATT_KP   = torch.tensor([PID_ROLL_KP, PID_PITCH_KP, PID_YAW_KP])    # roll, pitch, yaw
+ATT_KI   = torch.tensor([PID_ROLL_KI, PID_PITCH_KI, PID_YAW_KI])
+ATT_KD   = torch.tensor([PID_ROLL_KD, PID_PITCH_KD, PID_YAW_KD])
+ATT_ILIM = torch.tensor([PID_ROLL_INTEGRATION_LIMIT, PID_PITCH_INTEGRATION_LIMIT, PID_YAW_INTEGRATION_LIMIT])
 
 # Rate PID
-RATE_KP   = torch.tensor([250.0, 250.0, 120.0])
-RATE_KI   = torch.tensor([500.0, 500.0, 16.7])
-RATE_KD   = torch.tensor([2.5, 2.5, 0.0])
-RATE_ILIM = torch.tensor([33.3, 33.3, 166.7])
+RATE_KP   = torch.tensor([PID_ROLL_RATE_KP, PID_PITCH_RATE_KP, PID_YAW_RATE_KP])
+RATE_KI   = torch.tensor([PID_ROLL_RATE_KI, PID_PITCH_RATE_KI, PID_YAW_RATE_KI])
+RATE_KD   = torch.tensor([PID_ROLL_RATE_KD, PID_PITCH_RATE_KD, PID_YAW_RATE_KD])
+RATE_ILIM = torch.tensor([PID_ROLL_RATE_INTEGRATION_LIMIT, PID_PITCH_RATE_INTEGRATION_LIMIT, PID_YAW_RATE_INTEGRATION_LIMIT])
 
 # Velocity PID output limits (NN output bounds)
-PID_VEL_ROLL_MAX  = 20.0   # deg
-PID_VEL_PITCH_MAX = 20.0   # deg
+from crazyflie_firmware.constants import PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX
 YAW_RATE_MAX      = 200.0  # deg/s
 
 # ---- Timing ----
-NN_FREQ       = 100    # Hz (replaces position controller)
-ATTITUDE_RATE = 500    # Hz
-ATT_DT        = 1.0 / ATTITUDE_RATE   # 0.002 s
+from crazyflie_firmware.constants import POSITION_RATE, ATTITUDE_RATE, ATTITUDE_UPDATE_DT
+NN_FREQ       = POSITION_RATE    # Hz (replaces position controller)
 PID_STEPS_PER_NN = ATTITUDE_RATE // NN_FREQ  # 5
 
 # ---- Constantes du filtre moteur ----
 MOTOR_TAU = 0.02  # 20ms de délai mécanique/électrique
-MOTOR_ALPHA = ATT_DT / (MOTOR_TAU + ATT_DT)
+MOTOR_ALPHA = ATTITUDE_UPDATE_DT / (MOTOR_TAU + ATTITUDE_UPDATE_DT)
 
 # ---- State scaling (same as train_nn_cf2x.py) ----
 X_SCALE = np.array([
@@ -268,7 +275,7 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
     ], dim=-1)  # (B, 3)
 
     # --- Yaw setpoint accumulation ---
-    new_yaw_sp = yaw_sp + yaw_rate_deg * ATT_DT
+    new_yaw_sp = yaw_sp + yaw_rate_deg * ATTITUDE_UPDATE_DT
     new_yaw_sp = new_yaw_sp - 360.0 * torch.round(new_yaw_sp / 360.0)
 
     # --- Attitude PID (vectorised over 3 axes) ---
@@ -276,13 +283,13 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
 
     rate_desired, new_att_integ, new_att_prev = pid_update_vec(
         desired_att, actual_att, att_prev, att_integ,
-        g['att_kp'], g['att_ki'], g['att_kd'], ATT_DT, g['att_il'],
+        g['att_kp'], g['att_ki'], g['att_kd'], ATTITUDE_UPDATE_DT, g['att_il'],
         yaw_mask=g['yaw_mask'])
 
     # --- Rate PID (vectorised over 3 axes) ---
     motor_cmds, new_rate_integ, new_rate_prev = pid_update_vec(
         rate_desired, actual_gyro, rate_prev, rate_integ,
-        g['rate_kp'], g['rate_ki'], g['rate_kd'], ATT_DT, g['rate_il'])
+        g['rate_kp'], g['rate_ki'], g['rate_kd'], ATTITUDE_UPDATE_DT, g['rate_il'])
     motor_cmds = torch.clamp(motor_cmds, -32767, 32767)
 
     roll_cmd  = motor_cmds[:, 0]
@@ -309,7 +316,7 @@ def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
     rpm_cmd = pwm_to_rpm_torch(motor_pwms)
     new_motor_rpm = MOTOR_ALPHA * rpm_cmd + (1.0 - MOTOR_ALPHA) * motor_rpm
     
-    new_state = dynamics_substep(state_12, new_motor_rpm, ATT_DT)
+    new_state = dynamics_substep(state_12, new_motor_rpm, ATTITUDE_UPDATE_DT)
     
     new_pid_state = (new_att_integ, new_att_prev, new_rate_integ,
                      new_rate_prev, new_yaw_sp, new_motor_rpm)
