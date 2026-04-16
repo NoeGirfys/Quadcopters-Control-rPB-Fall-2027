@@ -24,17 +24,27 @@ Pipeline (NN phase, sim mode, per 500 Hz step):
   → Power Distribution → PWM → RPM → Motor filter → PyBullet
 
 Usage:
-  python fly_nn_cf_pid.py --weights trained_cf_pid_T20_ch50_h128_ep500.pt
+  cd training_regulation_simu_and_real
+  python fly_nn_cf_pid.py --weights trained_cf_pid_T20_ch50_h64_ep100.pt
   python fly_nn_cf_pid.py --weights ... --mode attitude --uri radio://...
 """
 
 import argparse
 import math
-import sys
 import time
 
 import numpy as np
 import torch
+
+
+import sys
+import os
+
+# Ajout du dossier parent (Semester_Project) au sys.path
+PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.append(PARENT_DIR)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # gym-pybullet-drones imports (only for sim mode)
@@ -61,18 +71,21 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
-from circle_comparison_simu_and_real.cf_firmware_pid_sim import (
+from crazyflie_firmware.firmware import (
     CrazyfliePositionController,
     CrazyflieAttitudeController,
     CrazyfliePowerDistribution,
+    cap_angle,
+)
+from circle_comparison_simu_and_real.cf_firmware_pid_sim import (
     MotorDynamicsFilter,
     obs_to_firmware_state,
-    pwm_to_rpm,
-    cap_angle,
-    ATTITUDE_RATE,
-    ATTITUDE_UPDATE_DT,
+    pwm_to_rpm
 )
-
+from crazyflie_firmware.constants import (
+    ATTITUDE_RATE,
+    ATTITUDE_UPDATE_DT
+)
 from train_nn_cf_pid import (
     ConcurrentPolicyMLP,
     NN_FREQ,
@@ -750,6 +763,8 @@ MODES:
                         help='PyBullet GUI (default: True)')
     parser.add_argument('--uri', default='radio://0/80/2M/E7E7E7E7E7',
                         help='Crazyflie radio URI (for real mode)')
+    parser.add_argument('--no-plot', dest='plot', action='store_false',
+                        help='Disable post-flight plots')
     args = parser.parse_args()
 
     target_pos = (0.0, 0.0, args.target_z)
@@ -758,7 +773,7 @@ MODES:
     if args.mode == 'sim':
         run_sim_nn(args.weights, target_pos=target_pos,
                    duration_sec=args.duration, takeoff_sec=args.takeoff,
-                   gui=args.gui, plot=True, device=device)
+                   gui=args.gui, plot=args.plot, device=device)
     elif args.mode == 'attitude':
         run_real_nn(args.weights, target_pos=target_pos,
                     uri=args.uri,
