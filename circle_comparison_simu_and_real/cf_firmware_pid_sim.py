@@ -60,95 +60,46 @@ except ImportError:
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ===================================================================
-#  CONSTANTS — from the firmware
-# ===================================================================
-
-# --- Rates ----------------------------------------------------------
-# [FW] src/modules/interface/stabilizer_types.h:364-372
-RATE_MAIN_LOOP = 1000   # Hz
-ATTITUDE_RATE  = 500    # Hz
-POSITION_RATE  = 100    # Hz
-ATTITUDE_UPDATE_DT = 1.0 / ATTITUDE_RATE   # 0.002 s
-POSITION_UPDATE_DT = 1.0 / POSITION_RATE   # 0.01  s
-
-# --- Physical constants  -------------------------------------------
-# [FW] src/platform/interface/platform_defaults_cf2.h:47,56
-ARM_LENGTH = 0.046       # m
-CF_MASS    = 0.027       # kg  (CF2X URDF uses 0.027)
-UINT16_MAX = 65535
-
-# ===================================================================
-#  PID GAINS — platform_defaults_cf2.h:96-176
-# ===================================================================
-
-# ---- Rate PID gains  (attitude_pid_controller.c) ------------------
-# [FW] platform_defaults_cf2.h:96-112
-PID_ROLL_RATE_KP  = 250.0;  PID_ROLL_RATE_KI  = 500.0;  PID_ROLL_RATE_KD  = 2.5
-PID_ROLL_RATE_KFF = 0.0;    PID_ROLL_RATE_INTEGRATION_LIMIT  = 33.3
-
-PID_PITCH_RATE_KP = 250.0;  PID_PITCH_RATE_KI = 500.0;  PID_PITCH_RATE_KD = 2.5
-PID_PITCH_RATE_KFF= 0.0;    PID_PITCH_RATE_INTEGRATION_LIMIT = 33.3
-
-PID_YAW_RATE_KP   = 120.0;  PID_YAW_RATE_KI   = 16.7;   PID_YAW_RATE_KD   = 0.0
-PID_YAW_RATE_KFF  = 0.0;    PID_YAW_RATE_INTEGRATION_LIMIT   = 166.7
-
-# ---- Attitude PID gains  -----------------------------------------
-# [FW] platform_defaults_cf2.h:114-130
-PID_ROLL_KP  = 6.0;  PID_ROLL_KI  = 3.0;  PID_ROLL_KD  = 0.0
-PID_ROLL_KFF = 0.0;  PID_ROLL_INTEGRATION_LIMIT  = 20.0
-
-PID_PITCH_KP = 6.0;  PID_PITCH_KI = 3.0;  PID_PITCH_KD = 0.0
-PID_PITCH_KFF= 0.0;  PID_PITCH_INTEGRATION_LIMIT = 20.0
-
-PID_YAW_KP   = 6.0;  PID_YAW_KI   = 1.0;  PID_YAW_KD   = 0.35
-PID_YAW_KFF  = 0.0;  PID_YAW_INTEGRATION_LIMIT   = 360.0
-
-# ---- Velocity PID gains  -----------------------------------------
-# [FW] platform_defaults_cf2.h:132-145
-PID_VEL_X_KP = 5.0;  PID_VEL_X_KI = 1.0;  PID_VEL_X_KD = 0.0;  PID_VEL_X_KFF = 0.0
-PID_VEL_Y_KP = 5.0;  PID_VEL_Y_KI = 1.0;  PID_VEL_Y_KD = 0.0;  PID_VEL_Y_KFF = 0.0
-PID_VEL_Z_KP = 25.0;  PID_VEL_Z_KI = 15.0; PID_VEL_Z_KD = 0.0;  PID_VEL_Z_KFF = 0.0
-
-# ---- Position PID gains  -----------------------------------------
-# [FW] platform_defaults_cf2.h:158-176
-PID_POS_X_KP = 1.0;  PID_POS_X_KI = 0.0;  PID_POS_X_KD = 0.0;  PID_POS_X_KFF = 0.0
-PID_POS_Y_KP = 1.0;  PID_POS_Y_KI = 0.0;  PID_POS_Y_KD = 0.0;  PID_POS_Y_KFF = 0.0
-PID_POS_Z_KP = 2.0;  PID_POS_Z_KI = 0.5;  PID_POS_Z_KD = 0.0;  PID_POS_Z_KFF = 0.0
-
-# ---- Velocity / position limits  ---------------------------------
-# [FW] platform_defaults_cf2.h:152-175
-PID_VEL_ROLL_MAX  = 20.0   # deg
-PID_VEL_PITCH_MAX = 20.0   # deg
-PID_VEL_THRUST_BASE = 36000.0
-PID_VEL_THRUST_MIN  = 20000.0
-THRUST_SCALE = 1000.0
-
-PID_POS_VEL_X_MAX = 1.0    # m/s
-PID_POS_VEL_Y_MAX = 1.0
-PID_POS_VEL_Z_MAX = 1.0
-
-VEL_MAX_OVERHEAD = 1.10
-RP_LIMIT_OVERHEAD = 1.10
-
-# ---- Filter defaults  ---------------------------------------------
-# [FW] platform_defaults.h:97-147
-ATTITUDE_LPF_ENABLE   = False
-ATTITUDE_LPF_CUTOFF   = 15.0    # Hz
-ATTITUDE_RATE_LPF_ENABLE = False
-ATTITUDE_ROLL_RATE_LPF_CUTOFF  = 30.0   # Hz
-ATTITUDE_PITCH_RATE_LPF_CUTOFF = 30.0
-ATTITUDE_YAW_RATE_LPF_CUTOFF   = 30.0
-
-POS_XY_FILT_ENABLE  = True;   POS_XY_FILT_CUTOFF  = 20.0
-POS_Z_FILT_ENABLE   = True;   POS_Z_FILT_CUTOFF   = 20.0
-VEL_XY_FILT_ENABLE  = True;   VEL_XY_FILT_CUTOFF  = 20.0
-VEL_Z_FILT_ENABLE   = True;   VEL_Z_FILT_CUTOFF   = 20.0
-
-# ---- PID generic defaults  ----------------------------------------
-# [FW] src/utils/interface/pid.h:33-34
-DEFAULT_PID_INTEGRATION_LIMIT = 5000.0
-DEFAULT_PID_OUTPUT_LIMIT      = 0.0      # 0 = no limit
+# ---------------------------------------------------------------------------
+# Firmware constants (gains, rates, filters) — from crazyflie_firmware
+# ---------------------------------------------------------------------------
+sys.path.insert(0, os.path.join(SCRIPT_DIR, ".."))
+from crazyflie_firmware.constants import (  # noqa: E402
+    RATE_MAIN_LOOP, ATTITUDE_RATE, POSITION_RATE,
+    ATTITUDE_UPDATE_DT, POSITION_UPDATE_DT,
+    ARM_LENGTH, CF_MASS, UINT16_MAX,
+    PID_ROLL_RATE_KP, PID_ROLL_RATE_KI, PID_ROLL_RATE_KD,
+    PID_ROLL_RATE_KFF, PID_ROLL_RATE_INTEGRATION_LIMIT,
+    PID_PITCH_RATE_KP, PID_PITCH_RATE_KI, PID_PITCH_RATE_KD,
+    PID_PITCH_RATE_KFF, PID_PITCH_RATE_INTEGRATION_LIMIT,
+    PID_YAW_RATE_KP, PID_YAW_RATE_KI, PID_YAW_RATE_KD,
+    PID_YAW_RATE_KFF, PID_YAW_RATE_INTEGRATION_LIMIT,
+    PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD,
+    PID_ROLL_KFF, PID_ROLL_INTEGRATION_LIMIT,
+    PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD,
+    PID_PITCH_KFF, PID_PITCH_INTEGRATION_LIMIT,
+    PID_YAW_KP, PID_YAW_KI, PID_YAW_KD,
+    PID_YAW_KFF, PID_YAW_INTEGRATION_LIMIT,
+    PID_VEL_X_KP, PID_VEL_X_KI, PID_VEL_X_KD, PID_VEL_X_KFF,
+    PID_VEL_Y_KP, PID_VEL_Y_KI, PID_VEL_Y_KD, PID_VEL_Y_KFF,
+    PID_VEL_Z_KP, PID_VEL_Z_KI, PID_VEL_Z_KD, PID_VEL_Z_KFF,
+    PID_POS_X_KP, PID_POS_X_KI, PID_POS_X_KD, PID_POS_X_KFF,
+    PID_POS_Y_KP, PID_POS_Y_KI, PID_POS_Y_KD, PID_POS_Y_KFF,
+    PID_POS_Z_KP, PID_POS_Z_KI, PID_POS_Z_KD, PID_POS_Z_KFF,
+    PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX,
+    PID_VEL_THRUST_BASE, PID_VEL_THRUST_MIN, THRUST_SCALE,
+    PID_POS_VEL_X_MAX, PID_POS_VEL_Y_MAX, PID_POS_VEL_Z_MAX,
+    VEL_MAX_OVERHEAD, RP_LIMIT_OVERHEAD,
+    ATTITUDE_LPF_ENABLE, ATTITUDE_LPF_CUTOFF,
+    ATTITUDE_RATE_LPF_ENABLE,
+    ATTITUDE_ROLL_RATE_LPF_CUTOFF, ATTITUDE_PITCH_RATE_LPF_CUTOFF,
+    ATTITUDE_YAW_RATE_LPF_CUTOFF,
+    POS_XY_FILT_ENABLE, POS_XY_FILT_CUTOFF,
+    POS_Z_FILT_ENABLE, POS_Z_FILT_CUTOFF,
+    VEL_XY_FILT_ENABLE, VEL_XY_FILT_CUTOFF,
+    VEL_Z_FILT_ENABLE, VEL_Z_FILT_CUTOFF,
+    DEFAULT_PID_INTEGRATION_LIMIT, DEFAULT_PID_OUTPUT_LIMIT,
+)
 
 
 # ===================================================================
