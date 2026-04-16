@@ -57,6 +57,13 @@ try:
 except ImportError:
     HAS_PYBULLET_DRONES = False
 
+    def sync(i: int, start: float, dt: float) -> None:
+        """Fallback sync when pybullet-drones is unavailable."""
+        target = start + (i + 1) * dt
+        remaining = target - time.time()
+        if remaining > 0:
+            time.sleep(remaining)
+
 # ---------------------------------------------------------------------------
 # cflib imports (only for real drone mode)
 # ---------------------------------------------------------------------------
@@ -206,12 +213,14 @@ def query_nn_chunk(policy: ConcurrentPolicyMLP, state_12: np.ndarray,
 
 def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                duration_sec: float = 15, takeoff_max_duration: float = 3.0,
+               hover_duration: float = 0.0,
                gui: bool = True, plot: bool = True,
                device: str = "cpu"):
     """Run NN controller in PyBullet simulation.
 
-    Phase 1 (0 .. takeoff_max_duration):        Position+Velocity PID climbs to takeoff_pos
-    Phase 2 (takeoff_max_duration .. duration): NN regulates to target_pos
+    Phase 0 (PID):   Position+Velocity PID climbs to takeoff_pos
+    Phase 1 (HOVER): PID holds takeoff_pos for hover_duration seconds
+    Phase 2 (NN):    NN regulates to target_pos
 
     The attitude + rate PIDs run continuously at 500 Hz throughout,
     ensuring a smooth handover between phases.
@@ -254,12 +263,19 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     pid_target = np.array(takeoff_pos, dtype=np.float64)
     n_steps = int(CTRL_FREQ * duration_sec)
 
-    PHASE_SWITCH_RADIUS = 0.05   # m — switch to NN when within 5 cm of pid_target
+    PHASE_SWITCH_RADIUS = 0.05   # m — switch to HOVER when within 5 cm of pid_target
     PHASE_SWITCH_MAX_SEC = takeoff_max_duration  # hard cap: switch anyway after takeoff_max_duration
+
+    PHASE_PID = 0
+    PHASE_HOVER = 1
+    PHASE_NN = 2
+    current_phase = PHASE_PID
+    hover_start_step: int = 0
 
     print(f"[SIM] PYB={PYB_FREQ}Hz  CTRL={CTRL_FREQ}Hz  NN={NN_FREQ}Hz")
     print(f"[SIM] PID target={pid_target}  NN target={nn_target}  "
-          f"Duration={duration_sec}s  Switch radius={PHASE_SWITCH_RADIUS}m")
+          f"Duration={duration_sec}s  Switch radius={PHASE_SWITCH_RADIUS}m  "
+          f"Hover={hover_duration}s")
 
     # ---- Logging ----------------------------------------------------
     log_t = np.zeros(n_steps)
@@ -283,7 +299,6 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     pitch_des = 0.0
     yaw_rate_cmd = 0.0
     yaw_setpoint = 0.0
-    in_pid_phase = True   # starts in PID phase; flips when close to pid_target
 
     for i in range(n_steps):
         obs, _, _, _, _ = env.step(action)
@@ -292,25 +307,39 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         pos, vel, rpy_deg, gyro_deg = obs_to_firmware_state(obs[0])
 
         # ---- Phase transition check ---------------------------------
-        if in_pid_phase:
+        if current_phase == PHASE_PID:
             dist_to_pid_target = np.linalg.norm(pos - pid_target)
             hard_cap_reached = (i >= int(CTRL_FREQ * PHASE_SWITCH_MAX_SEC))
             if dist_to_pid_target <= PHASE_SWITCH_RADIUS or hard_cap_reached:
-                in_pid_phase = False
                 reason = "proximity" if dist_to_pid_target <= PHASE_SWITCH_RADIUS else "timeout"
-                print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s ({reason})  "
-                      f"dist={dist_to_pid_target:.3f}m  "
+                if hover_duration > 0.0:
+                    current_phase = PHASE_HOVER
+                    hover_start_step = i
+                    print(f"[SIM] HOVER start at t={i / CTRL_FREQ:.1f}s ({reason})  "
+                          f"dist={dist_to_pid_target:.3f}m  "
+                          f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]  "
+                          f"hover={hover_duration}s")
+                else:
+                    current_phase = PHASE_NN
+                    print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s ({reason})  "
+                          f"dist={dist_to_pid_target:.3f}m  "
+                          f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]")
+        elif current_phase == PHASE_HOVER:
+            hover_elapsed = (i - hover_start_step) / CTRL_FREQ
+            if hover_elapsed >= hover_duration:
+                current_phase = PHASE_NN
+                print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s (hover done)  "
                       f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]")
 
         # ---- High-level controller (100 Hz) -------------------------
         if i % nn_divider == 0:
-            if in_pid_phase:
-                # Phase 1: Position + Velocity PID → pid_target
+            if current_phase == PHASE_PID or current_phase == PHASE_HOVER:
+                # Phase PID/HOVER: Position + Velocity PID → pid_target
                 thrust_cmd, roll_des, pitch_des = pos_ctrl.update(
                     pid_target, tuple(pos), tuple(vel), rpy_deg[2])
                 yaw_rate_cmd = 0.0
             else:
-                # Phase 2: NN controller — query at 100 Hz, use first action
+                # Phase NN: NN controller — query at 100 Hz, use first action
                 nn_state = obs_to_nn_state(obs[0])
                 t_start = time.perf_counter()
                 a = query_nn_chunk(policy, nn_state, nn_target, device)[0]
@@ -359,14 +388,14 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         log_rpms[i] = rpms
         log_thrust[i] = thrust_cmd
         log_nn_cmd[i] = [thrust_cmd, roll_des, pitch_des, yaw_rate_cmd]
-        log_phase[i] = 0 if in_pid_phase else 1
+        log_phase[i] = current_phase
 
         if i % CTRL_FREQ == 0:
             t = i / CTRL_FREQ
-            phase = "PID" if in_pid_phase else "NN "
-            current_target = pid_target if in_pid_phase else nn_target
+            phase_label = {PHASE_PID: "PID  ", PHASE_HOVER: "HOVER", PHASE_NN: "NN   "}[current_phase]
+            current_target = pid_target if current_phase != PHASE_NN else nn_target
             err = np.linalg.norm(pos - current_target)
-            print(f"  t={t:5.1f}s [{phase}]  "
+            print(f"  t={t:5.1f}s [{phase_label}]  "
                   f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]  "
                   f"err={err:.4f}m  thrust={thrust_cmd:.0f}")
 
@@ -388,9 +417,10 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
     data = dict(t=log_t, pos=log_pos, vel=log_vel, rpy=log_rpy,
                 rpms=log_rpms, thrust=log_thrust, nn_cmd=log_nn_cmd,
-                phase=log_phase, pid_target=pid_target, nn_target=nn_target)
+                phase=log_phase, pid_target=pid_target, nn_target=nn_target,
+                PHASE_PID=PHASE_PID, PHASE_HOVER=PHASE_HOVER, PHASE_NN=PHASE_NN)
     if plot:
-        _plot_nn_sim(data, takeoff_max_duration)
+        _plot_nn_sim(data)
     return data
 
 
@@ -398,7 +428,7 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 #  SIM plotting
 # ===================================================================
 
-def _plot_nn_sim(data: dict, takeoff_max_duration: float):
+def _plot_nn_sim(data: dict):
     """Plot NN simulation results."""
     try:
         import matplotlib
@@ -418,19 +448,25 @@ def _plot_nn_sim(data: dict, takeoff_max_duration: float):
     pid_target = data['pid_target']
     nn_target = data['nn_target']
     phase = data['phase']
+    PHASE_HOVER = data['PHASE_HOVER']
+    PHASE_NN = data['PHASE_NN']
 
-    # Actual switch time from phase log (first step where phase == 1)
-    nn_start_idx = np.argmax(phase == 1) if np.any(phase == 1) else len(t) - 1
-    switch_sec = t[nn_start_idx]
+    # Actual transition times from phase log
+    hover_start_idx = np.argmax(phase == PHASE_HOVER) if np.any(phase == PHASE_HOVER) else None
+    nn_start_idx = np.argmax(phase == PHASE_NN) if np.any(phase == PHASE_NN) else len(t) - 1
+    nn_switch_sec = t[nn_start_idx]
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
     fig.suptitle('NN Controller + CF Firmware Attitude/Rate PID', fontsize=14)
 
-    # Phase boundary line on all subplots
+    # Phase boundary lines on all subplots
     for row in axes:
         for ax in row:
-            ax.axvline(switch_sec, color='red', ls=':', alpha=0.5,
-                       label='PID\u2192NN')
+            if hover_start_idx is not None:
+                ax.axvline(t[hover_start_idx], color='orange', ls=':', alpha=0.5,
+                           label='PID\u2192HOVER')
+            ax.axvline(nn_switch_sec, color='red', ls=':', alpha=0.5,
+                       label='HOVER\u2192NN' if hover_start_idx is not None else 'PID\u2192NN')
 
     # -- Position --
     ax = axes[0, 0]
@@ -468,7 +504,7 @@ def _plot_nn_sim(data: dict, takeoff_max_duration: float):
 
     # -- NN commands --
     ax = axes[1, 1]
-    nn_mask = phase == 1
+    nn_mask = phase == PHASE_NN
     t_nn = t[nn_mask]
     ax.plot(t_nn, nn_cmd[nn_mask, 1], label='NN roll [deg]', alpha=0.8)
     ax.plot(t_nn, nn_cmd[nn_mask, 2], label='NN pitch [deg]', alpha=0.8)
@@ -511,11 +547,13 @@ def _plot_nn_sim(data: dict, takeoff_max_duration: float):
 def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 uri: str = "radio://0/80/2M/E7E7E7E7E7",
                 duration_sec: float = 15, takeoff_max_duration: float = 3.0,
+                hover_duration: float = 0.0,
                 device: str = "cpu"):
     """Run NN controller on a real Crazyflie via Crazyradio.
 
-    Phase 1 (takeoff): send_position_setpoint climbs to takeoff_pos
-    Phase 2 (NN):      NN outputs attitude + thrust regulating to target_pos
+    Phase 0 (PID):   send_position_setpoint climbs to takeoff_pos
+    Phase 1 (HOVER): holds takeoff_pos for hover_duration seconds
+    Phase 2 (NN):    NN outputs attitude + thrust regulating to target_pos
 
     The drone's onboard attitude + rate PIDs handle low-level stabilisation.
     """
@@ -528,7 +566,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     pid_target = np.array(takeoff_pos, dtype=np.float64)
 
     cflib.crtp.init_drivers()
-    print(f"[REAL] Mode: attitude  PID target: {pid_target}  NN target: {nn_target}")
+    print(f"[REAL] Mode: attitude  PID target: {pid_target}  NN target: {nn_target}  Hover: {hover_duration}s")
     print(f"[REAL] Connecting to {uri}...")
 
     with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
@@ -567,6 +605,8 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
         real_log = []
         flight_start = None
+        elapsed_phase0 = 0.0
+        elapsed_phases01 = 0.0
 
         def _state_cb(timestamp, data, logconf):
             drone_state['x'] = data['stateEstimate.x']
@@ -611,15 +651,15 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             time.sleep(0.02)
         print("[REAL] Commander unlocked.")
 
-        # ---- Phase 1: PID takeoff via position setpoints -----
+        # ---- Phase 0: PID takeoff via position setpoints -----
         TAKEOFF_FREQ = 20        # Hz — position setpoints don't need high rate
-        PHASE_SWITCH_RADIUS = 0.05  # m — switch to NN when within 5 cm of pid_target
+        PHASE_SWITCH_RADIUS = 0.05  # m — switch to HOVER/NN when within 5 cm
 
         START = time.time()
         flight_start = START
 
         try:
-            print(f"[REAL] Phase 1: PID takeoff to {pid_target} "
+            print(f"[REAL] Phase 0: PID takeoff to {pid_target} "
                   f"(max {takeoff_max_duration}s, switch radius={PHASE_SWITCH_RADIUS}m)...")
             takeoff_steps_max = int(TAKEOFF_FREQ * takeoff_max_duration)
             i = 0
@@ -643,7 +683,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
                 if dist <= PHASE_SWITCH_RADIUS or hard_cap_reached:
                     reason = "proximity" if dist <= PHASE_SWITCH_RADIUS else "timeout"
-                    print(f"[REAL] NN takeover at t={elapsed:.1f}s ({reason})  "
+                    print(f"[REAL] PID done at t={elapsed:.1f}s ({reason})  "
                           f"dist={dist:.3f}m  "
                           f"pos=[{pos_now[0]:+.3f},{pos_now[1]:+.3f},{pos_now[2]:.3f}]")
                     break
@@ -651,9 +691,27 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 i += 1
                 sync(i, START, 1.0 / TAKEOFF_FREQ)
 
+            elapsed_phase0 = time.time() - START
+
+            # ---- Phase 1: HOVER (hold position) -----
+            if hover_duration > 0.0:
+                print(f"[REAL] Phase 1: HOVER at {pid_target} for {hover_duration}s...")
+                hover_steps = int(TAKEOFF_FREQ * hover_duration)
+                hover_start = time.time()
+                for j in range(hover_steps):
+                    cf.commander.send_position_setpoint(
+                        pid_target[0], pid_target[1], pid_target[2], 0.0)
+                    if j % TAKEOFF_FREQ == 0:
+                        pos_now = np.array([drone_state['x'], drone_state['y'],
+                                            drone_state['z']])
+                        print(f"  hover t={j / TAKEOFF_FREQ:.1f}s  "
+                              f"pos=[{pos_now[0]:+.3f},{pos_now[1]:+.3f},{pos_now[2]:.3f}]")
+                    sync(j, hover_start, 1.0 / TAKEOFF_FREQ)
+                print("[REAL] Hover done.")
+
             # ---- Phase 2: NN control -----
-            elapsed_phase1 = time.time() - START
-            nn_duration = max(0.0, duration_sec - elapsed_phase1)
+            elapsed_phases01 = time.time() - START
+            nn_duration = max(0.0, duration_sec - elapsed_phases01)
             nn_steps = int(NN_FREQ * nn_duration)
             print(f"[REAL] Phase 2: NN control to {nn_target} for "
                   f"{nn_duration:.0f}s...")
@@ -670,7 +728,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                     roll_deg, pitch_deg, yaw_rate, int(thrust))
 
                 if i % NN_FREQ == 0:
-                    t = elapsed_phase1 + i / NN_FREQ
+                    t = elapsed_phases01 + i / NN_FREQ
                     err = math.sqrt(
                         (drone_state['x'] - nn_target[0]) ** 2
                         + (drone_state['y'] - nn_target[1]) ** 2
@@ -713,14 +771,16 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
         # ---- Post-flight plot -----
         if real_log:
-            _plot_real_nn(real_log, pid_target, nn_target, takeoff_max_duration)
+            _plot_real_nn(real_log, pid_target, nn_target,
+                          elapsed_phase0, elapsed_phases01)
 
 
 # ===================================================================
 #  REAL plotting
 # ===================================================================
 
-def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray, takeoff_max_duration: float):
+def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
+                  elapsed_phase0: float, elapsed_phases01: float):
     """Plot real drone NN control results."""
     try:
         import matplotlib
@@ -739,8 +799,11 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     fig.suptitle('NN Controller — Real Drone', fontsize=14)
 
     for ax in axes.flat:
-        ax.axvline(takeoff_max_duration, color='red', ls=':', alpha=0.5,
-                   label='PID\u2192NN')
+        if elapsed_phases01 > elapsed_phase0:
+            ax.axvline(elapsed_phase0, color='orange', ls=':', alpha=0.5,
+                       label='PID\u2192HOVER')
+        ax.axvline(elapsed_phases01, color='red', ls=':', alpha=0.5,
+                   label='HOVER\u2192NN' if elapsed_phases01 > elapsed_phase0 else 'PID\u2192NN')
 
     ax = axes[0, 0]
     ax.plot(t, pos[:, 0], label='x')
@@ -822,6 +885,8 @@ MODES:
                         help='PyBullet GUI (default: True)')
     parser.add_argument('--uri', default='radio://0/80/2M/E7E7E7E7E7',
                         help='Crazyflie radio URI (for real mode)')
+    parser.add_argument('--hover-duration', default=2.0, type=float,
+                        help='Hover duration between PID and NN phases [s] (default: 2.0)')
     parser.add_argument('--no-plot', dest='plot', action='store_false',
                         help='Disable post-flight plots')
     args = parser.parse_args()
@@ -834,11 +899,13 @@ MODES:
     if args.mode == 'sim':
         run_sim_nn(args.weights, takeoff_pos=takeoff_pos, target_pos=target_pos,
                    duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
+                   hover_duration=args.hover_duration,
                    gui=args.gui, plot=args.plot, device=device)
     elif args.mode == 'attitude':
         run_real_nn(args.weights, takeoff_pos=takeoff_pos, target_pos=target_pos,
                     uri=args.uri,
                     duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
+                    hover_duration=args.hover_duration,
                     device=device)
 
 
