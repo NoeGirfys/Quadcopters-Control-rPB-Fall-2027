@@ -22,8 +22,11 @@ All PID gains and constants come from:
   platform_defaults_cf2.h   (Crazyflie 2.1+ default gains)
   platform_defaults.h       (filter / rate defaults)
 
-Author : Claude / Anthropic  (based on Bitcraze firmware, GPLv3)
 Date   : 2026-03
+
+Usage :
+    cd circle_comparison_simu_and_real
+    python cf_firmware_pid_sim.py [--mode MODE]
 """
 
 import os
@@ -55,6 +58,7 @@ try:
 except ImportError:
     HAS_CFLIB = False
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ===================================================================
 #  CONSTANTS — from the firmware
@@ -1272,7 +1276,7 @@ def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('sim_results.png', dpi=150)
+    plt.savefig(os.path.join(SCRIPT_DIR, 'sim_results.png'), dpi=150)
     print("[PLOT] Saved to sim_results.png")
     plt.show()
 
@@ -1333,7 +1337,7 @@ def _plot_comparison(real, sim):
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('comparison_results.png', dpi=150)
+    plt.savefig(os.path.join(SCRIPT_DIR, 'comparison_results.png'), dpi=150)
     print("[PLOT] Saved to comparison_results.png")
     plt.show()
 
@@ -1423,7 +1427,8 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
     print(f"[REAL] Mode: {mode}")
     print(f"[REAL] Connecting to {uri} ...")
 
-    with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
+    cache_dir = os.path.join(SCRIPT_DIR, 'cache')
+    with SyncCrazyflie(uri, cf=Crazyflie(rw_cache=cache_dir)) as scf:
         cf = scf.cf
         print("[REAL] Connected!")
 

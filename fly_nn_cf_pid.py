@@ -61,7 +61,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
-from cf_firmware_pid_sim import (
+from circle_comparison_simu_and_real.cf_firmware_pid_sim import (
     CrazyfliePositionController,
     CrazyflieAttitudeController,
     CrazyfliePowerDistribution,
