@@ -54,14 +54,14 @@ PID_YAW_KFF  = 0.0;  PID_YAW_INTEGRATION_LIMIT   = 360.0
 
 # ---- Velocity PID gains  -----------------------------------------
 # [FW] platform_defaults_cf2.h:132-145
-PID_VEL_X_KP = 5.0;  PID_VEL_X_KI = 1.0;  PID_VEL_X_KD = 0.0;  PID_VEL_X_KFF = 0.0
-PID_VEL_Y_KP = 5.0;  PID_VEL_Y_KI = 1.0;  PID_VEL_Y_KD = 0.0;  PID_VEL_Y_KFF = 0.0
+PID_VEL_X_KP = 25.0;  PID_VEL_X_KI = 1.0;  PID_VEL_X_KD = 0.0;  PID_VEL_X_KFF = 0.0
+PID_VEL_Y_KP = 25.0;  PID_VEL_Y_KI = 1.0;  PID_VEL_Y_KD = 0.0;  PID_VEL_Y_KFF = 0.0
 PID_VEL_Z_KP = 25.0;  PID_VEL_Z_KI = 15.0; PID_VEL_Z_KD = 0.0;  PID_VEL_Z_KFF = 0.0
 
 # ---- Position PID gains  -----------------------------------------
 # [FW] platform_defaults_cf2.h:158-176
-PID_POS_X_KP = 1.0;  PID_POS_X_KI = 0.0;  PID_POS_X_KD = 0.0;  PID_POS_X_KFF = 0.0
-PID_POS_Y_KP = 1.0;  PID_POS_Y_KI = 0.0;  PID_POS_Y_KD = 0.0;  PID_POS_Y_KFF = 0.0
+PID_POS_X_KP = 2.0;  PID_POS_X_KI = 0.0;  PID_POS_X_KD = 0.0;  PID_POS_X_KFF = 0.0
+PID_POS_Y_KP = 2.0;  PID_POS_Y_KI = 0.0;  PID_POS_Y_KD = 0.0;  PID_POS_Y_KFF = 0.0
 PID_POS_Z_KP = 2.0;  PID_POS_Z_KI = 0.5;  PID_POS_Z_KD = 0.0;  PID_POS_Z_KFF = 0.0
 
 # ---- Velocity / position limits  ---------------------------------
