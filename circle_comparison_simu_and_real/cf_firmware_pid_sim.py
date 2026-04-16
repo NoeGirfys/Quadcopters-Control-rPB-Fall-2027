@@ -581,6 +581,7 @@ def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
     # -- Thrust --
     ax = axes[2, 0]
     ax.plot(t, thrust, label='thrust', color='black')
+    from crazyflie_firmware.constants import PID_VEL_THRUST_BASE
     ax.axhline(PID_VEL_THRUST_BASE, ls=':', color='gray',
                label=f'THRUST_BASE={PID_VEL_THRUST_BASE:.0f}')
     ax.set_ylabel('Thrust [uint16]')
@@ -685,6 +686,24 @@ def push_pid_gains_to_drone(cf):
       pid_attitude — attitude PID (roll/pitch/yaw)
       pid_rate    — angular rate PID (roll/pitch/yaw)
     """
+    from crazyflie_firmware.constants import (
+        PID_POS_X_KP, PID_POS_X_KI, PID_POS_X_KD,
+        PID_POS_Y_KP, PID_POS_Y_KI, PID_POS_Y_KD,
+        PID_POS_Z_KP, PID_POS_Z_KI, PID_POS_Z_KD,
+
+        PID_VEL_X_KP, PID_VEL_X_KI, PID_VEL_X_KD,
+        PID_VEL_Y_KP, PID_VEL_Y_KI, PID_VEL_Y_KD,
+        PID_VEL_Z_KP, PID_VEL_Z_KI, PID_VEL_Z_KD,
+
+        PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD,
+        PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD,
+        PID_YAW_KP, PID_YAW_KI, PID_YAW_KD,
+
+        PID_ROLL_RATE_KP, PID_ROLL_RATE_KI, PID_ROLL_RATE_KD,
+        PID_PITCH_RATE_KP, PID_PITCH_RATE_KI, PID_PITCH_RATE_KD,
+        PID_YAW_RATE_KP, PID_YAW_RATE_KI, PID_YAW_RATE_KD,
+    )
+    
     gains = {
         # ── Position PID ────────────────────────────────────────────
         'posCtlPid.xKp': PID_POS_X_KP,  'posCtlPid.xKi': PID_POS_X_KI,  'posCtlPid.xKd': PID_POS_X_KD,
