@@ -170,17 +170,18 @@ def drone_state_to_nn_state(ds: dict) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def query_nn(policy: ConcurrentPolicyMLP, state_12: np.ndarray,
-             target_pos: np.ndarray, device: str = "cpu"):
-    """Query the NN and return (thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s).
+def query_nn_chunk(policy: ConcurrentPolicyMLP, state_12: np.ndarray,
+                   target_pos: np.ndarray, device: str = "cpu") -> np.ndarray:
+    """Query the NN and return all T actions for the chunk.
 
-    Positions in state_12 are shifted so the target becomes the origin
-    for the NN (which was trained to regulate to the origin).
-    Only the first action (t=0) of the T-step chunk is used (MPC style).
+    Matches the training rollout exactly: the NN is called once at the start
+    of each T-step chunk and all T actions are used sequentially.
+
+    Returns: (T, 4) array of [thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s]
     """
     T = policy.T
 
-    # Shift positions so target is at origin
+    # Shift positions so target becomes the origin (training convention)
     state_shifted = state_12.copy()
     state_shifted[0] -= target_pos[0]   # x
     state_shifted[2] -= target_pos[1]   # y
@@ -189,15 +190,14 @@ def query_nn(policy: ConcurrentPolicyMLP, state_12: np.ndarray,
     s = torch.tensor(state_shifted, dtype=torch.float32,
                      device=device).unsqueeze(0)   # (1, 12)
 
-    # Relative targets: target(=0) - current_shifted = -current_shifted
-    current_pos = s[:, [0, 2, 4]]                  # (1, 3)
+    # Relative targets: all T targets are the same for regulation
+    current_pos = s[:, [0, 2, 4]]                      # (1, 3)
     rel = (-current_pos).unsqueeze(1).expand(1, T, 3)  # (1, T, 3)
 
     with torch.no_grad():
         actions = policy(s, rel)   # (1, T, 4)
 
-    a = actions[0, 0].cpu().numpy()
-    return float(a[0]), float(a[1]), float(a[2]), float(a[3])
+    return actions[0].cpu().numpy()   # (T, 4)
 
 
 # ===================================================================
@@ -282,6 +282,10 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     yaw_setpoint = 0.0
     in_pid_phase = True   # starts in PID phase; flips when close to pid_target
 
+    T = policy.T
+    nn_chunk_buf = None   # (T, 4) buffer of pre-planned NN actions
+    nn_step_in_chunk = T  # starts at T to force a query on the first NN step
+
     for i in range(n_steps):
         obs, _, _, _, _ = env.step(action)
 
@@ -294,6 +298,7 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             hard_cap_reached = (i >= int(CTRL_FREQ * PHASE_SWITCH_MAX_SEC))
             if dist_to_pid_target <= PHASE_SWITCH_RADIUS or hard_cap_reached:
                 in_pid_phase = False
+                nn_step_in_chunk = T  # force re-query on first NN step
                 reason = "proximity" if dist_to_pid_target <= PHASE_SWITCH_RADIUS else "timeout"
                 print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s ({reason})  "
                       f"dist={dist_to_pid_target:.3f}m  "
@@ -307,10 +312,17 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                     pid_target, tuple(pos), tuple(vel), rpy_deg[2])
                 yaw_rate_cmd = 0.0
             else:
-                # Phase 2: NN controller → nn_target
-                nn_state = obs_to_nn_state(obs[0])
+                # Phase 2: NN controller — chunk-based, identical to training.
+                # Re-query only at the start of each new T-step chunk so all T
+                # actions are executed in sequence (same as rollout() in training).
+                if nn_step_in_chunk >= T:
+                    nn_state = obs_to_nn_state(obs[0])
+                    nn_chunk_buf = query_nn_chunk(policy, nn_state, nn_target, device)
+                    nn_step_in_chunk = 0
+                a = nn_chunk_buf[nn_step_in_chunk]
                 thrust_cmd, roll_des, pitch_des, yaw_rate_cmd = \
-                    query_nn(policy, nn_state, nn_target, device)
+                    float(a[0]), float(a[1]), float(a[2]), float(a[3])
+                nn_step_in_chunk += 1
 
         # ---- Yaw setpoint accumulation (500 Hz) ---------------------
         yaw_setpoint = cap_angle(
@@ -340,7 +352,7 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
         # ---- Power distribution → RPMs ------------------------------
         motor_pwm = power.distribute(thrust_cmd, roll_cmd, pitch_cmd, yaw_cmd)
-        rpms = pwm_to_rpm(motor_pwm, KF)
+        rpms = pwm_to_rpm(motor_pwm, KF, truncate_8bit=True)
         rpms = motor_filter.apply(rpms)
         action[0, :] = rpms
 

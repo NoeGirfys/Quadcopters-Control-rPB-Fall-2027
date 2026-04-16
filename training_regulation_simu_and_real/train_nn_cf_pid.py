@@ -248,11 +248,34 @@ def _get_pid_gains(dev):
         }
     return _pid_cache[dev]
 
+_MOTORS_PWM_BITS = 8
+_MOTORS_PWM_SHIFT = 16 - _MOTORS_PWM_BITS  # 8
+
+
 def pwm_to_rpm_torch(motor_pwm: torch.Tensor) -> torch.Tensor:
-    """Convertit les PWM (0-65535) en RPM avec sécurité pour le gradient."""
-    thrust = (motor_pwm / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
-    # SÉCURITÉ CRITIQUE : Empêche un gradient infini si thrust = 0
-    thrust = torch.clamp(thrust, min=1e-3) 
+    """Convertit les PWM (0-65535) en RPM avec troncature 8-bit hardware.
+
+    Réplique la chaîne réelle CF2.1+ :
+      1. Troncature timer 8-bit : arrondi vers le bas au multiple de 256 le plus proche
+         [FW] motors.c:115  motorsConv16ToBits
+      2. Mapping linéaire uint16 → poussée [N]
+         [FW] motors.c:165  motorsCompensateBatteryVoltage
+      3. thrust = KF × rpm²  →  rpm = sqrt(thrust / KF)
+
+    La troncature n'est pas différentiable; on utilise un straight-through
+    estimator : forward = valeur tronquée, backward = gradient identité.
+    Cela conserve la fidélité physique tout en permettant la rétropropagation.
+    """
+    # Straight-through truncation: floor to nearest multiple of 256
+    # Equivalent to: int(pwm) >> 8 << 8
+    scale = float(1 << _MOTORS_PWM_SHIFT)  # 256.0
+    pwm_trunc = motor_pwm - (motor_pwm % scale)  # floor to multiple of 256
+    # Straight-through: use truncated value in forward, pass gradient through
+    pwm_trunc = motor_pwm + (pwm_trunc - motor_pwm).detach()
+
+    thrust = (pwm_trunc / UINT16_MAX) * CF2_THRUST_MAX_PER_MOTOR
+    # Empêche un gradient infini si thrust = 0
+    thrust = torch.clamp(thrust, min=1e-3)
     return torch.sqrt(thrust / KF)
 
 def one_pid_step(thrust_u16, roll_des_deg, pitch_des_deg, yaw_rate_deg,
