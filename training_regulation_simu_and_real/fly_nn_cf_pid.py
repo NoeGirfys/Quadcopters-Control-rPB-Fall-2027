@@ -47,7 +47,7 @@ if PARENT_DIR not in sys.path:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
-# gym-pybullet-drones imports (only for sim mode)
+# gym-pybullet-drones imports
 # ---------------------------------------------------------------------------
 try:
     from gym_pybullet_drones.utils.enums import DroneModel, Physics
@@ -526,7 +526,6 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     policy = load_nn_policy(ckpt_path, device)
     nn_target = np.array(target_pos, dtype=np.float64)
     pid_target = np.array(takeoff_pos, dtype=np.float64)
-    NN_CTRL_FREQ = NN_FREQ   # 100 Hz
 
     cflib.crtp.init_drivers()
     print(f"[REAL] Mode: attitude  PID target: {pid_target}  NN target: {nn_target}")
@@ -613,41 +612,53 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         print("[REAL] Commander unlocked.")
 
         # ---- Phase 1: PID takeoff via position setpoints -----
-        TAKEOFF_FREQ = 20   # Hz — position setpoints don't need high rate
-        takeoff_steps = int(TAKEOFF_FREQ * takeoff_max_duration)
-        nn_steps = int(NN_CTRL_FREQ * (duration_sec - takeoff_max_duration))
+        TAKEOFF_FREQ = 20        # Hz — position setpoints don't need high rate
+        PHASE_SWITCH_RADIUS = 0.05  # m — switch to NN when within 5 cm of pid_target
 
         START = time.time()
         flight_start = START
 
         try:
             print(f"[REAL] Phase 1: PID takeoff to {pid_target} "
-                  f"({takeoff_max_duration}s)...")
-            for i in range(takeoff_steps):
-                # Smooth ramp: reach pid_target at 80% of takeoff time
-                frac = min(1.0, (i + 1) / (takeoff_steps * 0.8))
+                  f"(max {takeoff_max_duration}s, switch radius={PHASE_SWITCH_RADIUS}m)...")
+            takeoff_steps_max = int(TAKEOFF_FREQ * takeoff_max_duration)
+            i = 0
+            while True:
+                elapsed = time.time() - START
+                # Smooth z ramp: reach pid_target at 80% of max takeoff time
+                frac = min(1.0, (i + 1) / (takeoff_steps_max * 0.8))
                 z = pid_target[2] * frac
                 cf.commander.send_position_setpoint(
                     pid_target[0], pid_target[1], z, 0.0)
 
-                if i % TAKEOFF_FREQ == 0:
-                    print(f"  takeoff t={i / TAKEOFF_FREQ:.1f}s  "
-                          f"pos=[{drone_state['x']:+.3f},"
-                          f"{drone_state['y']:+.3f},"
-                          f"{drone_state['z']:.3f}]  "
-                          f"sp_z={z:.3f}")
-                time.sleep(1.0 / TAKEOFF_FREQ)
+                pos_now = np.array([drone_state['x'], drone_state['y'],
+                                    drone_state['z']])
+                dist = np.linalg.norm(pos_now - pid_target)
+                hard_cap_reached = elapsed >= takeoff_max_duration
 
-            # Brief hover at pid_target to let the drone stabilise
-            print("[REAL] Stabilising at PID target...")
-            for _ in range(TAKEOFF_FREQ):
-                cf.commander.send_position_setpoint(
-                    pid_target[0], pid_target[1], pid_target[2], 0.0)
-                time.sleep(1.0 / TAKEOFF_FREQ)
+                if i % TAKEOFF_FREQ == 0:
+                    print(f"  takeoff t={elapsed:.1f}s  "
+                          f"pos=[{pos_now[0]:+.3f},{pos_now[1]:+.3f},{pos_now[2]:.3f}]  "
+                          f"dist={dist:.3f}m  sp_z={z:.3f}")
+
+                if dist <= PHASE_SWITCH_RADIUS or hard_cap_reached:
+                    reason = "proximity" if dist <= PHASE_SWITCH_RADIUS else "timeout"
+                    print(f"[REAL] NN takeover at t={elapsed:.1f}s ({reason})  "
+                          f"dist={dist:.3f}m  "
+                          f"pos=[{pos_now[0]:+.3f},{pos_now[1]:+.3f},{pos_now[2]:.3f}]")
+                    break
+
+                i += 1
+                sync(i, START, 1.0 / TAKEOFF_FREQ)
 
             # ---- Phase 2: NN control -----
+            elapsed_phase1 = time.time() - START
+            nn_duration = max(0.0, duration_sec - elapsed_phase1)
+            nn_steps = int(NN_FREQ * nn_duration)
             print(f"[REAL] Phase 2: NN control to {nn_target} for "
-                  f"{duration_sec - takeoff_max_duration:.0f}s...")
+                  f"{nn_duration:.0f}s...")
+
+            phase2_start = time.time()
             for i in range(nn_steps):
                 nn_state = drone_state_to_nn_state(drone_state)
                 thrust, roll_deg, pitch_deg, yaw_rate = \
@@ -658,8 +669,8 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 cf.commander.send_setpoint(
                     roll_deg, pitch_deg, yaw_rate, int(thrust))
 
-                if i % NN_CTRL_FREQ == 0:
-                    t = takeoff_max_duration + i / NN_CTRL_FREQ
+                if i % NN_FREQ == 0:
+                    t = elapsed_phase1 + i / NN_FREQ
                     err = math.sqrt(
                         (drone_state['x'] - nn_target[0]) ** 2
                         + (drone_state['y'] - nn_target[1]) ** 2
@@ -671,7 +682,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                           f"err={err:.4f}m  thrust={thrust:.0f}  "
                           f"r={roll_deg:+.1f} p={pitch_deg:+.1f}")
 
-                time.sleep(1.0 / NN_CTRL_FREQ)
+                sync(i, phase2_start, 1.0 / NN_FREQ)
 
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted!")
