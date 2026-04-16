@@ -282,10 +282,6 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     yaw_setpoint = 0.0
     in_pid_phase = True   # starts in PID phase; flips when close to pid_target
 
-    T = policy.T
-    nn_chunk_buf = None   # (T, 4) buffer of pre-planned NN actions
-    nn_step_in_chunk = T  # starts at T to force a query on the first NN step
-
     for i in range(n_steps):
         obs, _, _, _, _ = env.step(action)
 
@@ -298,7 +294,6 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             hard_cap_reached = (i >= int(CTRL_FREQ * PHASE_SWITCH_MAX_SEC))
             if dist_to_pid_target <= PHASE_SWITCH_RADIUS or hard_cap_reached:
                 in_pid_phase = False
-                nn_step_in_chunk = T  # force re-query on first NN step
                 reason = "proximity" if dist_to_pid_target <= PHASE_SWITCH_RADIUS else "timeout"
                 print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s ({reason})  "
                       f"dist={dist_to_pid_target:.3f}m  "
@@ -312,17 +307,11 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                     pid_target, tuple(pos), tuple(vel), rpy_deg[2])
                 yaw_rate_cmd = 0.0
             else:
-                # Phase 2: NN controller — chunk-based, identical to training.
-                # Re-query only at the start of each new T-step chunk so all T
-                # actions are executed in sequence (same as rollout() in training).
-                if nn_step_in_chunk >= T:
-                    nn_state = obs_to_nn_state(obs[0])
-                    nn_chunk_buf = query_nn_chunk(policy, nn_state, nn_target, device)
-                    nn_step_in_chunk = 0
-                a = nn_chunk_buf[nn_step_in_chunk]
+                # Phase 2: NN controller — query at 100 Hz, use first action
+                nn_state = obs_to_nn_state(obs[0])
+                a = query_nn_chunk(policy, nn_state, nn_target, device)[0]
                 thrust_cmd, roll_des, pitch_des, yaw_rate_cmd = \
                     float(a[0]), float(a[1]), float(a[2]), float(a[3])
-                nn_step_in_chunk += 1
 
         # ---- Yaw setpoint accumulation (500 Hz) ---------------------
         yaw_setpoint = cap_angle(
