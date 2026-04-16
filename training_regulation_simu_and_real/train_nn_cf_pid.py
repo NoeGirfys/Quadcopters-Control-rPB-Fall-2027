@@ -516,10 +516,19 @@ def compute_relative_targets(state, T, target_pos=None):
     return rel
 
 
-def rollout(policy, x0, n_chunks, tau_div=None):
+def rollout(policy, x0, n_chunks, tau_div=None, log_extra=False):
     """Full rollout: n_chunks * T NN steps, each = 5 PID steps.
 
-    Returns X: (B, n_chunks*T, 12) state trajectory at 100 Hz.
+    Args:
+        log_extra: if True, also return A (NN actions) and R (motor RPMs).
+                   Keep False during training to avoid memory overhead.
+
+    Returns:
+        X : (B, n_chunks*T, 12) state trajectory at 100 Hz.
+        A : (B, n_chunks*T, 4)  NN actions [thrust_u16, roll°, pitch°, yaw_rate°/s]
+            — only when log_extra=True
+        R : (B, n_chunks*T, 4)  motor RPMs [M1..M4]
+            — only when log_extra=True
     """
     T = policy.T
     B = x0.shape[0]
@@ -527,6 +536,10 @@ def rollout(policy, x0, n_chunks, tau_div=None):
     total_nn_steps = n_chunks * T
 
     X = torch.zeros(B, total_nn_steps, 12, device=dev)
+    if log_extra:
+        A = torch.zeros(B, total_nn_steps, 4, device=dev)
+        R = torch.zeros(B, total_nn_steps, 4, device=dev)
+
     state = x0
     pid_state = init_pid_state(state)
     step_idx = 0
@@ -542,6 +555,9 @@ def rollout(policy, x0, n_chunks, tau_div=None):
             nn_action = actions[:, t, :]
             state, pid_state = one_nn_step(state, nn_action, pid_state)
             X[:, step_idx, :] = state
+            if log_extra:
+                A[:, step_idx, :] = nn_action
+                R[:, step_idx, :] = pid_state[5]   # motor_rpm is index 5
             step_idx += 1
 
             # Curriculum reset
@@ -554,6 +570,8 @@ def rollout(policy, x0, n_chunks, tau_div=None):
                     state = torch.where(mask, torch.zeros_like(state), state)
                     pid_state = reset_pid_diverged(pid_state, diverged)
 
+    if log_extra:
+        return X, A, R
     return X
 
 
@@ -697,11 +715,11 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
         # ==========================================================
         
         with torch.no_grad():
-            X_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=False)
-            
+            X_eval, A_eval, R_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=False)
+
             # Nom du fichier : epoch_0001.png, epoch_0002.png...
             plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
-            save_plots(X_eval, eval_labels, plot_file, verbose=False)
+            save_plots(X_eval, A_eval, R_eval, eval_labels, plot_file, verbose=False)
         
         if killer.kill_now:
             print(f"\n[Arrêt Propre] Fin prématurée demandée à l'epoch {ep+1}.")
@@ -716,9 +734,16 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
 
 @torch.no_grad()
 def evaluate(policy, test_pts, n_chunks, device="cpu", verbose=True):
+    """Evaluate policy on test_pts.
+
+    Returns (X, A, R):
+        X : (B, total, 12)  state trajectory
+        A : (B, total, 4)   NN actions [thrust_u16, roll°, pitch°, yaw_rate°/s]
+        R : (B, total, 4)   motor RPMs [M1..M4]
+    """
     T = policy.T
     x0 = make_x0_batch(test_pts, device=device)
-    X = rollout(policy, x0, n_chunks, tau_div=None)
+    X, A, R = rollout(policy, x0, n_chunks, tau_div=None, log_extra=True)
 
     if verbose:
         pos_end = X[:, -1, [0, 2, 4]].norm(dim=1)
@@ -728,11 +753,20 @@ def evaluate(policy, test_pts, n_chunks, device="cpu", verbose=True):
         print(f"  Terminal pos error  mean={pos_end.mean():.5f} m  max={pos_end.max():.5f} m")
         print(f"  Terminal velocity   mean={vel_end.mean():.5f} m/s  max={vel_end.max():.5f} m/s")
 
-    return X
+    return X, A, R
 
 
-def save_plots(X, labels, filename="training_result.png", verbose=True):
-    """Plot position trajectories."""
+def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
+    """Plot full state + NN outputs + motor RPMs.
+
+    Layout: 6 rows × 3 cols
+      Row 0 : x, y, z  [m]
+      Row 1 : vx, vy, vz  [m/s]
+      Row 2 : roll (phi), pitch (theta), yaw (psi)  [deg]
+      Row 3 : roll rate (p), pitch rate (q), yaw rate (r)  [deg/s]
+      Row 4 : NN thrust [u16], NN roll_des [deg], NN pitch_des [deg]
+      Row 5 : NN yaw_rate [deg/s], RPM M1+M2, RPM M3+M4
+    """
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -741,29 +775,103 @@ def save_plots(X, labels, filename="training_result.png", verbose=True):
         print("[WARN] matplotlib not available, skipping plots.")
         return
 
-    X_np = X.cpu().numpy()
+    RAD2DEG = 180.0 / np.pi
+    X_np = X.cpu().numpy()                   # (B, T, 12)
+    A_np = A.cpu().numpy()                   # (B, T, 4)
+    R_np = R.cpu().numpy()                   # (B, T, 4)
     B = X_np.shape[0]
     T_total = X_np.shape[1]
     t_axis = np.arange(1, T_total + 1) / NN_FREQ
+    n_traj = min(B, 10)
 
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    coord_idx = [0, 2, 4]
-    coord_names = ["x (m)", "y (m)", "z (m)"]
+    fig, axes = plt.subplots(6, 3, figsize=(15, 20), sharex=True)
+    fig.suptitle("Concurrent NN Controller with CF Firmware PID", fontsize=13)
 
-    for j, (idx, name) in enumerate(zip(coord_idx, coord_names)):
-        for b in range(min(B, 10)):
-            axes[j].plot(t_axis, X_np[b, :, idx], linewidth=0.8, alpha=0.7,
-                         label=labels[b] if j == 0 else None)
-        axes[j].axhline(0, color="k", linewidth=0.5, linestyle="--")
-        axes[j].set_xlabel("Time (s)")
-        axes[j].set_ylabel(name)
-        axes[j].set_title(f"Position {name}")
-        axes[j].grid(True, alpha=0.3)
+    def _plot_row(row, data_list, ylabel_list, title_list, hline=None):
+        """Plot one row: data_list[j] is (B, T) array for subplot (row, j), or None to skip."""
+        for j, (data, ylabel, title) in enumerate(zip(data_list, ylabel_list, title_list)):
+            ax = axes[row, j]
+            if data is None:
+                ax.set_visible(False)
+                continue
+            for b in range(n_traj):
+                ax.plot(t_axis, data[b], linewidth=0.7, alpha=0.65,
+                        label=labels[b] if (row == 0 and j == 0) else None)
+            if hline is not None:
+                ax.axhline(hline, color="k", linewidth=0.6, linestyle="--", alpha=0.5)
+            ax.set_ylabel(ylabel, fontsize=8)
+            ax.set_title(title, fontsize=8)
+            ax.grid(True, alpha=0.3)
 
-    axes[0].legend(fontsize=6, ncol=2)
-    fig.suptitle("Concurrent NN Controller with CF Firmware PID", fontsize=12)
+    # Row 0 — positions [m]
+    _plot_row(0,
+              [X_np[:, :, 0], X_np[:, :, 2], X_np[:, :, 4]],
+              ["x (m)", "y (m)", "z (m)"],
+              ["Position x", "Position y", "Position z"],
+              hline=0.0)
+    axes[0, 0].legend(fontsize=5, ncol=2)
+
+    # Row 1 — velocities [m/s]
+    _plot_row(1,
+              [X_np[:, :, 1], X_np[:, :, 3], X_np[:, :, 5]],
+              ["vx (m/s)", "vy (m/s)", "vz (m/s)"],
+              ["Velocity vx", "Velocity vy", "Velocity vz"],
+              hline=0.0)
+
+    # Row 2 — angles [deg]
+    _plot_row(2,
+              [X_np[:, :, 6] * RAD2DEG, X_np[:, :, 8] * RAD2DEG, X_np[:, :, 10] * RAD2DEG],
+              ["phi (deg)", "theta (deg)", "psi (deg)"],
+              ["Roll angle", "Pitch angle", "Yaw angle"],
+              hline=0.0)
+
+    # Row 3 — angular rates [deg/s]
+    _plot_row(3,
+              [X_np[:, :, 7] * RAD2DEG, X_np[:, :, 9] * RAD2DEG, X_np[:, :, 11] * RAD2DEG],
+              ["p (deg/s)", "q (deg/s)", "r (deg/s)"],
+              ["Roll rate p", "Pitch rate q", "Yaw rate r"],
+              hline=0.0)
+
+    # Row 4 — NN outputs: thrust, roll_des, pitch_des
+    _plot_row(4,
+              [A_np[:, :, 0], A_np[:, :, 1], A_np[:, :, 2]],
+              ["thrust (u16)", "roll_des (deg)", "pitch_des (deg)"],
+              ["NN Thrust", "NN Roll setpoint", "NN Pitch setpoint"])
+    axes[4, 0].axhline(HOVER_THRUST_U16, color="gray", linewidth=0.8,
+                       linestyle=":", label=f"hover≈{HOVER_THRUST_U16:.0f}")
+    axes[4, 0].legend(fontsize=6)
+
+    # Row 5 — NN yaw_rate + RPMs
+    _plot_row(5,
+              [A_np[:, :, 3], None, None],
+              ["yaw_rate (deg/s)", "", ""],
+              ["NN Yaw rate setpoint", "", ""])
+
+    # RPM M1+M2 in (5,1), M3+M4 in (5,2)
+    motor_colors = ["C0", "C1", "C2", "C3"]
+    for m_idx, (col, motor_name) in enumerate([(1, "M1"), (1, "M2"), (2, "M3"), (2, "M4")]):
+        ax = axes[5, col]
+        for b in range(n_traj):
+            ax.plot(t_axis, R_np[b, :, m_idx], linewidth=0.7, alpha=0.55,
+                    color=motor_colors[m_idx], label=motor_name if b == 0 else None)
+    axes[5, 1].set_title("RPM M1 & M2", fontsize=8)
+    axes[5, 1].set_ylabel("RPM", fontsize=8)
+    axes[5, 1].legend(fontsize=6)
+    axes[5, 1].grid(True, alpha=0.3)
+    axes[5, 2].set_title("RPM M3 & M4", fontsize=8)
+    axes[5, 2].set_ylabel("RPM", fontsize=8)
+    axes[5, 2].legend(fontsize=6)
+    axes[5, 2].grid(True, alpha=0.3)
+    axes[5, 5 - 5].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+    axes[5, 1].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+    axes[5, 2].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+
+    # x-label only on bottom row
+    for j in range(3):
+        axes[5, j].set_xlabel("Time (s)", fontsize=8)
+
     fig.tight_layout()
-    fig.savefig(filename, dpi=150)
+    fig.savefig(filename, dpi=120)
     plt.close(fig)
     if verbose:
         print(f"[Saved] {filename}")
@@ -811,14 +919,14 @@ if __name__ == "__main__":
     test_pts = [(rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3),
                  rng.uniform(-0.3, 0.3)) for _ in range(20)]
-    X_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=True)
+    X_eval, A_eval, R_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=True)
 
     # Plot
     labels = [f"({p[0]:+.2f},{p[1]:+.2f},{p[2]:+.2f})" for p in test_pts]
     tag = f"_{args.tag}" if args.tag else ""
     plot_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"train_cf_pid_result{tag}.png")
-    save_plots(X_eval, labels, plot_file, verbose=True)
+    save_plots(X_eval, A_eval, R_eval, labels, plot_file, verbose=True)
 
     # Save checkpoint
     out_dir = os.path.dirname(os.path.abspath(__file__))
