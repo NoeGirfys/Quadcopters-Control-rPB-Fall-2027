@@ -15,6 +15,7 @@ Pipeline (per 500 Hz step):
 - Curriculum learning: state reset + detach when error > tau_div
 
 Usage:
+    cd training_regulation_simu_and_real
     python train_nn_cf_pid.py
     python train_nn_cf_pid.py --epochs 1000 --lr 5e-4 --t_sim 4.0
     python train_nn_cf_pid.py --t_chunk 0.4 --hidden 128 --tag exp1
@@ -23,11 +24,17 @@ Usage:
 import argparse
 import itertools
 import math
-import os
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+import sys
+import os
+# On ajoute le dossier parent (Semester_Project) au sys.path
+PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if PARENT_DIR not in sys.path:
+    sys.path.append(PARENT_DIR)
 
 # =====================================================================
 # 1. Physical Constants  (CF2X — from gym-pybullet-drones URDF)
@@ -46,13 +53,13 @@ T2W = 2.25
 GRAVITY   = M * G
 HOVER_RPM = np.sqrt(GRAVITY / (4 * KF))
 MAX_RPM   = np.sqrt((T2W * GRAVITY) / (4 * KF))
-from ..crazyflie_firmware.constants import UINT16_MAX
+from crazyflie_firmware.constants import UINT16_MAX
 
 # CF2.1+ per-motor thrust with battery compensation
 CF2_THRUST_MAX_PER_MOTOR = 0.12  # N
 
 # ---- PID Gains (from cf_firmware_pid_sim.py / platform_defaults_cf2.h) ----
-from ..crazyflie_firmware.constants import (
+from crazyflie_firmware.constants import (
     PID_ROLL_KP, PID_ROLL_KI, PID_ROLL_KD, PID_ROLL_INTEGRATION_LIMIT,
     PID_PITCH_KP, PID_PITCH_KI, PID_PITCH_KD, PID_PITCH_INTEGRATION_LIMIT,
     PID_YAW_KP, PID_YAW_KI, PID_YAW_KD, PID_YAW_INTEGRATION_LIMIT,
@@ -75,11 +82,11 @@ RATE_KD   = torch.tensor([PID_ROLL_RATE_KD, PID_PITCH_RATE_KD, PID_YAW_RATE_KD])
 RATE_ILIM = torch.tensor([PID_ROLL_RATE_INTEGRATION_LIMIT, PID_PITCH_RATE_INTEGRATION_LIMIT, PID_YAW_RATE_INTEGRATION_LIMIT])
 
 # Velocity PID output limits (NN output bounds)
-from ..crazyflie_firmware.constants import PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX
+from crazyflie_firmware.constants import PID_VEL_ROLL_MAX, PID_VEL_PITCH_MAX
 YAW_RATE_MAX      = 200.0  # deg/s
 
 # ---- Timing ----
-from ..crazyflie_firmware.constants import POSITION_RATE, ATTITUDE_RATE, ATTITUDE_UPDATE_DT
+from crazyflie_firmware.constants import POSITION_RATE, ATTITUDE_RATE, ATTITUDE_UPDATE_DT
 NN_FREQ       = POSITION_RATE    # Hz (replaces position controller)
 PID_STEPS_PER_NN = ATTITUDE_RATE // NN_FREQ  # 5
 
@@ -570,7 +577,6 @@ def generate_cube_points(half_side=0.3):
     return list(itertools.product(vals, repeat=3))
 
 import signal
-import sys
 class GracefulKiller:
     """Intercepte Ctrl+C pour arrêter l'entraînement proprement à la fin d'un epoch."""
     def __init__(self):
@@ -672,7 +678,7 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
             
             # Nom du fichier : epoch_0001.png, epoch_0002.png...
             plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
-            #save_plots(X_eval, eval_labels, plot_file, verbose=False)
+            save_plots(X_eval, eval_labels, plot_file, verbose=False)
         
         if killer.kill_now:
             print(f"\n[Arrêt Propre] Fin prématurée demandée à l'epoch {ep+1}.")
