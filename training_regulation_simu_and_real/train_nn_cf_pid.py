@@ -753,9 +753,9 @@ def save_plots(X, labels, filename="training_result.png", verbose=True):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train concurrent NN controller with CF firmware PID")
-    parser.add_argument("--epochs", type=int, default=500)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--hidden", type=int, default=64)
     parser.add_argument("--t_chunk", type=float, default=0.2,
                         help="Chunk duration in seconds (T = t_chunk * 100)")
     parser.add_argument("--t_sim", type=float, default=2.0,
