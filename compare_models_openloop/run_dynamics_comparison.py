@@ -12,6 +12,7 @@ Supports both CF2P (+) and CF2X (x) configurations,
 and multiple Physics modes (PYB, DYN, PYB_GND_DRAG_DW, etc.)
 
 Usage:
+    cd compare_models_openloop
     python run_dynamics_comparison.py
 
 Requirements:
