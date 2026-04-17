@@ -725,7 +725,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 # send_setpoint: (roll_deg, pitch_deg, yaw_rate_deg/s,
                 #                 thrust_uint16)
                 cf.commander.send_setpoint(
-                    roll_deg, pitch_deg, yaw_rate, int(thrust))
+                    roll_deg, -pitch_deg, yaw_rate, int(thrust))
 
                 if i % NN_FREQ == 0:
                     t = elapsed_phases01 + i / NN_FREQ
@@ -847,7 +847,7 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     plt.tight_layout()
     plt.savefig('nn_real_results.png', dpi=150)
     print("[PLOT] Saved to nn_real_results.png")
-    plt.show()
+    #plt.show()
 
 
 # ===================================================================
@@ -868,10 +868,10 @@ MODES:
     parser.add_argument('--mode', default='sim',
                         choices=['sim', 'attitude'],
                         help='Control mode (default: sim)')
-    parser.add_argument('--duration', default=5, type=float,
-                        help='Total flight duration [s] (default: 5)')
-    parser.add_argument('--takeoff-max-duration', default=3.0, type=float,
-                        help='PID takeoff duration [s] (default: 3)')
+    parser.add_argument('--duration', default=10, type=float,
+                        help='Total flight duration [s] (default: 10)')
+    parser.add_argument('--takeoff-max-duration', default=1.0, type=float,
+                        help='PID takeoff duration [s] (default: 1.0)')
     parser.add_argument('--PID-target', nargs=3, type=float,
                     default=[0.0, 0.0, 0.7],
                     metavar=('X', 'Y', 'Z'),
