@@ -208,19 +208,47 @@ def query_nn_chunk(policy: ConcurrentPolicyMLP, state_12: np.ndarray,
 
 
 # ===================================================================
+#  Shared trajectory helpers (identical profiles for sim & real)
+# ===================================================================
+
+def takeoff_ramp_z(target_z: float, elapsed: float, max_duration: float,
+                   ramp_frac: float = 0.8) -> float:
+    """Linear ramp used during Phase 0 (PID takeoff), identical sim & real.
+
+    Reaches target_z at ramp_frac * max_duration, then stays there.
+    """
+    frac = min(1.0, elapsed / (max_duration * ramp_frac))
+    return target_z * frac
+
+
+def landing_ramp_z(start_z: float, elapsed: float, duration: float) -> float:
+    """Smoothstep ramp used during landing, identical sim & real.
+
+    Follows z = start_z * (1 - (3 f^2 - 2 f^3)) with f in [0, 1].
+    """
+    frac = min(1.0, max(0.0, elapsed / max(duration, 1e-6)))
+    return start_z * (1.0 - (3.0 * frac ** 2 - 2.0 * frac ** 3))
+
+
+# ===================================================================
 #  SIM mode
 # ===================================================================
 
 def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                duration_sec: float = 15, takeoff_max_duration: float = 3.0,
                hover_duration: float = 0.0,
+               land_duration: float = None,
                gui: bool = True, plot: bool = True,
                device: str = "cpu"):
     """Run NN controller in PyBullet simulation.
 
     Phase 0 (PID):   Position+Velocity PID climbs to takeoff_pos
+                     using the same linear z-ramp as the real-drone mode
     Phase 1 (HOVER): PID holds takeoff_pos for hover_duration seconds
     Phase 2 (NN):    NN regulates to target_pos
+    Phase 3 (LAND):  PID brings the drone down along the same smoothstep
+                     profile used by the real-drone landing, so the two
+                     trajectories match end-to-end.
 
     The attitude + rate PIDs run continuously at 500 Hz throughout,
     ensuring a smooth handover between phases.
@@ -261,7 +289,6 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
     nn_target = np.array(target_pos, dtype=np.float64)
     pid_target = np.array(takeoff_pos, dtype=np.float64)
-    n_steps = int(CTRL_FREQ * duration_sec)
 
     PHASE_SWITCH_RADIUS = 0.05   # m — switch to HOVER when within 5 cm of pid_target
     PHASE_SWITCH_MAX_SEC = takeoff_max_duration  # hard cap: switch anyway after takeoff_max_duration
@@ -269,13 +296,33 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     PHASE_PID = 0
     PHASE_HOVER = 1
     PHASE_NN = 2
+    PHASE_LAND = 3
     current_phase = PHASE_PID
     hover_start_step: int = 0
+    land_start_step: int = 0
+    land_start_pos: np.ndarray = pid_target.copy()   # filled when LAND begins
+
+    # Landing duration: same rule as real mode (z / 0.3 m/s, min 1 s) by default.
+    # In sim we must pre-size the log arrays, so we estimate using nn_target[2]
+    # (the expected end-of-NN altitude). The actual descent profile is computed
+    # from the current pos when PHASE_LAND begins, identical to the real mode.
+    if land_duration is None:
+        land_duration_effective = max(1.0, float(nn_target[2]) / 0.3)
+    else:
+        land_duration_effective = max(0.0, float(land_duration))
+
+    SETTLE_TIME = 1.0  # On ajoute 1.5s pour voir le drone se poser
+    total_duration_sec = duration_sec + land_duration_effective + SETTLE_TIME
 
     print(f"[SIM] PYB={PYB_FREQ}Hz  CTRL={CTRL_FREQ}Hz  NN={NN_FREQ}Hz")
     print(f"[SIM] PID target={pid_target}  NN target={nn_target}  "
           f"Duration={duration_sec}s  Switch radius={PHASE_SWITCH_RADIUS}m  "
-          f"Hover={hover_duration}s")
+          f"Hover={hover_duration}s  Land={land_duration_effective:.1f}s")
+
+    n_steps = int(CTRL_FREQ * total_duration_sec)
+
+    # Step index at which the NN phase ends and landing starts
+    land_start_step_planned = int(CTRL_FREQ * duration_sec)
 
     # ---- Logging ----------------------------------------------------
     log_t = np.zeros(n_steps)
@@ -330,13 +377,45 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 current_phase = PHASE_NN
                 print(f"[SIM] NN takeover at t={i / CTRL_FREQ:.1f}s (hover done)  "
                       f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]")
+        elif current_phase == PHASE_NN:
+            # Switch to landing once the requested flight duration has elapsed,
+            # mirroring the real-mode behaviour (landing happens after the NN phase).
+            if land_duration_effective > 0.0 and i >= land_start_step_planned:
+                current_phase = PHASE_LAND
+                land_start_step = i
+                land_start_pos = pos.copy()
+                print(f"[SIM] LAND start at t={i / CTRL_FREQ:.1f}s  "
+                      f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]  "
+                      f"land={land_duration_effective:.1f}s")
 
         # ---- High-level controller (100 Hz) -------------------------
         if i % nn_divider == 0:
-            if current_phase == PHASE_PID or current_phase == PHASE_HOVER:
-                # Phase PID/HOVER: Position + Velocity PID → pid_target
+            if current_phase == PHASE_PID:
+                # Phase PID: same linear z-ramp as the real-drone mode,
+                # so position setpoints match end-to-end.
+                elapsed_sec = i / CTRL_FREQ
+                z_sp = takeoff_ramp_z(pid_target[2], elapsed_sec,
+                                      takeoff_max_duration, ramp_frac=0.8)
+                ramped_target = (pid_target[0], pid_target[1], z_sp)
                 thrust_cmd, roll_des, pitch_des = pos_ctrl.update(
-                    pid_target, tuple(pos), tuple(vel), rpy_deg[2])
+                    ramped_target, tuple(pos), tuple(vel), rpy_deg[2])
+                yaw_rate_cmd = 0.0
+            elif current_phase == PHASE_HOVER:
+                # Phase HOVER: hold pid_target exactly (same as real mode's
+                # send_position_setpoint(pid_target[0], pid_target[1], pid_target[2], 0)).
+                thrust_cmd, roll_des, pitch_des = pos_ctrl.update(
+                    tuple(pid_target), tuple(pos), tuple(vel), rpy_deg[2])
+                yaw_rate_cmd = 0.0
+            elif current_phase == PHASE_LAND:
+                # Phase LAND: same smoothstep descent as the real-drone mode.
+                land_elapsed = (i - land_start_step) / CTRL_FREQ
+                z_sp = landing_ramp_z(land_start_pos[2], land_elapsed,
+                                      land_duration_effective)
+                if z_sp < 0.05:
+                    z_sp = 0.05
+                land_sp = (land_start_pos[0], land_start_pos[1], z_sp)
+                thrust_cmd, roll_des, pitch_des = pos_ctrl.update(
+                    land_sp, tuple(pos), tuple(vel), rpy_deg[2])
                 yaw_rate_cmd = 0.0
             else:
                 # Phase NN: NN controller — query at 100 Hz, use first action
@@ -390,14 +469,20 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         log_nn_cmd[i] = [thrust_cmd, roll_des, pitch_des, yaw_rate_cmd]
         log_phase[i] = current_phase
 
-        if i % CTRL_FREQ == 0:
-            t = i / CTRL_FREQ
-            phase_label = {PHASE_PID: "PID  ", PHASE_HOVER: "HOVER", PHASE_NN: "NN   "}[current_phase]
-            current_target = pid_target if current_phase != PHASE_NN else nn_target
-            err = np.linalg.norm(pos - current_target)
-            print(f"  t={t:5.1f}s [{phase_label}]  "
-                  f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]  "
-                  f"err={err:.4f}m  thrust={thrust_cmd:.0f}")
+        #if i % CTRL_FREQ == 0:
+        #    t = i / CTRL_FREQ
+        #    phase_label = {PHASE_PID: "PID  ", PHASE_HOVER: "HOVER",
+        #                   PHASE_NN: "NN   ", PHASE_LAND: "LAND "}[current_phase]
+        #    if current_phase == PHASE_NN:
+        #        current_target = nn_target
+        #    elif current_phase == PHASE_LAND:
+        #        current_target = np.array([land_start_pos[0], land_start_pos[1], 0.0])
+        #    else:
+        #        current_target = pid_target
+        #    err = np.linalg.norm(pos - current_target)
+        #    print(f"  t={t:5.1f}s [{phase_label}]  "
+        #          f"pos=[{pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:.3f}]  "
+        #          f"err={err:.4f}m  thrust={thrust_cmd:.0f}")
 
         if gui:
             sync(i, START, 1.0 / CTRL_FREQ)
@@ -418,7 +503,8 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     data = dict(t=log_t, pos=log_pos, vel=log_vel, rpy=log_rpy,
                 rpms=log_rpms, thrust=log_thrust, nn_cmd=log_nn_cmd,
                 phase=log_phase, pid_target=pid_target, nn_target=nn_target,
-                PHASE_PID=PHASE_PID, PHASE_HOVER=PHASE_HOVER, PHASE_NN=PHASE_NN)
+                PHASE_PID=PHASE_PID, PHASE_HOVER=PHASE_HOVER,
+                PHASE_NN=PHASE_NN, PHASE_LAND=PHASE_LAND)
     if plot:
         _plot_nn_sim(data)
     return data
@@ -450,11 +536,14 @@ def _plot_nn_sim(data: dict):
     phase = data['phase']
     PHASE_HOVER = data['PHASE_HOVER']
     PHASE_NN = data['PHASE_NN']
+    PHASE_LAND = data.get('PHASE_LAND', -1)
 
     # Actual transition times from phase log
     hover_start_idx = np.argmax(phase == PHASE_HOVER) if np.any(phase == PHASE_HOVER) else None
     nn_start_idx = np.argmax(phase == PHASE_NN) if np.any(phase == PHASE_NN) else len(t) - 1
     nn_switch_sec = t[nn_start_idx]
+    land_start_idx = np.argmax(phase == PHASE_LAND) if np.any(phase == PHASE_LAND) else None
+    land_switch_sec = t[land_start_idx] if land_start_idx is not None else None
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
     fig.suptitle('NN Controller + CF Firmware Attitude/Rate PID', fontsize=14)
@@ -467,6 +556,9 @@ def _plot_nn_sim(data: dict):
                            label='PID\u2192HOVER')
             ax.axvline(nn_switch_sec, color='red', ls=':', alpha=0.5,
                        label='HOVER\u2192NN' if hover_start_idx is not None else 'PID\u2192NN')
+            if land_switch_sec is not None:
+                ax.axvline(land_switch_sec, color='purple', ls=':', alpha=0.5,
+                           label='NN\u2192LAND')
 
     # -- Position --
     ax = axes[0, 0]
@@ -548,12 +640,16 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 uri: str = "radio://0/80/2M/E7E7E7E7E7",
                 duration_sec: float = 15, takeoff_max_duration: float = 3.0,
                 hover_duration: float = 0.0,
+                land_duration: float = None,
                 device: str = "cpu"):
     """Run NN controller on a real Crazyflie via Crazyradio.
 
-    Phase 0 (PID):   send_position_setpoint climbs to takeoff_pos
+    Phase 0 (PID):   send_position_setpoint climbs to takeoff_pos via a
+                     linear z-ramp (shared helper with sim mode)
     Phase 1 (HOVER): holds takeoff_pos for hover_duration seconds
     Phase 2 (NN):    NN outputs attitude + thrust regulating to target_pos
+    Phase 3 (LAND):  smoothstep descent to the ground (shared helper with
+                     sim mode), using land_duration or ~0.3 m/s default.
 
     The drone's onboard attitude + rate PIDs handle low-level stabilisation.
     """
@@ -661,13 +757,13 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         try:
             print(f"[REAL] Phase 0: PID takeoff to {pid_target} "
                   f"(max {takeoff_max_duration}s, switch radius={PHASE_SWITCH_RADIUS}m)...")
-            takeoff_steps_max = int(TAKEOFF_FREQ * takeoff_max_duration)
             i = 0
             while True:
                 elapsed = time.time() - START
-                # Smooth z ramp: reach pid_target at 80% of max takeoff time
-                frac = min(1.0, (i + 1) / (takeoff_steps_max * 0.8))
-                z = pid_target[2] * frac
+                # Same linear z-ramp as the simulation (shared helper):
+                # reaches pid_target[2] at 80% of takeoff_max_duration.
+                z = takeoff_ramp_z(pid_target[2], elapsed,
+                                   takeoff_max_duration, ramp_frac=0.8)
                 cf.commander.send_position_setpoint(
                     pid_target[0], pid_target[1], z, 0.0)
 
@@ -745,18 +841,23 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted!")
         finally:
-            # ---- Smooth landing -----
+            # ---- Smooth landing (same smoothstep profile as sim) -----
             print("[REAL] Landing...")
             land_x = drone_state['x']
             land_y = drone_state['y']
             land_z = drone_state['z']
-            land_duration = max(1.0, land_z / 0.3)
+            # Same default rule as sim: ~0.3 m/s descent, min 1 s.
+            if land_duration is None:
+                land_duration_effective = max(1.0, land_z / 0.3)
+            else:
+                land_duration_effective = max(0.0, float(land_duration))
             LAND_FREQ = 20
-            land_steps = int(LAND_FREQ * land_duration)
+            land_steps = int(LAND_FREQ * land_duration_effective)
+            land_start_t = time.time()
 
             for j in range(land_steps):
-                frac = (j + 1) / land_steps
-                z = land_z * (1.0 - (3 * frac ** 2 - 2 * frac ** 3))
+                land_elapsed = time.time() - land_start_t
+                z = landing_ramp_z(land_z, land_elapsed, land_duration_effective)
                 if z < 0.05:
                     break
                 cf.commander.send_position_setpoint(
@@ -887,6 +988,9 @@ MODES:
                         help='Crazyflie radio URI (for real mode)')
     parser.add_argument('--hover-duration', default=2.0, type=float,
                         help='Hover duration between PID and NN phases [s] (default: 2.0)')
+    parser.add_argument('--land-duration', default=None, type=float,
+                        help='Landing duration [s] (default: None). '
+                             'Used identically in sim and real modes.')
     parser.add_argument('--no-plot', dest='plot', action='store_false',
                         help='Disable post-flight plots')
     args = parser.parse_args()
@@ -900,12 +1004,14 @@ MODES:
         run_sim_nn(args.weights, takeoff_pos=takeoff_pos, target_pos=target_pos,
                    duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
                    hover_duration=args.hover_duration,
+                   land_duration=args.land_duration,
                    gui=args.gui, plot=args.plot, device=device)
     elif args.mode == 'attitude':
         run_real_nn(args.weights, takeoff_pos=takeoff_pos, target_pos=target_pos,
                     uri=args.uri,
                     duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
                     hover_duration=args.hover_duration,
+                    land_duration=args.land_duration,
                     device=device)
 
 
