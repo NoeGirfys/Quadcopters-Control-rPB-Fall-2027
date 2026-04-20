@@ -669,6 +669,39 @@ def _plot_comparison(real, sim):
     plt.show()
 
 
+def _plot_jitter(times, dts, target_freq):
+    """Tracer l'historique des périodes d'envoi (Jitter)."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping jitter plot.")
+        return
+
+    # Conversion en millisecondes pour une lecture plus intuitive
+    dts_ms = np.array(dts) * 1000.0
+    target_ms = (1.0 / target_freq) * 1000.0
+
+    plt.figure(figsize=(12, 4))
+    plt.plot(times, dts_ms, label='Real period measured', color='purple', alpha=0.7)
+    
+    # Ligne idéale
+    plt.axhline(target_ms, color='red', linestyle='--', 
+                label=f'Ideal target ({target_ms:.1f} ms / {target_freq} Hz)')
+    
+    plt.xlabel('Time [s]')
+    plt.ylabel('Loop Period [ms]')
+    plt.title('Jitter Analysis (Radio Communication Stability)')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    # Sauvegarde de l'image
+    save_path = os.path.join(SCRIPT_DIR, 'jitter_results.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"[PLOT] Graphique du jitter sauvegardé dans : {save_path}")
+    plt.show()
+
+
 # ===================================================================
 #  Push Python PID constants → real Crazyflie firmware via cflib
 # ===================================================================
@@ -888,6 +921,16 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
         START = time.time()
         flight_start = START   # enable data logging in _state_cb
+
+        # --- Variables pour les statistiques de fréquence ---
+        cmd_count = 0
+        max_loop_dt = 0.0
+        last_cmd_time = START
+        
+        # NOUVEAU : Listes pour stocker l'historique
+        loop_dt_log = []
+        loop_time_log = []
+
         try:
             for i in range(len(waypoints)):
                 sp = waypoints[i]
@@ -951,11 +994,42 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                           f"{drone_state['y']:+.3f}, {drone_state['z']:.3f}]  "
                           f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
 
+                # --- NOUVEAU : Calcul et stockage du temps de boucle ---
+                current_time = time.time()
+                loop_dt = current_time - last_cmd_time
+                
+                # Enregistrement pour le graphique
+                loop_dt_log.append(loop_dt)
+                loop_time_log.append(current_time - START)
+
+                if loop_dt > max_loop_dt:
+                    max_loop_dt = loop_dt
+                
+                last_cmd_time = current_time
+                cmd_count += 1
+                # --------------------------------------------------------
+
                 sync(i, START, 1.0 / CTRL_FREQ)
 
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted! Soft landing...")
         finally:
+
+            # --- NOUVEAU : Affichage des statistiques de communication ---
+            total_flight_time = time.time() - START
+            if total_flight_time > 0 and cmd_count > 0:
+                avg_freq = cmd_count / total_flight_time
+                print("\n" + "="*50)
+                print("[DIAGNOSTIC] --- STATISTIQUES D'ENVOI RADIO ---")
+                print(f"[DIAGNOSTIC] Commandes envoyées : {cmd_count}")
+                print(f"[DIAGNOSTIC] Temps d'exécution  : {total_flight_time:.2f} s")
+                print(f"[DIAGNOSTIC] Fréquence CIBLE  : {CTRL_FREQ} Hz")
+                print(f"[DIAGNOSTIC] Fréquence MOYENNE: {avg_freq:.2f} Hz")
+                print(f"[DIAGNOSTIC] Pire délai (max) : {max_loop_dt*1000:.1f} ms (Attendu: {1000/CTRL_FREQ:.1f} ms)")
+                print("="*50 + "\n")
+            # -------------------------------------------------------------
+
+
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
             # Uses position mode for simplicity and safety (the onboard
@@ -1018,6 +1092,12 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
                              sp_t=sp_t_arr, sp=sp_arr)
 
+            #--- NOUVEAU : Affichage du graphique de Jitter ---
+            if loop_dt_log:
+                print("[REAL] Génération du graphique de jitter...")
+                _plot_jitter(loop_time_log, loop_dt_log, CTRL_FREQ)
+            # --------------------------------------------------
+
             print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
             if HAS_PYBULLET_DRONES:
                 sim_data = run_sim(duration_sec=duration_sec, gui=False,
@@ -1046,8 +1126,8 @@ MODES:
     parser.add_argument('--mode', default='sim',
                         choices=['sim', 'attitude', 'rate', 'position'],
                         help='Control mode (default: sim)')
-    parser.add_argument('--duration', default=20, type=float,
-                        help='Flight duration in seconds (default: 20)')
+    parser.add_argument('--duration', default=10, type=float,
+                        help='Flight duration in seconds (default: 10)')
     parser.add_argument('--height', default=1.0, type=float,
                         help='Hover height in meters (default: 1.0)')
     parser.add_argument('--radius', default=0.5, type=float,
