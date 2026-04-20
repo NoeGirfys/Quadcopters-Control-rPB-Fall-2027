@@ -106,6 +106,18 @@ X_SCALE = np.array([
 
 POS_SCALE = 1.0  # for relative targets [m]
 
+# Observation noise std for sim-to-real domain randomization.
+# The NN sees state + noise; dynamics evolve on the true state.
+# Units: positions [m], velocities [m/s], angles [rad], rates [rad/s].
+OBS_NOISE_STD = torch.tensor([
+    0.01,  0.05,                              # x, vx
+    0.01,  0.05,                              # y, vy
+    0.01,  0.05,                              # z, vz
+    math.radians(2),  math.radians(10),       # phi, p
+    math.radians(2),  math.radians(10),       # theta, q
+    math.radians(2),  math.radians(10),       # psi, r
+], dtype=torch.float32)
+
 # ---- Cost weights ----
 Q_DIAG = np.array([
     1.0, 1.0, 1.0, 1.0, 1.0, 1.0,                  # pos & vel (1/max^2, max=1)
@@ -516,19 +528,20 @@ def compute_relative_targets(state, T, target_pos=None):
     return rel
 
 
-def rollout(policy, x0, n_chunks, tau_div=None, log_extra=False):
+def rollout(policy, x0, n_chunks, tau_div=None, log_extra=False, obs_noise_std=None):
     """Full rollout: n_chunks * T NN steps, each = 5 PID steps.
 
     Args:
-        log_extra: if True, also return A (NN actions) and R (motor RPMs).
-                   Keep False during training to avoid memory overhead.
+        log_extra:      if True, also return A (NN actions) and R (motor RPMs).
+        obs_noise_std:  (12,) tensor of per-channel noise std, or None.
+                        When set, the NN receives state + Gaussian noise at each
+                        chunk query while dynamics evolve on the true state.
+                        This is sim-to-real domain randomization.
 
     Returns:
         X : (B, n_chunks*T, 12) state trajectory at 100 Hz.
-        A : (B, n_chunks*T, 4)  NN actions [thrust_u16, roll°, pitch°, yaw_rate°/s]
-            — only when log_extra=True
-        R : (B, n_chunks*T, 4)  motor RPMs [M1..M4]
-            — only when log_extra=True
+        A : (B, n_chunks*T, 4)  NN actions — only when log_extra=True
+        R : (B, n_chunks*T, 4)  motor RPMs  — only when log_extra=True
     """
     T = policy.T
     B = x0.shape[0]
@@ -545,11 +558,14 @@ def rollout(policy, x0, n_chunks, tau_div=None, log_extra=False):
     step_idx = 0
 
     for chunk in range(n_chunks):
-        # Compute relative targets from current position
-        targets_rel = compute_relative_targets(state, T)
+        # Noisy observation: NN sees state + noise, dynamics use true state
+        if obs_noise_std is not None:
+            state_obs = state + torch.randn_like(state) * obs_noise_std
+        else:
+            state_obs = state
 
-        # Query NN once for the entire chunk
-        actions = policy(state, targets_rel)   # (B, T, 4)
+        targets_rel = compute_relative_targets(state_obs, T)
+        actions = policy(state_obs, targets_rel)   # (B, T, 4)
 
         for t in range(T):
             nn_action = actions[:, t, :]
@@ -638,7 +654,7 @@ class GracefulKiller:
 
 def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
           half_side=0.3, terminal_weight=10.0,
-          tau_start=0.5, tau_end=2.0, device="cpu"):
+          tau_start=0.5, tau_end=2.0, obs_noise_scale=1.0, device="cpu"):
     """Train the concurrent NN controller with curriculum learning."""
 
     killer = GracefulKiller()
@@ -655,6 +671,15 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
     policy = ConcurrentPolicyMLP(T=T, hidden=hidden).to(device)
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
+
+    obs_noise = (OBS_NOISE_STD * obs_noise_scale).to(device) if obs_noise_scale > 0 else None
+    if obs_noise is not None:
+        print(f"[Config] Obs noise scale={obs_noise_scale}  "
+              f"gyro_std={math.degrees(obs_noise[7].item()):.1f}°/s  "
+              f"vel_std={obs_noise[1].item():.3f}m/s  "
+              f"att_std={math.degrees(obs_noise[6].item()):.1f}°")
+    else:
+        print("[Config] Obs noise disabled")
 
     cube_pts = generate_cube_points(half_side)
     x0 = make_x0_batch(cube_pts, device=device)
@@ -689,7 +714,7 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
         progress = ep / max(epochs - 1, 1)
         tau_div = tau_start + (tau_end - tau_start) * progress
 
-        X = rollout(policy, x0, n_chunks, tau_div=tau_div)
+        X = rollout(policy, x0, n_chunks, tau_div=tau_div, obs_noise_std=obs_noise)
         loss = trajectory_cost(X, terminal_weight)
 
         opt.zero_grad()
@@ -897,6 +922,8 @@ if __name__ == "__main__":
                         help="Curriculum: initial divergence threshold [m]")
     parser.add_argument("--tau_end", type=float, default=2.0,
                         help="Curriculum: final divergence threshold [m]")
+    parser.add_argument("--obs_noise_scale", type=float, default=1.0,
+                        help="Scale factor for observation noise (0=off, 1=default, 2=double)")
     parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
@@ -910,6 +937,7 @@ if __name__ == "__main__":
         t_chunk=args.t_chunk, t_sim=args.t_sim,
         half_side=args.half_side, terminal_weight=10.0,
         tau_start=args.tau_start, tau_end=args.tau_end,
+        obs_noise_scale=args.obs_noise_scale,
         device=device)
 
     # Evaluate on random test points
