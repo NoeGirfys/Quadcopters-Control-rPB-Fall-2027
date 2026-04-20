@@ -87,7 +87,8 @@ from crazyflie_firmware.firmware import (
 from circle_comparison_simu_and_real.cf_firmware_pid_sim import (
     MotorDynamicsFilter,
     obs_to_firmware_state,
-    pwm_to_rpm
+    pwm_to_rpm,
+    push_pid_gains_to_drone,
 )
 from crazyflie_firmware.constants import (
     ATTITUDE_RATE,
@@ -641,6 +642,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 duration_sec: float = 15, takeoff_max_duration: float = 3.0,
                 hover_duration: float = 0.0,
                 land_duration: float = None,
+                push_gains: bool = True,
                 device: str = "cpu"):
     """Run NN controller on a real Crazyflie via Crazyradio.
 
@@ -668,6 +670,9 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
     with SyncCrazyflie(uri, cf=Crazyflie(rw_cache='./cache')) as scf:
         cf = scf.cf
         print("[REAL] Connected!")
+
+        if push_gains:
+            push_pid_gains_to_drone(cf)
 
         # ---- Flow deck settings -----
         #cf.param.set_value('motion.adaptive', '0')
@@ -991,6 +996,8 @@ MODES:
     parser.add_argument('--land-duration', default=None, type=float,
                         help='Landing duration [s] (default: None). '
                              'Used identically in sim and real modes.')
+    parser.add_argument('--no-push-gains', dest='push_gains', action='store_false',
+                        help='Skip pushing finetuned PID gains to the drone (real mode only)')
     parser.add_argument('--no-plot', dest='plot', action='store_false',
                         help='Disable post-flight plots')
     args = parser.parse_args()
@@ -1012,6 +1019,7 @@ MODES:
                     duration_sec=args.duration, takeoff_max_duration=args.takeoff_max_duration,
                     hover_duration=args.hover_duration,
                     land_duration=args.land_duration,
+                    push_gains=args.push_gains,
                     device=device)
 
 
