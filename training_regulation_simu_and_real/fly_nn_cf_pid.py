@@ -758,6 +758,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 
         START = time.time()
         flight_start = START
+        nn_cmd_log = []
 
         try:
             print(f"[REAL] Phase 0: PID takeoff to {pid_target} "
@@ -823,6 +824,14 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 thrust, roll_deg, pitch_deg, yaw_rate = \
                     query_nn_chunk(policy, nn_state, nn_target, device)[0]
 
+                nn_cmd_log.append({
+                    't': elapsed_phases01 + i / NN_FREQ,
+                    'thrust': float(thrust),
+                    'roll': float(roll_deg),
+                    'pitch': float(pitch_deg),
+                    'yaw_rate': float(yaw_rate),
+                })
+
                 # send_setpoint: (roll_deg, pitch_deg, yaw_rate_deg/s,
                 #                 thrust_uint16)
                 cf.commander.send_setpoint(
@@ -878,7 +887,7 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
         # ---- Post-flight plot -----
         if real_log:
             _plot_real_nn(real_log, pid_target, nn_target,
-                          elapsed_phase0, elapsed_phases01)
+                          elapsed_phase0, elapsed_phases01, nn_cmd_log)
 
 
 # ===================================================================
@@ -886,7 +895,8 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
 # ===================================================================
 
 def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
-                  elapsed_phase0: float, elapsed_phases01: float):
+                  elapsed_phase0: float, elapsed_phases01: float,
+                  nn_cmd_log: list = None):
     """Plot real drone NN control results."""
     try:
         import matplotlib
@@ -901,15 +911,18 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     vel = np.array([[e['vx'], e['vy'], e['vz']] for e in real_log])
     rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True)
+    fig, axes = plt.subplots(3, 2, figsize=(14, 11), sharex=True)
     fig.suptitle('NN Controller — Real Drone', fontsize=14)
 
-    for ax in axes.flat:
+    def _add_phase_lines(ax):
         if elapsed_phases01 > elapsed_phase0:
             ax.axvline(elapsed_phase0, color='orange', ls=':', alpha=0.5,
                        label='PID\u2192HOVER')
         ax.axvline(elapsed_phases01, color='red', ls=':', alpha=0.5,
                    label='HOVER\u2192NN' if elapsed_phases01 > elapsed_phase0 else 'PID\u2192NN')
+
+    for ax in axes.flat:
+        _add_phase_lines(ax)
 
     ax = axes[0, 0]
     ax.plot(t, pos[:, 0], label='x')
@@ -945,9 +958,32 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     ax = axes[1, 1]
     ax.plot(t, rpy[:, 2], label='yaw', color='green')
     ax.set_ylabel('Angle [deg]')
-    ax.set_xlabel('Time [s]')
     ax.legend(fontsize=7)
     ax.set_title('Yaw')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2, 0]
+    if nn_cmd_log:
+        t_nn = np.array([e['t'] for e in nn_cmd_log])
+        ax.plot(t_nn, [e['roll'] for e in nn_cmd_log], label='NN roll [deg]', alpha=0.8)
+        ax.plot(t_nn, [e['pitch'] for e in nn_cmd_log], label='NN pitch [deg]', alpha=0.8)
+        ax.plot(t_nn, [e['yaw_rate'] for e in nn_cmd_log], label='NN yaw_rate [deg/s]', alpha=0.6)
+    ax.set_ylabel('NN attitude cmd')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7)
+    ax.set_title('NN Outputs (attitude)')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[2, 1]
+    if nn_cmd_log:
+        t_nn = np.array([e['t'] for e in nn_cmd_log])
+        ax.plot(t_nn, [e['thrust'] for e in nn_cmd_log], color='black', label='NN thrust')
+        ax.axhline(HOVER_THRUST_U16, ls=':', color='gray',
+                   label=f'hover={HOVER_THRUST_U16:.0f}')
+    ax.set_ylabel('Thrust [uint16]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7)
+    ax.set_title('NN Thrust')
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
