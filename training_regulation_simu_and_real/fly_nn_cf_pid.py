@@ -818,14 +818,40 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             print(f"[REAL] Phase 2: NN control to {nn_target} for "
                   f"{nn_duration:.0f}s...")
 
-            phase2_start = time.time()
+            def _sync_precise(target: float) -> None:
+                """Wait until target (time.perf_counter). Sleep most of the
+                remaining time, then busy-wait the last 2 ms for accuracy.
+                Requires timeBeginPeriod(1) on Windows so that sleep(~8ms)
+                actually sleeps ~8ms instead of rounding to 15.6ms."""
+                remaining = target - time.perf_counter()
+                if remaining > 0.002:
+                    time.sleep(remaining - 0.002)
+                while time.perf_counter() < target:
+                    pass
+
+            # timeBeginPeriod(1): set Windows timer resolution to 1 ms so that
+            # time.sleep() is accurate. Without this, any sleep < 15.6 ms
+            # rounds up to one full Windows tick and overshoots the target.
+            try:
+                import ctypes
+                ctypes.windll.winmm.timeBeginPeriod(1)
+                _win_timer_set = True
+            except Exception:
+                _win_timer_set = False
+
+            nn_dt = 1.0 / NN_FREQ
+            phase2_start = time.perf_counter()
             for i in range(nn_steps):
+                t_iter_wall = time.time()
+                target_t = phase2_start + (i + 1) * nn_dt
+
                 nn_state = drone_state_to_nn_state(drone_state)
                 thrust, roll_deg, pitch_deg, yaw_rate = \
                     query_nn_chunk(policy, nn_state, nn_target, device)[0]
 
                 nn_cmd_log.append({
                     't': elapsed_phases01 + i / NN_FREQ,
+                    't_wall': t_iter_wall,
                     'thrust': float(thrust),
                     'roll': float(roll_deg),
                     'pitch': float(pitch_deg),
@@ -850,7 +876,10 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                           f"err={err:.4f}m  thrust={thrust:.0f}  "
                           f"r={roll_deg:+.1f} p={pitch_deg:+.1f}")
 
-                sync(i, phase2_start, 1.0 / NN_FREQ)
+                _sync_precise(target_t)
+
+            if _win_timer_set:
+                ctypes.windll.winmm.timeEndPeriod(1)
 
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted!")
@@ -989,6 +1018,46 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     plt.tight_layout()
     plt.savefig('nn_real_results.png', dpi=150)
     print("[PLOT] Saved to nn_real_results.png")
+
+    # ---- Timing plot ------------------------------------------------
+    if nn_cmd_log and 't_wall' in nn_cmd_log[0]:
+        t_wall = np.array([e['t_wall'] for e in nn_cmd_log])
+        t_nominal = np.array([e['t'] for e in nn_cmd_log])
+        # Drift = écart entre le temps réel et le timing théorique
+        drift_ms = (t_wall - t_wall[0] - (t_nominal - t_nominal[0])) * 1000.0
+
+        fig2, axes2 = plt.subplots(2, 1, figsize=(12, 6))
+        fig2.suptitle('NN Send Timing — Real Drone (nominal: 10 ms @ 100 Hz)', fontsize=13)
+
+        ax = axes2[0]
+        ax.plot(t_nominal, drift_ms, lw=0.8, alpha=0.9, label='drift vs nominal [ms]')
+        ax.axhline(0, color='red', ls='--', lw=1.2, label='perfect timing')
+        ax.set_ylabel('Drift [ms]')
+        ax.set_xlabel('Time [s]')
+        ax.legend(fontsize=8)
+        ax.set_title('Cumulative drift vs nominal 100 Hz timeline')
+        ax.grid(True, alpha=0.3)
+
+        ax = axes2[1]
+        intervals_ms = np.diff(t_wall) * 1000.0
+        ax.plot(t_nominal[1:], intervals_ms, lw=0.6, alpha=0.7, label='inter-send interval [ms]')
+        ax.axhline(1000.0 / NN_FREQ, color='red', ls='--', lw=1.2,
+                   label=f'nominal {1000.0/NN_FREQ:.1f} ms')
+        ax.set_ylabel('Interval [ms]')
+        ax.set_xlabel('Time [s]')
+        ax.legend(fontsize=8)
+        ax.set_title('Inter-send interval (jitter)')
+        ax.grid(True, alpha=0.3)
+
+        fig2.tight_layout()
+        fig2.savefig('nn_real_timing.png', dpi=150)
+        print("[PLOT] Saved to nn_real_timing.png")
+        print(f"[TIMING] n={len(intervals_ms)}  "
+              f"mean={np.mean(intervals_ms):.2f} ms  "
+              f"std={np.std(intervals_ms):.2f} ms  "
+              f"min={np.min(intervals_ms):.2f} ms  "
+              f"max={np.max(intervals_ms):.2f} ms  "
+              f"final_drift={drift_ms[-1]:.1f} ms")
     #plt.show()
 
 
