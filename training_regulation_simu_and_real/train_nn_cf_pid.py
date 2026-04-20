@@ -636,7 +636,7 @@ class GracefulKiller:
             print("\n[Arrêt Forcé] Double Ctrl+C détecté. Arrêt immédiat !")
             sys.exit(1)
 
-def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.2, t_sim=2.0,
+def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
           half_side=0.3, terminal_weight=10.0,
           tau_start=0.5, tau_end=2.0, device="cpu"):
     """Train the concurrent NN controller with curriculum learning."""
@@ -887,13 +887,13 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--hidden", type=int, default=64)
-    parser.add_argument("--t_chunk", type=float, default=0.2,
+    parser.add_argument("--t_chunk", type=float, default=0.01,
                         help="Chunk duration in seconds (T = t_chunk * 100)")
     parser.add_argument("--t_sim", type=float, default=2.0,
                         help="Total simulation duration in seconds")
-    parser.add_argument("--half_side", type=float, default=0.3,
+    parser.add_argument("--half_side", type=float, default=0.5,
                         help="Half-side of initial position cube [m]")
-    parser.add_argument("--tau_start", type=float, default=0.5,
+    parser.add_argument("--tau_start", type=float, default=0.8,
                         help="Curriculum: initial divergence threshold [m]")
     parser.add_argument("--tau_end", type=float, default=2.0,
                         help="Curriculum: final divergence threshold [m]")
