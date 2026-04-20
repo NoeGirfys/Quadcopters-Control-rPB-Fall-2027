@@ -595,23 +595,25 @@ def rollout(policy, x0, n_chunks, tau_div=None, log_extra=False, obs_noise_std=N
 # 8. Cost Function
 # =====================================================================
 
-def trajectory_cost(X, terminal_weight=10.0, pos_weight=10.0):
+def trajectory_cost(X, terminal_weight=50.0, pos_weight=10.0, z_weight=1.0):
     """Quadratic cost: position-dominant + small state penalty.
 
-    pos_weight scales the position terms relative to velocity/angle terms.
-    This encourages the NN to actually move toward target, not just hover.
+    pos_weight scales all position terms; z_weight adds an extra multiplier
+    on z only (index 4 in state, index 2 in [x,y,z] terminal slice).
+    Useful when z has a persistent steady-state error due to gravity.
     """
     Q = torch.as_tensor(Q_DIAG, dtype=X.dtype, device=X.device)
 
-    # Scale position terms more heavily
     Q_scaled = Q.clone()
     Q_scaled[[0, 2, 4]] *= pos_weight   # x, y, z positions
+    Q_scaled[4] *= z_weight             # extra penalty on z
 
     cost_running = (X**2 * Q_scaled).sum(dim=2).mean(dim=0).sum()
 
     if terminal_weight > 0:
-        pos_T = X[:, -1, [0, 2, 4]]
-        cost_running += terminal_weight * (pos_T**2).sum(dim=1).mean()
+        pos_T = X[:, -1, [0, 2, 4]]   # (B, 3) [x, y, z]
+        z_scale = torch.tensor([1.0, 1.0, z_weight], dtype=X.dtype, device=X.device)
+        cost_running += terminal_weight * (pos_T**2 * z_scale).sum(dim=1).mean()
 
     return cost_running
 
@@ -653,7 +655,7 @@ class GracefulKiller:
             sys.exit(1)
 
 def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
-          half_side=0.3, terminal_weight=10.0,
+          half_side=0.3, terminal_weight=10.0, z_weight=1.0,
           tau_start=0.5, tau_end=2.0, obs_noise_scale=1.0, device="cpu"):
     """Train the concurrent NN controller with curriculum learning."""
 
@@ -715,7 +717,7 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
         tau_div = tau_start + (tau_end - tau_start) * progress
 
         X = rollout(policy, x0, n_chunks, tau_div=tau_div, obs_noise_std=obs_noise)
-        loss = trajectory_cost(X, terminal_weight)
+        loss = trajectory_cost(X, terminal_weight, z_weight=z_weight)
 
         opt.zero_grad()
         loss.backward()
@@ -918,12 +920,16 @@ if __name__ == "__main__":
                         help="Total simulation duration in seconds")
     parser.add_argument("--half_side", type=float, default=0.5,
                         help="Half-side of initial position cube [m]")
+    parser.add_argument("--terminal_weight", type=float, default=50.0,
+                        help="Weight on terminal position cost (default: 50)")
     parser.add_argument("--tau_start", type=float, default=0.8,
                         help="Curriculum: initial divergence threshold [m]")
     parser.add_argument("--tau_end", type=float, default=2.0,
                         help="Curriculum: final divergence threshold [m]")
     parser.add_argument("--obs_noise_scale", type=float, default=1.0,
                         help="Scale factor for observation noise (0=off, 1=default, 2=double)")
+    parser.add_argument("--z_weight", type=float, default=1.0,
+                        help="Extra cost multiplier on z position (running + terminal)")
     parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
@@ -935,7 +941,8 @@ if __name__ == "__main__":
     policy = train(
         epochs=args.epochs, lr=args.lr, hidden=args.hidden,
         t_chunk=args.t_chunk, t_sim=args.t_sim,
-        half_side=args.half_side, terminal_weight=10.0,
+        half_side=args.half_side, terminal_weight=args.terminal_weight,
+        z_weight=args.z_weight,
         tau_start=args.tau_start, tau_end=args.tau_end,
         obs_noise_scale=args.obs_noise_scale,
         device=device)
