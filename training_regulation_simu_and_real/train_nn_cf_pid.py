@@ -809,18 +809,16 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
     B = X_np.shape[0]
     T_total = X_np.shape[1]
     t_axis = np.arange(1, T_total + 1) / NN_FREQ
+    t_max = T_total / NN_FREQ
     n_traj = min(B, 10)
 
-    fig, axes = plt.subplots(6, 3, figsize=(15, 20), sharex=True)
-    fig.suptitle("Concurrent NN Controller with CF Firmware PID", fontsize=13)
+    fig, axes = plt.subplots(6, 3, figsize=(15, 20))
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.97, bottom=0.04,
+                        hspace=0.65, wspace=0.32)
 
     def _plot_row(row, data_list, ylabel_list, title_list, hline=None):
-        """Plot one row: data_list[j] is (B, T) array for subplot (row, j), or None to skip."""
         for j, (data, ylabel, title) in enumerate(zip(data_list, ylabel_list, title_list)):
             ax = axes[row, j]
-            if data is None:
-                ax.set_visible(False)
-                continue
             for b in range(n_traj):
                 ax.plot(t_axis, data[b], linewidth=0.7, alpha=0.65,
                         label=labels[b] if (row == 0 and j == 0) else None)
@@ -828,6 +826,8 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
                 ax.axhline(hline, color="k", linewidth=0.6, linestyle="--", alpha=0.5)
             ax.set_ylabel(ylabel, fontsize=8)
             ax.set_title(title, fontsize=8)
+            ax.set_xlabel("Time (s)", fontsize=7)
+            ax.set_xlim(0, t_max)
             ax.grid(True, alpha=0.3)
 
     # Row 0 — positions [m]
@@ -868,11 +868,15 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
                        linestyle=":", label=f"hover≈{HOVER_THRUST_U16:.0f}")
     axes[4, 0].legend(fontsize=6)
 
-    # Row 5 — NN yaw_rate + RPMs
-    _plot_row(5,
-              [A_np[:, :, 3], None, None],
-              ["yaw_rate (deg/s)", "", ""],
-              ["NN Yaw rate setpoint", "", ""])
+    # Row 5 — NN yaw_rate
+    ax50 = axes[5, 0]
+    for b in range(n_traj):
+        ax50.plot(t_axis, A_np[b, :, 3], linewidth=0.7, alpha=0.65)
+    ax50.set_ylabel("yaw_rate (deg/s)", fontsize=8)
+    ax50.set_title("NN Yaw rate setpoint", fontsize=8)
+    ax50.set_xlabel("Time (s)", fontsize=7)
+    ax50.set_xlim(0, t_max)
+    ax50.grid(True, alpha=0.3)
 
     # RPM M1+M2 in (5,1), M3+M4 in (5,2)
     motor_colors = ["C0", "C1", "C2", "C3"]
@@ -883,21 +887,19 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
                     color=motor_colors[m_idx], label=motor_name if b == 0 else None)
     axes[5, 1].set_title("RPM M1 & M2", fontsize=8)
     axes[5, 1].set_ylabel("RPM", fontsize=8)
+    axes[5, 1].set_xlabel("Time (s)", fontsize=7)
+    axes[5, 1].set_xlim(0, t_max)
     axes[5, 1].legend(fontsize=6)
     axes[5, 1].grid(True, alpha=0.3)
     axes[5, 2].set_title("RPM M3 & M4", fontsize=8)
     axes[5, 2].set_ylabel("RPM", fontsize=8)
+    axes[5, 2].set_xlabel("Time (s)", fontsize=7)
+    axes[5, 2].set_xlim(0, t_max)
     axes[5, 2].legend(fontsize=6)
     axes[5, 2].grid(True, alpha=0.3)
-    axes[5, 5 - 5].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
+    axes[5, 0].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
     axes[5, 1].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
     axes[5, 2].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
-
-    # x-label only on bottom row
-    for j in range(3):
-        axes[5, j].set_xlabel("Time (s)", fontsize=8)
-
-    fig.tight_layout()
     fig.savefig(filename, dpi=120)
     plt.close(fig)
     if verbose:
@@ -926,7 +928,7 @@ if __name__ == "__main__":
                         help="Curriculum: initial divergence threshold [m]")
     parser.add_argument("--tau_end", type=float, default=2.0,
                         help="Curriculum: final divergence threshold [m]")
-    parser.add_argument("--obs_noise_scale", type=float, default=1.0,
+    parser.add_argument("--obs_noise_scale", type=float, default=2.0,
                         help="Scale factor for observation noise (0=off, 1=default, 2=double)")
     parser.add_argument("--z_weight", type=float, default=1.0,
                         help="Extra cost multiplier on z position (running + terminal)")
