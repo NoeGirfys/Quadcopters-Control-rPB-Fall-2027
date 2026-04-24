@@ -7,13 +7,11 @@ This script replicates the EXACT PID control pipeline from the Crazyflie
 firmware (crazyflie-firmware-master), and uses it to fly a drone
 (takeoff → circle → land) inside the gym-pybullet-drones simulator.
 
-An optional --mode argument selects how much of the pipeline runs on the PC
-vs. on the real Crazyflie via Crazyradio:
+An optional --mode argument selects the target:
 
   sim        – Full pipeline in Python → RPMs → PyBullet           (default)
-  attitude   – pos + vel PIDs on PC    → send_setpoint (att+thrust to drone)
-  rate       – pos + vel + att PIDs    → send_setpoint in rate mode
-  position   – trajectory only         → send_position_setpoint (all PIDs on drone)
+  position   – OptiTrack mocap → extpose to drone; PC streams
+               send_position_setpoint (all PIDs on drone)
 
 Firmware source references are given as comments of the form:
   # [FW] path/to/file.c:LINE
@@ -57,6 +55,17 @@ try:
     HAS_CFLIB = True
 except ImportError:
     HAS_CFLIB = False
+
+# ---------------------------------------------------------------------------
+# libmotioncapture (OptiTrack streaming for real drone, position mode)
+# ---------------------------------------------------------------------------
+try:
+    import motioncapture
+    HAS_MOCAP = True
+except ImportError:
+    HAS_MOCAP = False
+
+import threading
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -276,8 +285,14 @@ def pwm_to_rpm(pwm_values, kf, truncate_8bit=True):
 #  Trajectory generation  (takeoff → circle → land)
 # ===================================================================
 
-def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
+def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5,
+                        start_xy=(0.0, 0.0)):
     """Generate a smooth takeoff → circle → landing trajectory.
+
+    The whole trajectory is rigidly translated so that takeoff and landing
+    happen at (start_xy[0], start_xy[1]) in the world frame.  This lets the
+    real drone start from an arbitrary mocap position without jerking
+    toward the origin on takeoff.
 
     Returns
     -------
@@ -293,26 +308,27 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     circle_steps   = int(ctrl_freq * circle_time)
     landing_steps  = n_steps - takeoff_steps - circle_steps
 
+    ox, oy = start_xy   # trajectory origin in world frame
+
     # --- Phase 1: Takeoff (vertical climb to hover_height) ---
     for i in range(takeoff_steps):
         t = i / takeoff_steps
         z = hover_height * t
-        waypoints[i] = [0.0, 0.0, z, 0.0]
+        waypoints[i] = [ox, oy, z, 0.0]
 
     # --- Phase 2: Circle at hover_height ---
     for i in range(circle_steps):
         t = i / circle_steps
         angle = t * 2 * math.pi   # one full circle
-        x = radius * math.cos(angle) - radius  # start at (0,0)
+        x = radius * math.cos(angle) - radius  # starts at (0,0) relative
         y = radius * math.sin(angle)
-        waypoints[takeoff_steps + i] = [x, y, hover_height, 0.0]
+        waypoints[takeoff_steps + i] = [ox + x, oy + y, hover_height, 0.0]
 
-    # --- Phase 3: Landing (back to center, descend) ---
-    # First, the circle ends near (0, 0).  Descend smoothly.
+    # --- Phase 3: Landing (back to origin, descend) ---
     for i in range(landing_steps):
         t = i / landing_steps
         z = hover_height * (1.0 - t)
-        waypoints[takeoff_steps + circle_steps + i] = [0.0, 0.0, z, 0.0]
+        waypoints[takeoff_steps + circle_steps + i] = [ox, oy, z, 0.0]
 
     return waypoints
 
@@ -376,7 +392,7 @@ def obs_to_firmware_state(obs):
 # ===================================================================
 
 def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
-            simulate_flow_deck=False):
+            simulate_flow_deck=False, setpoint_freq_hz=100):
     """Run the full firmware PID pipeline in PyBullet simulation.
 
     Parameters
@@ -385,6 +401,13 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
         If True, replace the perfect PyBullet state with a simulated Flow
         deck v2 estimate (noise + delay) before feeding it to the position
         PID.  This reproduces the oscillations seen on the real drone.
+    setpoint_freq_hz : float
+        Rate at which a new position setpoint is handed to the firmware PID,
+        matching the radio packet rate on the real drone (default 10 Hz).
+        The internal PID still runs at CTRL_FREQ (500 Hz); between setpoint
+        updates the controller holds the last received setpoint — exactly
+        the behavior of the real firmware between two send_position_setpoint
+        packets.
     """
     if not HAS_PYBULLET_DRONES:
         print("ERROR: gym-pybullet-drones not found. Install it first.")
@@ -436,16 +459,21 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
     else:
         flow_deck = None
 
-    # Generate trajectory
-    waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
-                                    hover_height=hover_height, radius=radius)
-    n_steps = len(waypoints)
+    # Generate the setpoint trajectory at the radio packet rate, then run
+    # the sim at CTRL_FREQ — each setpoint is held for CTRL_FREQ/setpoint_freq_hz
+    # PID cycles, mirroring the real drone where the firmware keeps the last
+    # send_position_setpoint value until the next radio packet arrives.
+    setpoint_waypoints = generate_trajectory(int(setpoint_freq_hz), duration_sec,
+                                             hover_height=hover_height, radius=radius)
+    n_steps = int(CTRL_FREQ * duration_sec)
+    n_sp    = len(setpoint_waypoints)
 
-    print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz")
+    print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz, "
+          f"Setpoint freq: {setpoint_freq_hz} Hz")
     print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {HOVER_RPM:.1f}, KF: {KF:.4e}")
     print(f"[SIM] Firmware THRUST_MAX/motor: {CF2_THRUST_MAX_PER_MOTOR*1000:.1f} mN, "
           f"RPM at THRUST_MAX: {math.sqrt(CF2_THRUST_MAX_PER_MOTOR/KF):.1f}")
-    print(f"[SIM] Trajectory: {n_steps} steps, {duration_sec}s")
+    print(f"[SIM] Trajectory: {n_steps} PID steps ({n_sp} setpoints), {duration_sec}s")
     print(f"[SIM] Phases: takeoff 3s → circle {duration_sec-6}s → land 3s")
 
     action = np.full((1, 4), HOVER_RPM)
@@ -475,8 +503,10 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
         else:
             pos_ctrl, vel_ctrl = pos, vel
 
-        # --- Get setpoint ---
-        sp = waypoints[i]
+        # --- Get setpoint (held between radio packets, like the real drone) ---
+        # Each setpoint is kept for CTRL_FREQ/setpoint_freq_hz PID cycles.
+        sp_idx = min(i * n_sp // n_steps, n_sp - 1)
+        sp = setpoint_waypoints[sp_idx]
         setpoint_pos      = sp[0:3]
         setpoint_yaw_rate = sp[3]
 
@@ -763,46 +793,115 @@ def push_pid_gains_to_drone(cf):
 
 
 # ===================================================================
-#  MAIN — Real drone modes
+#  OptiTrack streaming thread  (libmotioncapture → send_extpose)
 # ===================================================================
 
-def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
+def _mocap_streamer(cf, mocap_ip, rigid_body, stop_event, shared=None,
+                    rate_hz=None):
+    """Stream OptiTrack rigid-body pose to the Crazyflie via send_extpose.
+
+    Motive must be configured with:
+      • Data Streaming pane → Broadcast ON, Up Axis = Z, Multicast ON,
+        Rigid Bodies ON, Unlabeled Markers OFF.
+      • A rigid body named exactly `rigid_body` with streaming enabled.
+
+    The shared dict is always updated at Motive's native rate (so the
+    start-of-flight handshake converges quickly).  Packets sent over the
+    radio are optionally throttled to `rate_hz` to save CRTP bandwidth;
+    `rate_hz=None` sends every frame.
+    """
+    try:
+        mc = motioncapture.MotionCaptureOptitrack(mocap_ip)
+    except Exception as e:
+        print(f"[MOCAP] Failed to connect to Motive at {mocap_ip}: {e}")
+        stop_event.set()
+        return
+
+    rate_msg = f"throttled to {rate_hz:.0f} Hz" if rate_hz else "every frame"
+    print(f"[MOCAP] Connected to Motive at {mocap_ip} — tracking '{rigid_body}' "
+          f"({rate_msg})")
+
+    period = (1.0 / rate_hz) if rate_hz else 0.0
+    last_sent = 0.0
+    n_frames, n_sent, n_missing = 0, 0, 0
+    while not stop_event.is_set():
+        try:
+            mc.waitForNextFrame()
+        except Exception as e:
+            print(f"[MOCAP] Stream error: {e}")
+            break
+        if rigid_body not in mc.rigidBodies:
+            n_missing += 1
+            if n_missing in (1, 100, 500):
+                print(f"[MOCAP] Rigid body '{rigid_body}' not visible "
+                      f"({n_missing} missing frames)")
+            continue
+        rb = mc.rigidBodies[rigid_body]
+        x, y, z = rb.position
+        qx, qy, qz, qw = rb.rotation
+        n_frames += 1
+        if shared is not None:
+            shared['x'], shared['y'], shared['z'] = x, y, z
+            shared['count'] = n_frames
+
+        # Optional radio-side throttle
+        now = time.time()
+        if period > 0 and (now - last_sent) < period:
+            continue
+        cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
+        last_sent = now
+        n_sent += 1
+
+    print(f"[MOCAP] Stopped ({n_frames} frames from Motive, "
+          f"{n_sent} sent to drone, {n_missing} missed).")
+
+
+# ===================================================================
+#  MAIN — Real drone (position mode, OptiTrack-fed Kalman)
+# ===================================================================
+
+def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
              duration_sec=15, hover_height=0.5, radius=0.5,
-             push_gains=False):
-    """Run with a real Crazyflie drone.
+             push_gains=False,
+             mocap_ip="192.168.1.100", rigid_body="cf1",
+             mocap_rate_hz=None):
+    """Run with a real Crazyflie drone in position mode, fed by OptiTrack.
+
+    The PC only streams pose from Motive (via libmotioncapture) to the
+    drone; the drone runs all PIDs internally on its Kalman estimate.
 
     Parameters
     ----------
-    mode : str
-        'attitude' — PC runs pos+vel PIDs, sends attitude+thrust to drone
-        'rate'     — PC runs pos+vel+att PIDs, sends rate+thrust to drone
-        'position' — Sends position setpoint, drone runs all PIDs
     uri : str
-        Crazyflie radio URI
+        Crazyflie radio URI.
     push_gains : bool
         If True, overwrite the drone's onboard PID gains with the Python
         constants defined at the top of this file before flying.
+    mocap_ip : str
+        IP address of the Motive PC on the OptiTrack network.
+    rigid_body : str
+        Exact name of the Crazyflie rigid body configured in Motive.
     """
     if not HAS_CFLIB:
         print("ERROR: cflib not found. pip install cflib")
         sys.exit(1)
+    if not HAS_MOCAP:
+        print("ERROR: motioncapture not found. pip install motioncapture")
+        sys.exit(1)
 
     cflib.crtp.init_drivers()
 
-    # Control rate for the PC-side loop
-    if mode == "position":
-        CTRL_FREQ = 10     # position setpoints don't need high rate
-    else:
-        CTRL_FREQ = 100    # attitude / rate commands: 100 Hz is typical
+    # Send send_position_setpoint at 100 Hz — matches the Crazyflie
+    # ecosystem convention (crazyswarm, Bitcraze examples) and keeps each
+    # setpoint step small enough to avoid the high-frequency ringing that
+    # appears at 10 Hz.  Bandwidth usage: ~20 B × 100 Hz = 2 kB/s (well
+    # within the CRTP link's ~100 kB/s).
+    CTRL_FREQ = 100
 
-    waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
-                                    hover_height=hover_height, radius=radius)
+    # Trajectory is generated later, after we know the mocap start position,
+    # so that takeoff happens at the drone's actual location.
 
-    # We only need the position controller for 'attitude' and 'rate' modes
-    pos_ctrl = CrazyfliePositionController() if mode != "position" else None
-    att_ctrl = CrazyflieAttitudeController() if mode == "rate"    else None
-
-    print(f"[REAL] Mode: {mode}")
+    print(f"[REAL] Mode: position (OptiTrack-fed Kalman)")
     print(f"[REAL] Connecting to {uri} ...")
 
     cache_dir = os.path.join(SCRIPT_DIR, 'cache')
@@ -810,30 +909,25 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         cf = scf.cf
         print("[REAL] Connected!")
 
-        # On s'assure de désactiver l'écart-type adaptatif
-        cf.param.set_value('motion.adaptive', '0')
-
-        # On augmente l'écart-type fixe du Flowdeck (par défaut à 2.0)
-        # La valeur de 10.0 est un bon point de départ pour lisser les oscillations selon les tests de Bitcraze
-        cf.param.set_value('motion.flowStdFixed', '10.0')
+        # ─── Estimator & external-position configuration ──────────────
+        # Force the Kalman filter (required for mocap-based localization)
+        # and set the standard deviation of the incoming extpose packets.
+        #   stabilizer.estimator: 1 = complementary, 2 = Kalman
+        #   locSrv.extPosStdDev  : position noise std [m]
+        #   locSrv.extQuatStdDev : quaternion noise std [rad]
+        cf.param.set_value('stabilizer.estimator', '2')
+        cf.param.set_value('locSrv.extPosStdDev',  '0.001')
+        cf.param.set_value('locSrv.extQuatStdDev', '0.0045')
 
         if push_gains:
             push_pid_gains_to_drone(cf)
 
-        # For rate mode, disable the onboard stabilizer's attitude PID
-        # so send_setpoint sends rate commands directly.
-        # [FW] The firmware checks flightmode.stabModeRoll/Pitch/Yaw params.
-        if mode == "rate":
-            cf.param.set_value('flightmode.stabModeRoll',  '0')
-            cf.param.set_value('flightmode.stabModeRoll',  '0')
-            cf.param.set_value('flightmode.stabModePitch', '0')
-            cf.param.set_value('flightmode.stabModeYaw',   '0')
-            print("[REAL] Rate mode: disabled onboard attitude stabilization")
-
-        # Set up logging to read back state (position + velocity + attitude)
-        # This requires a positioning system (Lighthouse / Loco / MoCap)
+        # Set up logging to read back state (position + velocity + attitude).
+        # 10 Hz (period_in_ms=100) keeps radio bandwidth low; the comparison
+        # plot still has ~10× duration samples, which is plenty.
         from cflib.crazyflie.log import LogConfig
-        log_state = LogConfig(name='State', period_in_ms=10)  # 100 Hz
+        LOG_PERIOD_MS = 100   # 10 Hz — tune this if more resolution is needed
+        log_state = LogConfig(name='State', period_in_ms=LOG_PERIOD_MS)
         log_state.add_variable('stateEstimate.x',  'float')
         log_state.add_variable('stateEstimate.y',  'float')
         log_state.add_variable('stateEstimate.z',  'float')
@@ -841,21 +935,15 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.add_variable('stateEstimate.vy', 'float')
         log_state.add_variable('stateEstimate.vz', 'float')
 
-        log_att = LogConfig(name='Attitude', period_in_ms=10)
+        log_att = LogConfig(name='Attitude', period_in_ms=LOG_PERIOD_MS)
         log_att.add_variable('stabilizer.roll',  'float')
         log_att.add_variable('stabilizer.pitch', 'float')
         log_att.add_variable('stabilizer.yaw',   'float')
-        # Gyro for rate mode
-        if mode == "rate":
-            log_att.add_variable('gyro.x', 'float')
-            log_att.add_variable('gyro.y', 'float')
-            log_att.add_variable('gyro.z', 'float')
 
         # Shared state dict updated by log callbacks
         drone_state = {
             'x': 0, 'y': 0, 'z': 0, 'vx': 0, 'vy': 0, 'vz': 0,
             'roll': 0, 'pitch': 0, 'yaw': 0,
-            'gyro_x': 0, 'gyro_y': 0, 'gyro_z': 0
         }
 
         # Timestamped data logs — filled during flight for comparison plot
@@ -883,10 +971,6 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             drone_state['roll']  = data['stabilizer.roll']
             drone_state['pitch'] = data['stabilizer.pitch']
             drone_state['yaw']   = data['stabilizer.yaw']
-            if mode == "rate":
-                drone_state['gyro_x'] = data['gyro.x']
-                drone_state['gyro_y'] = data['gyro.y']
-                drone_state['gyro_z'] = data['gyro.z']
 
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
@@ -895,14 +979,42 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.start()
         log_att.start()
 
+        # ── Start OptiTrack streaming thread ──────────────────────────
+        # The Kalman filter needs external pose packets BEFORE the reset
+        # so that it converges to the true mocap origin instead of (0,0,0).
+        mocap_stop  = threading.Event()
+        mocap_shared = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'count': 0}
+        mocap_thread = threading.Thread(
+            target=_mocap_streamer,
+            kwargs=dict(cf=cf, mocap_ip=mocap_ip, rigid_body=rigid_body,
+                        stop_event=mocap_stop, shared=mocap_shared,
+                        rate_hz=mocap_rate_hz),
+            daemon=True)
+        mocap_thread.start()
+
+        # Wait until the thread has streamed a few frames (or bail out).
+        t0 = time.time()
+        while mocap_shared['count'] < 30 and not mocap_stop.is_set():
+            if time.time() - t0 > 5.0:
+                print("[REAL] ERROR: no OptiTrack frames received in 5s. "
+                      "Check Motive streaming config, IP, and rigid-body name.")
+                mocap_stop.set()
+                mocap_thread.join(timeout=1.0)
+                return
+            time.sleep(0.05)
+        start_xy = (mocap_shared['x'], mocap_shared['y'])
+        print(f"[REAL] Mocap pose @ start: "
+              f"({mocap_shared['x']:.3f}, {mocap_shared['y']:.3f}, {mocap_shared['z']:.3f})")
+        print(f"[REAL] Trajectory origin set to start_xy=({start_xy[0]:+.3f}, {start_xy[1]:+.3f})")
+
+        # ── Generate trajectory centered on the drone's actual start ──
+        waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
+                                        hover_height=hover_height,
+                                        radius=radius, start_xy=start_xy)
+
         # ── Reset Kalman estimator ────────────────────────────────────
-        # Without this, the drone's position estimate keeps the value from
-        # the previous flight (or wherever the estimator drifted to).
-        # All trajectory setpoints are in the estimator frame, so if the
-        # estimator thinks the drone is at (1, 0, 0) the first setpoint
-        # (0, 0, z) will make it fly sideways — the drift you observe.
-        # After reset the estimator restarts from (0, 0, 0), which becomes
-        # the origin for the whole trajectory.
+        # With extpose packets already streaming, the reset re-initializes
+        # the filter around the current mocap pose.
         print("[REAL] Resetting Kalman estimator...")
         cf.param.set_value('kalman.resetEstimation', '1')
         time.sleep(0.1)
@@ -937,55 +1049,14 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
 
-                # Log setpoint for every control step (all modes)
+                # Log setpoint for every control step
                 real_sp_log.append({'t': time.time() - flight_start, 'pos': sp_pos.copy()})
 
-                if mode == "position":
-                    # ─── Mode: position ───────────────────────────
-                    # All PIDs run on the drone.
-                    # send_position_setpoint(x, y, z, yaw)
-                    cf.commander.send_position_setpoint(
-                        sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
-
-                elif mode == "attitude":
-                    # ─── Mode: attitude ───────────────────────────
-                    # PC runs pos+vel PIDs → sends attitude + thrust
-                    # Drone runs attitude + rate PIDs.
-                    #
-                    # send_setpoint(roll, pitch, yawrate, thrust)
-                    #   roll, pitch: degrees
-                    #   yawrate: deg/s
-                    #   thrust: uint16 [0..65535]
-                    state_pos = [drone_state['x'], drone_state['y'], drone_state['z']]
-                    state_vel = [drone_state['vx'], drone_state['vy'], drone_state['vz']]
-                    yaw_deg   = drone_state['yaw']
-
-                    thrust, roll_d, pitch_d = pos_ctrl.update(
-                        sp_pos, state_pos, state_vel, yaw_deg)
-
-                    cf.commander.send_setpoint(
-                        roll_d, pitch_d, sp_yaw_rate, int(thrust))
-
-                elif mode == "rate":
-                    # ─── Mode: rate ───────────────────────────────
-                    # PC runs pos+vel+attitude PIDs → sends rate + thrust
-                    # Drone runs only rate PID.
-                    #
-                    # With stabMode disabled, send_setpoint interprets
-                    # roll/pitch as rate commands (deg/s).
-                    state_pos = [drone_state['x'], drone_state['y'], drone_state['z']]
-                    state_vel = [drone_state['vx'], drone_state['vy'], drone_state['vz']]
-                    rpy_deg   = [drone_state['roll'], drone_state['pitch'], drone_state['yaw']]
-
-                    thrust, roll_d, pitch_d = pos_ctrl.update(
-                        sp_pos, state_pos, state_vel, rpy_deg[2])
-
-                    roll_rate_d, pitch_rate_d, yaw_rate_d = att_ctrl.correct_attitude(
-                        rpy_deg[0], rpy_deg[1], rpy_deg[2],
-                        roll_d, pitch_d, 0.0)  # yaw desired = 0
-
-                    cf.commander.send_setpoint(
-                        roll_rate_d, pitch_rate_d, yaw_rate_d, int(thrust))
+                # ─── Position mode ────────────────────────────────
+                # All PIDs run on the drone; mocap-fed Kalman supplies the state.
+                # send_position_setpoint(x, y, z, yaw_deg)
+                cf.commander.send_position_setpoint(
+                    sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
 
                 # --- Timing ---
                 if i % (CTRL_FREQ * 1) == 0:
@@ -1032,16 +1103,6 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
-            # Uses position mode for simplicity and safety (the onboard
-            # PIDs handle attitude even if we were in rate mode before).
-            #
-            # First, restore normal stabilization so send_position_setpoint works.
-            if mode == "rate":
-                cf.param.set_value('flightmode.stabModeRoll',  '1')
-                cf.param.set_value('flightmode.stabModePitch', '1')
-                cf.param.set_value('flightmode.stabModeYaw',   '1')
-                time.sleep(0.05)
-
             land_x = drone_state['x']
             land_y = drone_state['y']
             land_z = drone_state['z']
@@ -1074,10 +1135,9 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             log_state.stop()
             log_att.stop()
 
-            # Restore normal flight mode (if not already done above)
-            if mode == "rate":
-                # Already restored above before landing
-                pass
+            # Stop OptiTrack streaming thread cleanly
+            mocap_stop.set()
+            mocap_thread.join(timeout=2.0)
 
             print("[REAL] Landed and cleaned up.")
 
@@ -1089,6 +1149,16 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             real_rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
             sp_t_arr = np.array([e['t']   for e in real_sp_log])
             sp_arr   = np.array([e['pos'] for e in real_sp_log])
+
+            # Remove the trajectory's world-frame offset so the comparison
+            # overlays the sim (which always takes off from (0,0,0.02)).
+            if real_pos.size > 0:
+                real_pos[:, 0] -= start_xy[0]
+                real_pos[:, 1] -= start_xy[1]
+            if sp_arr.size > 0:
+                sp_arr[:, 0]   -= start_xy[0]
+                sp_arr[:, 1]   -= start_xy[1]
+
             real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
                              sp_t=sp_t_arr, sp=sp_arr)
 
@@ -1114,17 +1184,15 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Crazyflie firmware-faithful PID — sim & real drone",
+        description="Crazyflie firmware-faithful PID — sim & real drone (OptiTrack)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
-  sim        Full firmware PID in Python → RPMs → PyBullet  (default)
-  attitude   Pos+vel PIDs on PC → send_setpoint(att, thrust) to drone
-  rate       Pos+vel+att PIDs on PC → send_setpoint(rate, thrust)
-  position   Only trajectory → send_position_setpoint (all PIDs on drone)
+  sim        Full firmware PID in Python → RPMs → PyBullet           (default)
+  position   OptiTrack → extpose → send_position_setpoint (all PIDs on drone)
         """)
     parser.add_argument('--mode', default='sim',
-                        choices=['sim', 'attitude', 'rate', 'position'],
+                        choices=['sim', 'position'],
                         help='Control mode (default: sim)')
     parser.add_argument('--duration', default=10, type=float,
                         help='Flight duration in seconds (default: 10)')
@@ -1135,11 +1203,18 @@ MODES:
     parser.add_argument('--gui', default=True, type=lambda x: x.lower() == 'true',
                         help='PyBullet GUI (default: True)')
     parser.add_argument('--uri', default='radio://0/80/2M/E7E7E7E7E7',
-                        help='Crazyflie radio URI (for real modes)')
+                        help='Crazyflie radio URI (for real drone)')
     parser.add_argument('--flow-deck-sim', action='store_true',
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
                         help='Overwrite drone PID gains with Python constants before flying')
+    parser.add_argument('--mocap-ip', default='192.168.1.100',
+                        help='IP address of the Motive PC (default: 192.168.1.100)')
+    parser.add_argument('--rigid-body', default='cf1',
+                        help='Name of the Crazyflie rigid body in Motive (default: cf1)')
+    parser.add_argument('--mocap-rate', default=None, type=float,
+                        help='Throttle extpose packets to this rate [Hz] '
+                             '(default: send every Motive frame)')
     args = parser.parse_args()
 
     if args.mode == 'sim':
@@ -1147,9 +1222,11 @@ MODES:
                 hover_height=args.height, radius=args.radius,
                 simulate_flow_deck=args.flow_deck_sim)
     else:
-        run_real(mode=args.mode, uri=args.uri,
+        run_real(uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
-                 radius=args.radius, push_gains=args.push_gains)
+                 radius=args.radius, push_gains=args.push_gains,
+                 mocap_ip=args.mocap_ip, rigid_body=args.rigid_body,
+                 mocap_rate_hz=args.mocap_rate)
 
 
 if __name__ == "__main__":

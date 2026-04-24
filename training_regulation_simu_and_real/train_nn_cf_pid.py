@@ -900,7 +900,7 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
     axes[5, 0].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
     axes[5, 1].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
     axes[5, 2].axhline(HOVER_RPM, color="gray", linewidth=0.6, linestyle=":", alpha=0.7)
-    fig.savefig(filename, dpi=120)
+    fig.savefig(filename, dpi=300)
     plt.close(fig)
     if verbose:
         print(f"[Saved] {filename}")

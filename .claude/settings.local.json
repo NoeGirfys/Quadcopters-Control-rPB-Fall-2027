@@ -6,7 +6,8 @@
       "WebFetch(domain:www.bitcraze.io)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:arxiv.org)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "WebFetch(domain:forum.bitcraze.io)"
     ]
   }
 }
