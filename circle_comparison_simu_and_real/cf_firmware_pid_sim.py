@@ -699,36 +699,53 @@ def _plot_comparison(real, sim):
     plt.show()
 
 
-def _plot_jitter(times, dts, target_freq):
-    """Tracer l'historique des périodes d'envoi (Jitter)."""
+def _plot_jitter(t_wall_log: list, t_nominal_log: list, target_freq: float) -> None:
+    """Plot cumulative drift vs nominal timeline and inter-send interval (jitter)."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("[PLOT] matplotlib not found — skipping jitter plot.")
         return
 
-    # Conversion en millisecondes pour une lecture plus intuitive
-    dts_ms = np.array(dts) * 1000.0
-    target_ms = (1.0 / target_freq) * 1000.0
+    t_wall = np.array(t_wall_log)
+    t_nominal = np.array(t_nominal_log)
+    drift_ms = (t_wall - t_wall[0] - (t_nominal - t_nominal[0])) * 1000.0
+    intervals_ms = np.diff(t_wall) * 1000.0
+    nominal_interval_ms = 1000.0 / target_freq
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(times, dts_ms, label='Real period measured', color='purple', alpha=0.7)
-    
-    # Ligne idéale
-    plt.axhline(target_ms, color='red', linestyle='--', 
-                label=f'Ideal target ({target_ms:.1f} ms / {target_freq} Hz)')
-    
-    plt.xlabel('Time [s]')
-    plt.ylabel('Loop Period [ms]')
-    plt.title('Jitter Analysis (Radio Communication Stability)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    # Sauvegarde de l'image
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+    fig.suptitle(f'Send Timing — Real Drone (nominal: {nominal_interval_ms:.1f} ms @ {target_freq:.0f} Hz)',
+                 fontsize=13)
+
+    ax = axes[0]
+    ax.plot(t_nominal, drift_ms, lw=0.8, alpha=0.9, label='drift vs nominal [ms]')
+    ax.axhline(0, color='red', ls='--', lw=1.2, label='perfect timing')
+    ax.set_ylabel('Drift [ms]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=8)
+    ax.set_title('Cumulative drift vs nominal timeline')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(t_nominal[1:], intervals_ms, lw=0.6, alpha=0.7, label='inter-send interval [ms]')
+    ax.axhline(nominal_interval_ms, color='red', ls='--', lw=1.2,
+               label=f'nominal {nominal_interval_ms:.1f} ms')
+    ax.set_ylabel('Interval [ms]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=8)
+    ax.set_title('Inter-send interval (jitter)')
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
     save_path = os.path.join(SCRIPT_DIR, 'jitter_results.png')
-    plt.savefig(save_path, dpi=150)
-    print(f"[PLOT] Graphique du jitter sauvegardé dans : {save_path}")
+    fig.savefig(save_path, dpi=150)
+    print(f"[PLOT] Saved to {save_path}")
+    print(f"[TIMING] n={len(intervals_ms)}  "
+          f"mean={np.mean(intervals_ms):.2f} ms  "
+          f"std={np.std(intervals_ms):.2f} ms  "
+          f"min={np.min(intervals_ms):.2f} ms  "
+          f"max={np.max(intervals_ms):.2f} ms  "
+          f"final_drift={drift_ms[-1]:.1f} ms")
     plt.show()
 
 
@@ -1034,17 +1051,36 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         START = time.time()
         flight_start = START   # enable data logging in _state_cb
 
-        # --- Variables pour les statistiques de fréquence ---
         cmd_count = 0
-        max_loop_dt = 0.0
-        last_cmd_time = START
-        
-        # NOUVEAU : Listes pour stocker l'historique
-        loop_dt_log = []
-        loop_time_log = []
+
+        # Wall-clock timestamp at the start of each iteration (for drift/jitter analysis)
+        t_wall_log: list = []
+        t_nominal_log: list = []
+
+        def _sync_precise(target: float) -> None:
+            """Wait until target (time.perf_counter()). Sleeps most of the remaining
+            time, then busy-waits the last 2 ms for accuracy.
+            Requires timeBeginPeriod(1) on Windows so that sleep(<15 ms) is accurate."""
+            remaining = target - time.perf_counter()
+            if remaining > 0.002:
+                time.sleep(remaining - 0.002)
+            while time.perf_counter() < target:
+                pass
+
+        _win_timer_set = False
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            _win_timer_set = True
+        except Exception:
+            pass
+
+        ctrl_dt = 1.0 / CTRL_FREQ
+        loop_start_perf = time.perf_counter()
 
         try:
             for i in range(len(waypoints)):
+                t_iter_wall = time.time()
                 sp = waypoints[i]
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
@@ -1065,41 +1101,17 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                           f"{drone_state['y']:+.3f}, {drone_state['z']:.3f}]  "
                           f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
 
-                # --- NOUVEAU : Calcul et stockage du temps de boucle ---
-                current_time = time.time()
-                loop_dt = current_time - last_cmd_time
-                
-                # Enregistrement pour le graphique
-                loop_dt_log.append(loop_dt)
-                loop_time_log.append(current_time - START)
-
-                if loop_dt > max_loop_dt:
-                    max_loop_dt = loop_dt
-                
-                last_cmd_time = current_time
+                t_wall_log.append(t_iter_wall)
+                t_nominal_log.append(i / CTRL_FREQ)
                 cmd_count += 1
-                # --------------------------------------------------------
 
-                sync(i, START, 1.0 / CTRL_FREQ)
+                _sync_precise(loop_start_perf + (i + 1) * ctrl_dt)
 
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted! Soft landing...")
         finally:
-
-            # --- NOUVEAU : Affichage des statistiques de communication ---
-            total_flight_time = time.time() - START
-            if total_flight_time > 0 and cmd_count > 0:
-                avg_freq = cmd_count / total_flight_time
-                print("\n" + "="*50)
-                print("[DIAGNOSTIC] --- STATISTIQUES D'ENVOI RADIO ---")
-                print(f"[DIAGNOSTIC] Commandes envoyées : {cmd_count}")
-                print(f"[DIAGNOSTIC] Temps d'exécution  : {total_flight_time:.2f} s")
-                print(f"[DIAGNOSTIC] Fréquence CIBLE  : {CTRL_FREQ} Hz")
-                print(f"[DIAGNOSTIC] Fréquence MOYENNE: {avg_freq:.2f} Hz")
-                print(f"[DIAGNOSTIC] Pire délai (max) : {max_loop_dt*1000:.1f} ms (Attendu: {1000/CTRL_FREQ:.1f} ms)")
-                print("="*50 + "\n")
-            # -------------------------------------------------------------
-
+            if _win_timer_set:
+                ctypes.windll.winmm.timeEndPeriod(1)
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
@@ -1162,11 +1174,9 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
                              sp_t=sp_t_arr, sp=sp_arr)
 
-            #--- NOUVEAU : Affichage du graphique de Jitter ---
-            if loop_dt_log:
-                print("[REAL] Génération du graphique de jitter...")
-                _plot_jitter(loop_time_log, loop_dt_log, CTRL_FREQ)
-            # --------------------------------------------------
+            if t_wall_log:
+                print("[REAL] Generating timing plot...")
+                _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
 
             print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
             if HAS_PYBULLET_DRONES:
@@ -1208,8 +1218,8 @@ MODES:
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
                         help='Overwrite drone PID gains with Python constants before flying')
-    parser.add_argument('--mocap-ip', default='192.168.1.100',
-                        help='IP address of the Motive PC (default: 192.168.1.100)')
+    parser.add_argument('--mocap-ip', default='192.168.0.24',
+                        help='IP address of the Motive PC (default: 192.168.0.24)')
     parser.add_argument('--rigid-body', default='cf1',
                         help='Name of the Crazyflie rigid body in Motive (default: cf1)')
     parser.add_argument('--mocap-rate', default=None, type=float,
