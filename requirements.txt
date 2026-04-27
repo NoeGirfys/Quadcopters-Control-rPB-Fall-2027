@@ -1,0 +1,1 @@
+-e ./gym-pybullet-drones # need to suppress the hidden .git folder in the gym-pybullet-drones package if you want to push some changes of the library on your repo
