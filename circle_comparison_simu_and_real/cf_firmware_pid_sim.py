@@ -57,17 +57,16 @@ except ImportError:
     HAS_CFLIB = False
 
 # ---------------------------------------------------------------------------
-# libmotioncapture (OptiTrack streaming for real drone, position mode)
+# NatNet SDK (OptiTrack streaming for real drone, position mode)
+# Bundled in ./NatNetSDK/ — added to sys.path lazily inside the streamer
+# so that import failures only affect real-drone runs.
 # ---------------------------------------------------------------------------
-try:
-    import motioncapture
-    HAS_MOCAP = True
-except ImportError:
-    HAS_MOCAP = False
-
 import threading
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+NATNET_DIR = os.path.join(SCRIPT_DIR, "NatNetSDK")
+HAS_NATNET = os.path.isdir(NATNET_DIR) and os.path.isfile(
+    os.path.join(NATNET_DIR, "NatNetClient.py"))
 
 # ---------------------------------------------------------------------------
 # Firmware constants and classes — from crazyflie_firmware
@@ -810,67 +809,117 @@ def push_pid_gains_to_drone(cf):
 
 
 # ===================================================================
-#  OptiTrack streaming thread  (libmotioncapture → send_extpose)
+#  OptiTrack streaming thread  (NatNet SDK → send_extpose)
 # ===================================================================
 
-def _mocap_streamer(cf, mocap_ip, rigid_body, stop_event, shared=None,
-                    rate_hz=None):
-    """Stream OptiTrack rigid-body pose to the Crazyflie via send_extpose.
+def _natnet_streamer(cf, server_ip, client_ip, use_multicast, rigid_body_id,
+                     stop_event, shared=None, rate_hz=None):
+    """Stream OptiTrack rigid-body pose to the Crazyflie via send_extpose,
+    using the bundled NatNet SDK directly.
 
     Motive must be configured with:
-      • Data Streaming pane → Broadcast ON, Up Axis = Z, Multicast ON,
-        Rigid Bodies ON, Unlabeled Markers OFF.
-      • A rigid body named exactly `rigid_body` with streaming enabled.
+      • Streaming Engine ON, Up Axis = Z, Rigid Bodies ON.
+      • Multicast or Unicast matching `use_multicast`.
+      • A rigid body with streaming ID = `rigid_body_id`.
 
-    The shared dict is always updated at Motive's native rate (so the
-    start-of-flight handshake converges quickly).  Packets sent over the
-    radio are optionally throttled to `rate_hz` to save CRTP bandwidth;
-    `rate_hz=None` sends every frame.
+    The NatNet client spawns its own data thread internally; the per-rigid-body
+    callback fires there.  `cf.extpos.send_extpose` is called directly from
+    that callback (cflib serializes radio writes via its own queues).
+
+    The shared dict is updated at Motive's native rate so the start-of-flight
+    handshake converges quickly.  Radio writes are optionally throttled to
+    `rate_hz`; `rate_hz=None` sends every frame.
     """
-    try:
-        mc = motioncapture.MotionCaptureOptitrack(mocap_ip)
-    except Exception as e:
-        print(f"[MOCAP] Failed to connect to Motive at {mocap_ip}: {e}")
+    if not HAS_NATNET:
+        print(f"[MOCAP] NatNet SDK not found at {NATNET_DIR}")
         stop_event.set()
         return
 
-    rate_msg = f"throttled to {rate_hz:.0f} Hz" if rate_hz else "every frame"
-    print(f"[MOCAP] Connected to Motive at {mocap_ip} — tracking '{rigid_body}' "
-          f"({rate_msg})")
+    if NATNET_DIR not in sys.path:
+        sys.path.insert(0, NATNET_DIR)
+    try:
+        from NatNetClient import NatNetClient  # type: ignore
+    except Exception as e:
+        print(f"[MOCAP] Failed to import NatNetClient: {e}")
+        stop_event.set()
+        return
 
     period = (1.0 / rate_hz) if rate_hz else 0.0
-    last_sent = 0.0
-    n_frames, n_sent, n_missing = 0, 0, 0
-    while not stop_event.is_set():
-        try:
-            mc.waitForNextFrame()
-        except Exception as e:
-            print(f"[MOCAP] Stream error: {e}")
-            break
-        if rigid_body not in mc.rigidBodies:
-            n_missing += 1
-            if n_missing in (1, 100, 500):
-                print(f"[MOCAP] Rigid body '{rigid_body}' not visible "
-                      f"({n_missing} missing frames)")
-            continue
-        rb = mc.rigidBodies[rigid_body]
-        x, y, z = rb.position
-        qx, qy, qz, qw = rb.rotation
-        n_frames += 1
+    state = {
+        'last_sent': 0.0,
+        'n_frames':  0,
+        'n_sent':    0,
+        'warned_missing': False,
+    }
+
+    def _on_rigid_body(new_id, position, rotation):
+        if new_id != rigid_body_id:
+            return
+        x, y, z = position
+        qx, qy, qz, qw = rotation
+        state['n_frames'] += 1
         if shared is not None:
             shared['x'], shared['y'], shared['z'] = x, y, z
-            shared['count'] = n_frames
+            shared['count'] = state['n_frames']
 
-        # Optional radio-side throttle
         now = time.time()
-        if period > 0 and (now - last_sent) < period:
-            continue
-        cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
-        last_sent = now
-        n_sent += 1
+        if period > 0 and (now - state['last_sent']) < period:
+            return
+        try:
+            cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
+        except Exception as e:
+            if not state['warned_missing']:
+                print(f"[MOCAP] send_extpose error: {e}")
+                state['warned_missing'] = True
+            return
+        state['last_sent'] = now
+        state['n_sent'] += 1
 
-    print(f"[MOCAP] Stopped ({n_frames} frames from Motive, "
-          f"{n_sent} sent to drone, {n_missing} missed).")
+    client = NatNetClient()
+    client.set_client_address(client_ip)
+    client.set_server_address(server_ip)
+    client.set_use_multicast(bool(use_multicast))
+    client.rigid_body_listener = _on_rigid_body
+    #client.set_print_level(0)
+
+    if not client.run('d'):
+        print("[MOCAP] NatNet run() failed — could not open sockets.")
+        stop_event.set()
+        return
+
+    # Wait briefly for the server handshake to complete.
+    t0 = time.time()
+    while not client.connected() and (time.time() - t0) < 3.0:
+        if stop_event.is_set():
+            client.shutdown()
+            return
+        time.sleep(0.05)
+
+    if not client.connected():
+        print(f"[MOCAP] NatNet did not connect to {server_ip} "
+              f"(client={client_ip}, multicast={use_multicast}). "
+              f"Check Motive Streaming Engine settings.")
+        client.shutdown()
+        stop_event.set()
+        return
+
+    cast_str = "multicast" if use_multicast else "unicast"
+    rate_msg = f"throttled to {rate_hz:.0f} Hz" if rate_hz else "every frame"
+    print(f"[MOCAP] NatNet connected — server={server_ip} client={client_ip} "
+          f"{cast_str}, rigid body id={rigid_body_id} ({rate_msg})")
+
+    try:
+        while not stop_event.is_set():
+            time.sleep(0.1)
+            if state['n_frames'] == 0 and (time.time() - t0) > 3.0 \
+                    and not state['warned_missing']:
+                print(f"[MOCAP] No frames for rigid body id={rigid_body_id} "
+                      f"yet — verify the streaming ID in Motive.")
+                state['warned_missing'] = True
+    finally:
+        client.shutdown()
+        print(f"[MOCAP] Stopped ({state['n_frames']} frames received, "
+              f"{state['n_sent']} sent to drone).")
 
 
 # ===================================================================
@@ -880,12 +929,15 @@ def _mocap_streamer(cf, mocap_ip, rigid_body, stop_event, shared=None,
 def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
              duration_sec=15, hover_height=0.5, radius=0.5,
              push_gains=False,
-             mocap_ip="192.168.1.100", rigid_body="cf1",
+             natnet_server_ip="192.168.0.24",
+             natnet_client_ip="192.168.0.100",
+             natnet_multicast=True,
+             rigid_body_id=1,
              mocap_rate_hz=None):
     """Run with a real Crazyflie drone in position mode, fed by OptiTrack.
 
-    The PC only streams pose from Motive (via libmotioncapture) to the
-    drone; the drone runs all PIDs internally on its Kalman estimate.
+    The PC only streams pose from Motive (via the NatNet SDK) to the drone;
+    the drone runs all PIDs internally on its Kalman estimate.
 
     Parameters
     ----------
@@ -894,16 +946,22 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
     push_gains : bool
         If True, overwrite the drone's onboard PID gains with the Python
         constants defined at the top of this file before flying.
-    mocap_ip : str
+    natnet_server_ip : str
         IP address of the Motive PC on the OptiTrack network.
-    rigid_body : str
-        Exact name of the Crazyflie rigid body configured in Motive.
+    natnet_client_ip : str
+        IP address of this PC's network interface used to receive the stream.
+    natnet_multicast : bool
+        True = multicast (matches PythonSample.py's '0' choice),
+        False = unicast.
+    rigid_body_id : int
+        Streaming ID of the Crazyflie rigid body in Motive (the "User Data"
+        ID column in Motive, NOT the rigid body name).
     """
     if not HAS_CFLIB:
         print("ERROR: cflib not found. pip install cflib")
         sys.exit(1)
-    if not HAS_MOCAP:
-        print("ERROR: motioncapture not found. pip install motioncapture")
+    if not HAS_NATNET:
+        print(f"ERROR: NatNet SDK not found at {NATNET_DIR}")
         sys.exit(1)
 
     cflib.crtp.init_drivers()
@@ -1002,8 +1060,12 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         mocap_stop  = threading.Event()
         mocap_shared = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'count': 0}
         mocap_thread = threading.Thread(
-            target=_mocap_streamer,
-            kwargs=dict(cf=cf, mocap_ip=mocap_ip, rigid_body=rigid_body,
+            target=_natnet_streamer,
+            kwargs=dict(cf=cf,
+                        server_ip=natnet_server_ip,
+                        client_ip=natnet_client_ip,
+                        use_multicast=natnet_multicast,
+                        rigid_body_id=rigid_body_id,
                         stop_event=mocap_stop, shared=mocap_shared,
                         rate_hz=mocap_rate_hz),
             daemon=True)
@@ -1218,13 +1280,20 @@ MODES:
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
                         help='Overwrite drone PID gains with Python constants before flying')
-    parser.add_argument('--mocap-ip', default='192.168.0.24',
-                        help='IP address of the Motive PC (default: 192.168.0.24)')
-    parser.add_argument('--rigid-body', default='cf1',
-                        help='Name of the Crazyflie rigid body in Motive (default: cf1)')
+    parser.add_argument('--natnet-server-ip', default='192.168.0.24',
+                        help='IP address of the Motive PC / NatNet server '
+                             '(default: 192.168.0.24)')
+    parser.add_argument('--natnet-client-ip', default='192.168.0.100',
+                        help='IP address of this PC on the OptiTrack network '
+                             '(default: 192.168.0.100)')
+    parser.add_argument('--natnet-unicast', action='store_true',
+                        help='Use unicast instead of multicast (default: multicast)')
+    parser.add_argument('--rigid-body-id', default=4, type=int,
+                        help='Streaming ID of the Crazyflie rigid body in Motive '
+                             '(default: 4)')
     parser.add_argument('--mocap-rate', default=None, type=float,
                         help='Throttle extpose packets to this rate [Hz] '
-                             '(default: send every Motive frame)')
+                             '(default: send every NatNet frame)')
     args = parser.parse_args()
 
     if args.mode == 'sim':
@@ -1235,7 +1304,10 @@ MODES:
         run_real(uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
                  radius=args.radius, push_gains=args.push_gains,
-                 mocap_ip=args.mocap_ip, rigid_body=args.rigid_body,
+                 natnet_server_ip=args.natnet_server_ip,
+                 natnet_client_ip=args.natnet_client_ip,
+                 natnet_multicast=(not args.natnet_unicast),
+                 rigid_body_id=args.rigid_body_id,
                  mocap_rate_hz=args.mocap_rate)
 
 
