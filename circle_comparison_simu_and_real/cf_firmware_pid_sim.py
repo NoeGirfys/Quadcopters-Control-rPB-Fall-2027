@@ -845,11 +845,20 @@ def _natnet_streamer(cf, server_ip, client_ip, use_multicast, rigid_body_id,
         return
 
     period = (1.0 / rate_hz) if rate_hz else 0.0
+    # Watchdog thresholds (seconds)
+    RB_LOST_TIMEOUT     = 0.10   # no rigid body for 100 ms → lost
+    STREAM_LOST_TIMEOUT = 0.50   # no frame at all for 500 ms → stream down
+
     state = {
-        'last_sent': 0.0,
-        'n_frames':  0,
-        'n_sent':    0,
-        'warned_missing': False,
+        'last_sent':       0.0,
+        'last_rb_time':    None,   # last time the target rigid body was seen
+        'last_frame_time': None,   # last time any frame arrived
+        'n_rb':            0,      # frames where the target RB was present
+        'n_frames':        0,      # total frames received
+        'n_sent':          0,      # extpose packets sent to drone
+        'n_lost_events':   0,      # tracking-loss transitions
+        'tracked':         False,  # current tracking state (latched)
+        'warned_send':     False,
     }
 
     def _on_rigid_body(new_id, position, rotation):
@@ -857,30 +866,41 @@ def _natnet_streamer(cf, server_ip, client_ip, use_multicast, rigid_body_id,
             return
         x, y, z = position
         qx, qy, qz, qw = rotation
-        state['n_frames'] += 1
+        now = time.time()
+        state['n_rb'] += 1
+        state['last_rb_time'] = now
+        if not state['tracked']:
+            state['tracked'] = True
+            if state['n_lost_events'] > 0:
+                print(f"[MOCAP] Rigid body id={rigid_body_id} REGAINED "
+                      f"@ pos=({x:+.3f}, {y:+.3f}, {z:+.3f})")
         if shared is not None:
             shared['x'], shared['y'], shared['z'] = x, y, z
-            shared['count'] = state['n_frames']
+            shared['count'] = state['n_rb']
 
-        now = time.time()
         if period > 0 and (now - state['last_sent']) < period:
             return
         try:
             cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
         except Exception as e:
-            if not state['warned_missing']:
+            if not state['warned_send']:
                 print(f"[MOCAP] send_extpose error: {e}")
-                state['warned_missing'] = True
+                state['warned_send'] = True
             return
         state['last_sent'] = now
         state['n_sent'] += 1
+
+    def _on_frame(_data_dict):
+        state['n_frames'] += 1
+        state['last_frame_time'] = time.time()
 
     client = NatNetClient()
     client.set_client_address(client_ip)
     client.set_server_address(server_ip)
     client.set_use_multicast(bool(use_multicast))
     client.rigid_body_listener = _on_rigid_body
-    #client.set_print_level(0)
+    client.new_frame_listener = _on_frame
+    client.set_print_level(0)
 
     if not client.run('d'):
         print("[MOCAP] NatNet run() failed — could not open sockets.")
@@ -909,17 +929,54 @@ def _natnet_streamer(cf, server_ip, client_ip, use_multicast, rigid_body_id,
           f"{cast_str}, rigid body id={rigid_body_id} ({rate_msg})")
 
     try:
+        warned_no_frames = False
+        warned_no_rb     = False
         while not stop_event.is_set():
-            time.sleep(0.1)
-            if state['n_frames'] == 0 and (time.time() - t0) > 3.0 \
-                    and not state['warned_missing']:
-                print(f"[MOCAP] No frames for rigid body id={rigid_body_id} "
-                      f"yet — verify the streaming ID in Motive.")
-                state['warned_missing'] = True
+            time.sleep(0.05)
+            now = time.time()
+
+            # ── Stream watchdog: no frame at all from Motive ──────────
+            if state['last_frame_time'] is None:
+                if (now - t0) > 3.0 and not warned_no_frames:
+                    print("[MOCAP] WARNING: no NatNet frames received yet "
+                          "— Motive streaming likely stopped.")
+                    warned_no_frames = True
+                continue
+
+            stream_age = now - state['last_frame_time']
+            if stream_age > STREAM_LOST_TIMEOUT:
+                if not warned_no_frames:
+                    print(f"[MOCAP] WARNING: NatNet stream stalled "
+                          f"({stream_age*1000:.0f} ms since last frame).")
+                    warned_no_frames = True
+            else:
+                if warned_no_frames:
+                    print(f"[MOCAP] NatNet stream resumed after "
+                          f"{stream_age*1000:.0f} ms gap.")
+                    warned_no_frames = False
+
+            # ── Tracking watchdog: frames arriving but no rigid body ──
+            if state['last_rb_time'] is None:
+                if (now - t0) > 3.0 and not warned_no_rb:
+                    print(f"[MOCAP] WARNING: no frames for rigid body "
+                          f"id={rigid_body_id} yet — check Motive streaming "
+                          f"ID and that the body is visible.")
+                    warned_no_rb = True
+                continue
+
+            rb_age = now - state['last_rb_time']
+            if state['tracked'] and rb_age > RB_LOST_TIMEOUT:
+                state['tracked'] = False
+                state['n_lost_events'] += 1
+                print(f"[MOCAP] *** TRACKING LOST *** rigid body id="
+                      f"{rigid_body_id} not seen for {rb_age*1000:.0f} ms "
+                      f"(stream still alive @ "
+                      f"{1.0/max(stream_age,1e-6):.0f} Hz)")
     finally:
         client.shutdown()
-        print(f"[MOCAP] Stopped ({state['n_frames']} frames received, "
-              f"{state['n_sent']} sent to drone).")
+        print(f"[MOCAP] Stopped — frames={state['n_frames']} "
+              f"rb_frames={state['n_rb']} sent={state['n_sent']} "
+              f"tracking_loss_events={state['n_lost_events']}")
 
 
 # ===================================================================

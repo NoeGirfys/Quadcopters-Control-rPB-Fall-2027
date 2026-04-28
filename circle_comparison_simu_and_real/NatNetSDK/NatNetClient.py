@@ -2079,9 +2079,8 @@ class NatNetClient:
 
             offset_tmp, mocap_data = self.__unpack_mocap_data(data[offset:], packet_size, major, minor) #type: ignore  # noqa E501
             offset += offset_tmp
-            print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
-            # get a string version of the data for output
             if print_level >= 1:
+                print("MoCap Frame: %d\n" % (mocap_data.prefix_data.frame_number))
                 mocap_data_str = mocap_data.get_as_string()
                 print(" %s\n" % mocap_data_str)
 
