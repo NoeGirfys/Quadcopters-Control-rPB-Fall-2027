@@ -707,16 +707,20 @@ def _plot_jitter(times, dts, target_freq):
 _TAKEOFF_DURATION = 2  # seconds — must match generate_trajectory
 
 
-def compute_and_save_metrics(real_log, real_sp_log, duration_sec,
+def compute_and_save_metrics(real_log, duration_sec,
                               positioning_system, output_dir):
     """Compute and persist tracking metrics for the circle phase.
 
-    Position RMSE: interpolated PC-side setpoints vs stateEstimate.
-    Velocity RMSE: ctrltarget.vx/vy/vz (pos-PID output) vs stateEstimate.vx/vy/vz.
-    Attitude RMSE: ctrltarget.roll/pitch (vel-PID output) vs stabilizer.roll/pitch.
-    Rate RMSE: controller.rollRate/pitchRate/yawRate (att-PID output) vs gyro.x/y/z.
-    All four come from the drone's own log at 100 Hz — no extra interpolation needed
-    beyond aligning PC-side position setpoints.
+    All setpoints come from the drone's own log at 100 Hz — no interpolation.
+    posCtl.targetX/Y/Z and posCtl.targetVX/VY/VZ are in the body-yaw-aligned
+    (BYA) frame and are rotated back to the world frame using the concurrent
+    yaw estimate before computing errors.
+
+    Cascade:
+      Position  : posCtl.targetX/Y/Z (BYA→world)  vs  stateEstimate.x/y/z
+      Velocity  : posCtl.targetVX/VY/VZ (BYA→world) vs  stateEstimate.vx/vy/vz
+      Attitude  : controller.roll/pitch/yaw          vs  stabilizer.roll/pitch/yaw
+      Rate      : controller.rollRate/pitchRate/yawRate vs gyro.x/y/z
     """
     import json
     from datetime import datetime
@@ -725,52 +729,66 @@ def compute_and_save_metrics(real_log, real_sp_log, duration_sec,
     circle_start = float(_TAKEOFF_DURATION)
     circle_end   = float(duration_sec - _TAKEOFF_DURATION)
 
-    if not real_log or not real_sp_log:
+    if not real_log:
         print("[METRICS] No flight data — skipping.")
         return None
 
-    all_t      = np.array([e['t']                                              for e in real_log])
-    all_pos    = np.array([[e['x'],       e['y'],       e['z']]                for e in real_log])
-    all_vel    = np.array([[e['vx'],      e['vy'],      e['vz']]               for e in real_log])
-    all_sp_vel = np.array([[e.get('sp_vx', 0.0), e.get('sp_vy', 0.0),
-                             e.get('sp_vz', 0.0)]                              for e in real_log])
-    all_rpy    = np.array([[e['roll'],    e['pitch'],   e['yaw']]              for e in real_log])
-    all_sp_att = np.array([[e.get('sp_roll', 0.0), e.get('sp_pitch', 0.0)]    for e in real_log])
+    all_t      = np.array([e['t']                                               for e in real_log])
+    all_pos    = np.array([[e['x'],       e['y'],       e['z']]                 for e in real_log])
+    all_vel    = np.array([[e['vx'],      e['vy'],      e['vz']]                for e in real_log])
+    all_sp_bya = np.array([[e.get('sp_x', 0.0), e.get('sp_y', 0.0),
+                             e.get('sp_z', 0.0)]                                for e in real_log])
+    all_sv_bya = np.array([[e.get('sp_vx', 0.0), e.get('sp_vy', 0.0),
+                             e.get('sp_vz', 0.0)]                               for e in real_log])
+    all_rpy    = np.array([[e['roll'],    e['pitch'],   e['yaw']]               for e in real_log])
+    all_sp_att = np.array([[e.get('sp_roll', 0.0), e.get('sp_pitch', 0.0),
+                             e.get('sp_yaw',  0.0)]                             for e in real_log])
     all_gyro   = np.array([[e.get('gx', 0.0),  e.get('gy', 0.0),
-                             e.get('gz', 0.0)]                                 for e in real_log])
+                             e.get('gz', 0.0)]                                  for e in real_log])
     all_sp_gyr = np.array([[e.get('sp_gx', 0.0), e.get('sp_gy', 0.0),
-                             e.get('sp_gz', 0.0)]                              for e in real_log])
-
-    sp_t   = np.array([e['t']   for e in real_sp_log])
-    sp_pos = np.array([e['pos'] for e in real_sp_log])
+                             e.get('sp_gz', 0.0)]                               for e in real_log])
 
     # ── Filter to circle phase ────────────────────────────────────────────
     mask   = (all_t >= circle_start) & (all_t <= circle_end)
     t      = all_t[mask]
     pos    = all_pos[mask]
-    vel    = all_vel[mask];    sp_vel = all_sp_vel[mask]
-    rpy    = all_rpy[mask];    sp_att = all_sp_att[mask]
-    gyro   = all_gyro[mask];   sp_gyr = all_sp_gyr[mask]
+    vel    = all_vel[mask]
+    sp_bya = all_sp_bya[mask];  sv_bya = all_sv_bya[mask]
+    rpy    = all_rpy[mask];     sp_att = all_sp_att[mask]
+    gyro   = all_gyro[mask];    sp_gyr = all_sp_gyr[mask]
 
     if len(t) < 2:
         print("[METRICS] Circle phase too short — skipping metrics.")
         return None
 
-    # ── Position: interpolate PC-side setpoints onto drone timestamps ──────
+    # ── Body-yaw-aligned → world frame ────────────────────────────────────
+    # posCtl uses a frame rotated by the drone's current yaw around Z.
+    # Inverse rotation: x_w = x_bya·cos(ψ) − y_bya·sin(ψ)
+    #                   y_w = x_bya·sin(ψ) + y_bya·cos(ψ)
+    yaw_rad = np.radians(rpy[:, 2])
+    c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+
     sp_interp = np.column_stack([
-        np.interp(t, sp_t, sp_pos[:, 0]),
-        np.interp(t, sp_t, sp_pos[:, 1]),
-        np.interp(t, sp_t, sp_pos[:, 2]),
+        sp_bya[:, 0] * c - sp_bya[:, 1] * s,   # x world
+        sp_bya[:, 0] * s + sp_bya[:, 1] * c,   # y world
+        sp_bya[:, 2],                            # z unchanged
     ])
-    pos_err = pos - sp_interp
+    sp_vel = np.column_stack([
+        sv_bya[:, 0] * c - sv_bya[:, 1] * s,
+        sv_bya[:, 0] * s + sv_bya[:, 1] * c,
+        sv_bya[:, 2],
+    ])
+
+    pos_err    = pos - sp_interp
     pos_err_3d = np.linalg.norm(pos_err, axis=1)
 
-    # ── Velocity error (drone-side setpoints, no interpolation needed) ─────
+    # ── Velocity error ────────────────────────────────────────────────────
     vel_err    = vel - sp_vel
     vel_err_3d = np.linalg.norm(vel_err, axis=1)
 
-    # ── Attitude error (roll/pitch only; yaw is controlled as rate) ────────
-    att_err = rpy[:, :2] - sp_att   # (N, 2): roll error, pitch error
+    # ── Attitude error (wrap yaw to [−180, 180]) ──────────────────────────
+    att_err = rpy - sp_att
+    att_err[:, 2] = ((att_err[:, 2] + 180) % 360) - 180
 
     # ── Rate error ─────────────────────────────────────────────────────────
     rate_err    = gyro - sp_gyr
@@ -804,10 +822,13 @@ def compute_and_save_metrics(real_log, real_sp_log, duration_sec,
         'attitude_tracking': {
             'rmse_roll_deg':  _rmse(att_err[:, 0]),
             'rmse_pitch_deg': _rmse(att_err[:, 1]),
+            'rmse_yaw_deg':   _rmse(att_err[:, 2]),
             'mae_roll_deg':   _mae(att_err[:, 0]),
             'mae_pitch_deg':  _mae(att_err[:, 1]),
+            'mae_yaw_deg':    _mae(att_err[:, 2]),
             'max_roll_deg':   _max(att_err[:, 0]),
             'max_pitch_deg':  _max(att_err[:, 1]),
+            'max_yaw_deg':    _max(att_err[:, 2]),
         },
         'rate_tracking': {
             'rmse_3d_deg_s':  float(np.sqrt(np.mean(rate_err_3d ** 2))),
@@ -837,10 +858,10 @@ def compute_and_save_metrics(real_log, real_sp_log, duration_sec,
     print(f"  [Velocity]  RMSE 3-D    : {vt['rmse_3d_m_s']*100:6.2f} cm/s")
     print(f"              RMSE vx/vy/vz: {vt['rmse_vx_m_s']*100:.2f} / "
           f"{vt['rmse_vy_m_s']*100:.2f} / {vt['rmse_vz_m_s']*100:.2f} cm/s")
-    print(f"  [Attitude]  RMSE roll   : {at['rmse_roll_deg']:.2f} °   "
-          f"pitch: {at['rmse_pitch_deg']:.2f} °")
-    print(f"              MAE  roll   : {at['mae_roll_deg']:.2f} °   "
-          f"pitch: {at['mae_pitch_deg']:.2f} °")
+    print(f"  [Attitude]  RMSE r/p/y  : {at['rmse_roll_deg']:.2f} / "
+          f"{at['rmse_pitch_deg']:.2f} / {at['rmse_yaw_deg']:.2f} °")
+    print(f"              MAE  r/p/y  : {at['mae_roll_deg']:.2f} / "
+          f"{at['mae_pitch_deg']:.2f} / {at['mae_yaw_deg']:.2f} °")
     print(f"  [Rate]      RMSE 3-D    : {rt['rmse_3d_deg_s']:6.1f} °/s")
     print(f"              RMSE gx/gy/gz: {rt['rmse_gx_deg_s']:.1f} / "
           f"{rt['rmse_gy_deg_s']:.1f} / {rt['rmse_gz_deg_s']:.1f} °/s")
@@ -922,24 +943,20 @@ def _plot_metrics(t, pos, sp_interp, pos_err, pos_err_3d,
                           tr, vel[:, col], sp_vel[:, col], lbl, f'Vel {axis}',
                           clr_a='darkorange', clr_s='royalblue')
 
-    # ── Row 2: attitude ───────────────────────────────────────────────────
-    for col, (lbl, sp_col, rmse) in enumerate([
-            ('roll [°]',  0, at['rmse_roll_deg']),
-            ('pitch [°]', 1, at['rmse_pitch_deg']),
-    ]):
+    # ── Row 2: attitude (roll, pitch, yaw — all vs setpoint) ─────────────
+    att_row = [
+        ('roll [°]',  0, at['rmse_roll_deg']),
+        ('pitch [°]', 1, at['rmse_pitch_deg']),
+        ('yaw [°]',   2, at['rmse_yaw_deg']),
+    ]
+    for col, (lbl, idx, rmse) in enumerate(att_row):
         ax = fig.add_subplot(gs[2, col])
-        ax.plot(tr, rpy[:, col],    color='seagreen',    lw=1.5, label='actual')
-        ax.plot(tr, sp_att[:, col], color='mediumorchid', lw=1.0, ls='--', label='setpoint')
+        ax.plot(tr, rpy[:, idx],    color='seagreen',     lw=1.5, label='actual')
+        ax.plot(tr, sp_att[:, idx], color='mediumorchid', lw=1.0, ls='--', label='setpoint')
         ax.set_ylabel(lbl)
-        ax.set_title(f'Att {["roll","pitch"][col]}  RMSE {rmse:.2f}°')
+        ax.set_title(f'Att {["roll","pitch","yaw"][idx]}  RMSE {rmse:.2f}°')
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
-
-    ax = fig.add_subplot(gs[2, 2])
-    ax.plot(tr, rpy[:, 2], color='seagreen', lw=1.2)
-    ax.set_ylabel('yaw [°]')
-    ax.set_title('Yaw actual')
-    ax.grid(True, alpha=0.3)
 
     # ── Row 3: angular rate ───────────────────────────────────────────────
     rate_labels = ['gx [°/s]', 'gy [°/s]', 'gz [°/s]']
@@ -1119,13 +1136,14 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.add_variable('stateEstimate.vy', 'float')
         log_state.add_variable('stateEstimate.vz', 'float')
 
-        # actual attitude + attitude setpoints from vel-PID (5 floats = 20 bytes)
+        # actual attitude + attitude setpoints from vel-PID (6 floats = 24 bytes)
         log_att = LogConfig(name='Attitude', period_in_ms=10)
         log_att.add_variable('stabilizer.roll',   'float')
         log_att.add_variable('stabilizer.pitch',  'float')
         log_att.add_variable('stabilizer.yaw',    'float')
-        log_att.add_variable('ctrltarget.roll',   'float')  # att setpoint from vel-PID [deg]
-        log_att.add_variable('ctrltarget.pitch',  'float')  # att setpoint from vel-PID [deg]
+        log_att.add_variable('controller.roll',   'float')  # att setpoint from vel-PID [deg]
+        log_att.add_variable('controller.pitch',  'float')  # att setpoint from vel-PID [deg]
+        log_att.add_variable('controller.yaw',    'float')  # att setpoint from vel-PID [deg]
 
         # actual gyro + rate setpoints from att-PID (6 floats = 24 bytes)
         log_rate = LogConfig(name='AngRate', period_in_ms=10)
@@ -1136,20 +1154,24 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_rate.add_variable('controller.pitchRate', 'float')
         log_rate.add_variable('controller.yawRate',   'float')
 
-        # velocity setpoints from pos-PID (3 floats = 12 bytes)
-        log_vel_sp = LogConfig(name='VelSp', period_in_ms=10)
-        log_vel_sp.add_variable('ctrltarget.vx', 'float')  # vel setpoint from pos-PID [m/s]
-        log_vel_sp.add_variable('ctrltarget.vy', 'float')
-        log_vel_sp.add_variable('ctrltarget.vz', 'float')
+        # position + velocity setpoints from pos-PID, body-yaw-aligned frame (6 floats = 24 bytes)
+        log_vel_sp = LogConfig(name='PidSp', period_in_ms=10)
+        log_vel_sp.add_variable('posCtl.targetX',  'float')  # pos setpoint BYA [m]
+        log_vel_sp.add_variable('posCtl.targetY',  'float')
+        log_vel_sp.add_variable('posCtl.targetZ',  'float')
+        log_vel_sp.add_variable('posCtl.targetVX', 'float')  # vel setpoint BYA [m/s]
+        log_vel_sp.add_variable('posCtl.targetVY', 'float')
+        log_vel_sp.add_variable('posCtl.targetVZ', 'float')
 
         # Shared state dict updated by log callbacks
         drone_state = {
             'x': 0, 'y': 0, 'z': 0, 'vx': 0, 'vy': 0, 'vz': 0,
-            'sp_vx': 0, 'sp_vy': 0, 'sp_vz': 0,
+            'sp_x': 0, 'sp_y': 0, 'sp_z': 0,          # pos setpoints (BYA → world in metrics)
+            'sp_vx': 0, 'sp_vy': 0, 'sp_vz': 0,        # vel setpoints (BYA → world in metrics)
             'roll': 0, 'pitch': 0, 'yaw': 0,
-            'sp_roll': 0, 'sp_pitch': 0,
+            'sp_roll': 0, 'sp_pitch': 0, 'sp_yaw': 0,  # att setpoints [deg]
             'gyro_x': 0, 'gyro_y': 0, 'gyro_z': 0,
-            'sp_gx': 0, 'sp_gy': 0, 'sp_gz': 0,
+            'sp_gx': 0, 'sp_gy': 0, 'sp_gz': 0,        # rate setpoints [deg/s]
         }
 
         # Timestamped data logs — filled during flight for comparison plot
@@ -1168,18 +1190,20 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             if flight_start is not None:
                 real_log.append({
                     't':  time.time() - flight_start,
-                    # actual position & velocity
+                    # actual position & velocity (world frame)
                     'x':  drone_state['x'],     'y':  drone_state['y'],     'z':  drone_state['z'],
                     'vx': drone_state['vx'],    'vy': drone_state['vy'],    'vz': drone_state['vz'],
-                    # velocity setpoints (pos-PID output)
+                    # pos/vel setpoints from pos-PID — body-yaw-aligned; converted in metrics
+                    'sp_x':  drone_state['sp_x'],  'sp_y':  drone_state['sp_y'],  'sp_z':  drone_state['sp_z'],
                     'sp_vx': drone_state['sp_vx'], 'sp_vy': drone_state['sp_vy'], 'sp_vz': drone_state['sp_vz'],
-                    # actual attitude
+                    # actual attitude [deg]
                     'roll': drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
-                    # attitude setpoints (vel-PID output)
+                    # attitude setpoints from vel-PID [deg]
                     'sp_roll': drone_state['sp_roll'], 'sp_pitch': drone_state['sp_pitch'],
-                    # actual angular rates
+                    'sp_yaw':  drone_state['sp_yaw'],
+                    # actual angular rates [deg/s]
                     'gx': drone_state['gyro_x'], 'gy': drone_state['gyro_y'], 'gz': drone_state['gyro_z'],
-                    # rate setpoints (att-PID output)
+                    # rate setpoints from att-PID [deg/s]
                     'sp_gx': drone_state['sp_gx'], 'sp_gy': drone_state['sp_gy'], 'sp_gz': drone_state['sp_gz'],
                 })
 
@@ -1187,8 +1211,9 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             drone_state['roll']     = data['stabilizer.roll']
             drone_state['pitch']    = data['stabilizer.pitch']
             drone_state['yaw']      = data['stabilizer.yaw']
-            drone_state['sp_roll']  = data['ctrltarget.roll']
-            drone_state['sp_pitch'] = data['ctrltarget.pitch']
+            drone_state['sp_roll']  = data['controller.roll']
+            drone_state['sp_pitch'] = data['controller.pitch']
+            drone_state['sp_yaw']   = data['controller.yaw']
 
         def _rate_cb(timestamp, data, logconf):
             drone_state['gyro_x'] = data['gyro.x']
@@ -1199,9 +1224,12 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             drone_state['sp_gz']  = data['controller.yawRate']
 
         def _vel_sp_cb(timestamp, data, logconf):
-            drone_state['sp_vx'] = data['ctrltarget.vx']
-            drone_state['sp_vy'] = data['ctrltarget.vy']
-            drone_state['sp_vz'] = data['ctrltarget.vz']
+            drone_state['sp_x']  = data['posCtl.targetX']
+            drone_state['sp_y']  = data['posCtl.targetY']
+            drone_state['sp_z']  = data['posCtl.targetZ']
+            drone_state['sp_vx'] = data['posCtl.targetVX']
+            drone_state['sp_vy'] = data['posCtl.targetVY']
+            drone_state['sp_vz'] = data['posCtl.targetVZ']
 
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
@@ -1360,7 +1388,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ── Flight-quality metrics (circle phase only) ─────────────
             metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
-            compute_and_save_metrics(real_log, real_sp_log, duration_sec,
+            compute_and_save_metrics(real_log, duration_sec,
                                      positioning_system, metrics_dir)
             # -----------------------------------------------------------
 
