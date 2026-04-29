@@ -274,8 +274,14 @@ def pwm_to_rpm(pwm_values, kf, truncate_8bit=True):
 #  Trajectory generation  (takeoff → circle → land)
 # ===================================================================
 
-def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
+def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5,
+                        start_xy=(0.0, 0.0)):
     """Generate a smooth takeoff → circle → landing trajectory.
+
+    The whole trajectory is rigidly translated so that takeoff and landing
+    happen at (start_xy[0], start_xy[1]) in the world frame.  This lets the
+    real drone start from an arbitrary mocap position without jerking
+    toward the origin on takeoff.
 
     Returns
     -------
@@ -291,26 +297,27 @@ def generate_trajectory(ctrl_freq, duration_sec, hover_height=0.5, radius=0.5):
     circle_steps   = int(ctrl_freq * circle_time)
     landing_steps  = n_steps - takeoff_steps - circle_steps
 
+    ox, oy = start_xy   # trajectory origin in world frame
+
     # --- Phase 1: Takeoff (vertical climb to hover_height) ---
     for i in range(takeoff_steps):
         t = i / takeoff_steps
         z = hover_height * t
-        waypoints[i] = [0.0, 0.0, z, 0.0]
+        waypoints[i] = [ox, oy, z, 0.0]
 
     # --- Phase 2: Circle at hover_height ---
     for i in range(circle_steps):
         t = i / circle_steps
         angle = t * 2 * math.pi   # one full circle
-        x = radius * math.cos(angle) - radius  # start at (0,0)
+        x = radius * math.cos(angle) - radius  # starts at (0,0) relative
         y = radius * math.sin(angle)
-        waypoints[takeoff_steps + i] = [x, y, hover_height, 0.0]
+        waypoints[takeoff_steps + i] = [ox + x, oy + y, hover_height, 0.0]
 
-    # --- Phase 3: Landing (back to center, descend) ---
-    # First, the circle ends near (0, 0).  Descend smoothly.
+    # --- Phase 3: Landing (back to origin, descend) ---
     for i in range(landing_steps):
         t = i / landing_steps
         z = hover_height * (1.0 - t)
-        waypoints[takeoff_steps + circle_steps + i] = [0.0, 0.0, z, 0.0]
+        waypoints[takeoff_steps + circle_steps + i] = [ox, oy, z, 0.0]
 
     return waypoints
 
@@ -667,36 +674,53 @@ def _plot_comparison(real, sim):
     plt.show()
 
 
-def _plot_jitter(times, dts, target_freq):
-    """Tracer l'historique des périodes d'envoi (Jitter)."""
+def _plot_jitter(t_wall_log: list, t_nominal_log: list, target_freq: float) -> None:
+    """Plot cumulative drift vs nominal timeline and inter-send interval (jitter)."""
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("[PLOT] matplotlib not found — skipping jitter plot.")
         return
 
-    # Conversion en millisecondes pour une lecture plus intuitive
-    dts_ms = np.array(dts) * 1000.0
-    target_ms = (1.0 / target_freq) * 1000.0
+    t_wall = np.array(t_wall_log)
+    t_nominal = np.array(t_nominal_log)
+    drift_ms = (t_wall - t_wall[0] - (t_nominal - t_nominal[0])) * 1000.0
+    intervals_ms = np.diff(t_wall) * 1000.0
+    nominal_interval_ms = 1000.0 / target_freq
 
-    plt.figure(figsize=(12, 4))
-    plt.plot(times, dts_ms, label='Real period measured', color='purple', alpha=0.7)
-    
-    # Ligne idéale
-    plt.axhline(target_ms, color='red', linestyle='--', 
-                label=f'Ideal target ({target_ms:.1f} ms / {target_freq} Hz)')
-    
-    plt.xlabel('Time [s]')
-    plt.ylabel('Loop Period [ms]')
-    plt.title('Jitter Analysis (Radio Communication Stability)')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    
-    # Sauvegarde de l'image
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6))
+    fig.suptitle(f'Send Timing — Real Drone (nominal: {nominal_interval_ms:.1f} ms @ {target_freq:.0f} Hz)',
+                 fontsize=13)
+
+    ax = axes[0]
+    ax.plot(t_nominal, drift_ms, lw=0.8, alpha=0.9, label='drift vs nominal [ms]')
+    ax.axhline(0, color='red', ls='--', lw=1.2, label='perfect timing')
+    ax.set_ylabel('Drift [ms]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=8)
+    ax.set_title('Cumulative drift vs nominal timeline')
+    ax.grid(True, alpha=0.3)
+
+    ax = axes[1]
+    ax.plot(t_nominal[1:], intervals_ms, lw=0.6, alpha=0.7, label='inter-send interval [ms]')
+    ax.axhline(nominal_interval_ms, color='red', ls='--', lw=1.2,
+               label=f'nominal {nominal_interval_ms:.1f} ms')
+    ax.set_ylabel('Interval [ms]')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=8)
+    ax.set_title('Inter-send interval (jitter)')
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
     save_path = os.path.join(SCRIPT_DIR, 'jitter_results.png')
-    plt.savefig(save_path, dpi=150)
-    print(f"[PLOT] Graphique du jitter sauvegardé dans : {save_path}")
+    fig.savefig(save_path, dpi=150)
+    print(f"[PLOT] Saved to {save_path}")
+    print(f"[TIMING] n={len(intervals_ms)}  "
+          f"mean={np.mean(intervals_ms):.2f} ms  "
+          f"std={np.std(intervals_ms):.2f} ms  "
+          f"min={np.min(intervals_ms):.2f} ms  "
+          f"max={np.max(intervals_ms):.2f} ms  "
+          f"final_drift={drift_ms[-1]:.1f} ms")
     plt.show()
 
 
@@ -1104,10 +1128,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
     cflib.crtp.init_drivers()
 
-    CTRL_FREQ = 10   # position setpoints don't need high rate
-    waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
-                                    hover_height=hover_height, radius=radius)
-
+    CTRL_FREQ = 100   # position setpoints don't need high rate
     print(f"[REAL] Connecting to {uri} ...")
 
     cache_dir = os.path.join(SCRIPT_DIR, 'cache')
@@ -1128,7 +1149,8 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         # Set up logging to read back state (position + velocity + attitude)
         # This requires a positioning system (Lighthouse / Loco / MoCap)
         from cflib.crazyflie.log import LogConfig
-        log_state = LogConfig(name='State', period_in_ms=10)  # 100 Hz
+        LOG_MS = 50 # 20 Hz
+        log_state = LogConfig(name='State', period_in_ms=LOG_MS)  
         log_state.add_variable('stateEstimate.x',  'float')
         log_state.add_variable('stateEstimate.y',  'float')
         log_state.add_variable('stateEstimate.z',  'float')
@@ -1137,7 +1159,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.add_variable('stateEstimate.vz', 'float')
 
         # actual attitude + attitude setpoints from vel-PID (6 floats = 24 bytes)
-        log_att = LogConfig(name='Attitude', period_in_ms=10)
+        log_att = LogConfig(name='Attitude', period_in_ms=LOG_MS)
         log_att.add_variable('stabilizer.roll',   'float')
         log_att.add_variable('stabilizer.pitch',  'float')
         log_att.add_variable('stabilizer.yaw',    'float')
@@ -1146,7 +1168,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_att.add_variable('controller.yaw',    'float')  # att setpoint from vel-PID [deg]
 
         # actual gyro + rate setpoints from att-PID (6 floats = 24 bytes)
-        log_rate = LogConfig(name='AngRate', period_in_ms=10)
+        log_rate = LogConfig(name='AngRate', period_in_ms=LOG_MS)
         log_rate.add_variable('gyro.x',              'float')
         log_rate.add_variable('gyro.y',              'float')
         log_rate.add_variable('gyro.z',              'float')
@@ -1155,7 +1177,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_rate.add_variable('controller.yawRate',   'float')
 
         # position + velocity setpoints from pos-PID, body-yaw-aligned frame (6 floats = 24 bytes)
-        log_vel_sp = LogConfig(name='PidSp', period_in_ms=10)
+        log_vel_sp = LogConfig(name='PidSp', period_in_ms=LOG_MS)
         log_vel_sp.add_variable('posCtl.targetX',  'float')  # pos setpoint BYA [m]
         log_vel_sp.add_variable('posCtl.targetY',  'float')
         log_vel_sp.add_variable('posCtl.targetZ',  'float')
@@ -1244,21 +1266,24 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_rate.start()
         log_vel_sp.start()
 
+
         # ── Reset Kalman estimator ────────────────────────────────────
-        # Without this, the drone's position estimate keeps the value from
-        # the previous flight (or wherever the estimator drifted to).
-        # All trajectory setpoints are in the estimator frame, so if the
-        # estimator thinks the drone is at (1, 0, 0) the first setpoint
-        # (0, 0, z) will make it fly sideways — the drift you observe.
-        # After reset the estimator restarts from (0, 0, 0), which becomes
-        # the origin for the whole trajectory.
         print("[REAL] Resetting Kalman estimator...")
         cf.param.set_value('kalman.resetEstimation', '1')
         time.sleep(0.1)
         cf.param.set_value('kalman.resetEstimation', '0')
-        time.sleep(2.0)   # let filter converge and receive first log packets
+        time.sleep(2.0)   # On attend que le filtre converge ET que les paquets de logs arrivent !
+        
+        # --- NOUVEAU PLACEMENT ICI ---
+        # Maintenant les logs sont à jour avec la vraie position absolue Lighthouse
+        start_xy = np.array([drone_state['x'], drone_state['y']]) # <-- Note les crochets []
         print(f"[REAL] Estimator ready — pos=({drone_state['x']:.3f}, "
               f"{drone_state['y']:.3f}, {drone_state['z']:.3f})")
+
+        # ── Generate trajectory centered on the drone's actual start ──
+        waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
+                                        hover_height=hover_height,
+                                        radius=radius, start_xy=start_xy)
 
         # ── Unlock commander watchdog ─────────────────────────────────
         # The firmware requires receiving setpoints before it accepts real
@@ -1271,17 +1296,36 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         START = time.time()
         flight_start = START   # enable data logging in _state_cb
 
-        # --- Variables pour les statistiques de fréquence ---
         cmd_count = 0
-        max_loop_dt = 0.0
-        last_cmd_time = START
-        
-        # NOUVEAU : Listes pour stocker l'historique
-        loop_dt_log = []
-        loop_time_log = []
+
+        # Wall-clock timestamp at the start of each iteration (for drift/jitter analysis)
+        t_wall_log: list = []
+        t_nominal_log: list = []
+
+        def _sync_precise(target: float) -> None:
+            """Wait until target (time.perf_counter()). Sleeps most of the remaining
+            time, then busy-waits the last 2 ms for accuracy.
+            Requires timeBeginPeriod(1) on Windows so that sleep(<15 ms) is accurate."""
+            remaining = target - time.perf_counter()
+            if remaining > 0.002:
+                time.sleep(remaining - 0.002)
+            while time.perf_counter() < target:
+                pass
+
+        _win_timer_set = False
+        try:
+            import ctypes
+            ctypes.windll.winmm.timeBeginPeriod(1)
+            _win_timer_set = True
+        except Exception:
+            pass
+
+        ctrl_dt = 1.0 / CTRL_FREQ
+        loop_start_perf = time.perf_counter()
 
         try:
             for i in range(len(waypoints)):
+                t_iter_wall = time.time()
                 sp = waypoints[i]
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
@@ -1296,41 +1340,17 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                           f"{drone_state['y']:+.3f}, {drone_state['z']:.3f}]  "
                           f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
 
-                # --- NOUVEAU : Calcul et stockage du temps de boucle ---
-                current_time = time.time()
-                loop_dt = current_time - last_cmd_time
-                
-                # Enregistrement pour le graphique
-                loop_dt_log.append(loop_dt)
-                loop_time_log.append(current_time - START)
-
-                if loop_dt > max_loop_dt:
-                    max_loop_dt = loop_dt
-                
-                last_cmd_time = current_time
+                t_wall_log.append(t_iter_wall)
+                t_nominal_log.append(i / CTRL_FREQ)
                 cmd_count += 1
-                # --------------------------------------------------------
 
-                sync(i, START, 1.0 / CTRL_FREQ)
+                _sync_precise(loop_start_perf + (i + 1) * ctrl_dt)
 
         except KeyboardInterrupt:
             print("\n[REAL] Interrupted! Soft landing...")
         finally:
-
-            # --- NOUVEAU : Affichage des statistiques de communication ---
-            total_flight_time = time.time() - START
-            if total_flight_time > 0 and cmd_count > 0:
-                avg_freq = cmd_count / total_flight_time
-                print("\n" + "="*50)
-                print("[DIAGNOSTIC] --- STATISTIQUES D'ENVOI RADIO ---")
-                print(f"[DIAGNOSTIC] Commandes envoyées : {cmd_count}")
-                print(f"[DIAGNOSTIC] Temps d'exécution  : {total_flight_time:.2f} s")
-                print(f"[DIAGNOSTIC] Fréquence CIBLE  : {CTRL_FREQ} Hz")
-                print(f"[DIAGNOSTIC] Fréquence MOYENNE: {avg_freq:.2f} Hz")
-                print(f"[DIAGNOSTIC] Pire délai (max) : {max_loop_dt*1000:.1f} ms (Attendu: {1000/CTRL_FREQ:.1f} ms)")
-                print("="*50 + "\n")
-            # -------------------------------------------------------------
-
+            if _win_timer_set:
+                ctypes.windll.winmm.timeEndPeriod(1)
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
@@ -1377,14 +1397,20 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             real_rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
             sp_t_arr = np.array([e['t']   for e in real_sp_log])
             sp_arr   = np.array([e['pos'] for e in real_sp_log])
+
+            real_pos[:, 0] -= start_xy[0]
+            real_pos[:, 1] -= start_xy[1]
+
+            sp_arr[:, 0]   -= start_xy[0]
+            sp_arr[:, 1]   -= start_xy[1]
+
+
             real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
                              sp_t=sp_t_arr, sp=sp_arr)
 
-            #--- NOUVEAU : Affichage du graphique de Jitter ---
-            if loop_dt_log:
-                print("[REAL] Génération du graphique de jitter...")
-                _plot_jitter(loop_time_log, loop_dt_log, CTRL_FREQ)
-            # --------------------------------------------------
+            if t_wall_log:
+                print("[REAL] Generating timing plot...")
+                _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
 
             # ── Flight-quality metrics (circle phase only) ─────────────
             metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
