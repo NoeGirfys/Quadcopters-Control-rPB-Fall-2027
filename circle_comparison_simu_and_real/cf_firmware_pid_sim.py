@@ -1041,6 +1041,67 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         cf = scf.cf
         print("[REAL] Connected!")
 
+        # ─── Radio link health monitoring ─────────────────────────────
+        # The Crazyradio reports link quality (0-100 %) periodically and
+        # fires connection_lost / disconnected on hard radio failures
+        # (e.g. "Too many packets lost" from the cflib radio driver).
+        #
+        # We use these to:
+        #   1. log every degradation / loss event
+        #   2. trigger a preemptive controlled descent when the link
+        #      stays below LINK_QUALITY_ABORT_PCT for too long, before
+        #      cflib gives up entirely.
+        LINK_QUALITY_WARN_PCT  = 70.0   # transient warning threshold
+        LINK_QUALITY_ABORT_PCT = 40.0   # sustained → abort to landing
+        LINK_BAD_ABORT_SEC     = 0.5    # how long to stay below abort
+
+        link_status = {
+            'quality':      100.0,
+            'lost':         False,    # True after connection_lost callback
+            'disconnect':   False,    # True after disconnected callback
+            'reason':       None,     # error message from connection_lost
+            'bad_since':    None,     # time.time() when quality first dropped
+            'warn_active':  False,
+            'n_low_events': 0,
+            'min_quality':  100.0,
+        }
+
+        def _link_quality_cb(percent):
+            link_status['quality'] = percent
+            if percent < link_status['min_quality']:
+                link_status['min_quality'] = percent
+
+            now = time.time()
+            if percent < LINK_QUALITY_ABORT_PCT:
+                if link_status['bad_since'] is None:
+                    link_status['bad_since'] = now
+            else:
+                link_status['bad_since'] = None
+
+            if percent < LINK_QUALITY_WARN_PCT:
+                if not link_status['warn_active']:
+                    link_status['warn_active'] = True
+                    link_status['n_low_events'] += 1
+                    print(f"[LINK] WARNING: link quality dropped to "
+                          f"{percent:.0f}%")
+            else:
+                if link_status['warn_active']:
+                    print(f"[LINK] Link quality recovered ({percent:.0f}%)")
+                    link_status['warn_active'] = False
+
+        def _connection_lost_cb(uri_str, msg):
+            link_status['lost']   = True
+            link_status['reason'] = msg
+            print(f"[LINK] *** CONNECTION LOST *** {uri_str} — {msg}")
+
+        def _disconnected_cb(uri_str):
+            link_status['disconnect'] = True
+            print(f"[LINK] Disconnected from {uri_str}")
+
+        cf.link_quality_updated.add_callback(_link_quality_cb)
+        cf.connection_lost.add_callback(_connection_lost_cb)
+        cf.disconnected.add_callback(_disconnected_cb)
+
         # ─── Estimator & external-position configuration ──────────────
         # Force the Kalman filter (required for mocap-based localization)
         # and set the standard deviation of the incoming extpose packets.
@@ -1199,6 +1260,20 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
         try:
             for i in range(len(waypoints)):
+                # ─── Link health check ────────────────────────────
+                if link_status['lost'] or link_status['disconnect']:
+                    print(f"[REAL] Aborting flight loop — link lost "
+                          f"(reason: {link_status['reason']}).")
+                    break
+                if (link_status['bad_since'] is not None
+                        and (time.time() - link_status['bad_since'])
+                            > LINK_BAD_ABORT_SEC):
+                    print(f"[REAL] Aborting flight loop — link quality "
+                          f"≤ {LINK_QUALITY_ABORT_PCT:.0f}% for "
+                          f">{LINK_BAD_ABORT_SEC*1000:.0f} ms "
+                          f"(now {link_status['quality']:.0f}%).")
+                    break
+
                 t_iter_wall = time.time()
                 sp = waypoints[i]
                 sp_pos = sp[0:3]
@@ -1234,41 +1309,71 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
-            land_x = drone_state['x']
-            land_y = drone_state['y']
-            land_z = drone_state['z']
-            land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
-            land_freq = 20  # Hz — position setpoints don't need high rate
-            land_steps = int(land_freq * land_duration)
-            cutoff_z = 0.05  # m — cut motors below this height
+            # Skip the active descent if the radio link is already gone —
+            # the firmware will hit its commander watchdog (~500 ms) on its
+            # own; trying to send packets only triggers more error logs.
+            link_dead = link_status['lost'] or link_status['disconnect']
+            if link_dead:
+                print(f"[REAL] Skipping smooth landing — link is down "
+                      f"(reason: {link_status['reason']}). Firmware watchdog "
+                      f"will idle the motors.")
+            else:
+                land_x = drone_state['x']
+                land_y = drone_state['y']
+                land_z = drone_state['z']
+                land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
+                land_freq = 20  # Hz — position setpoints don't need high rate
+                land_steps = int(land_freq * land_duration)
+                cutoff_z = 0.05  # m — cut motors below this height
 
-            print(f"[REAL] Landing from z={land_z:.2f}m over {land_duration:.1f}s...")
+                print(f"[REAL] Landing from z={land_z:.2f}m over "
+                      f"{land_duration:.1f}s...")
 
-            land_start = time.time()
-            for j in range(land_steps):
-                frac = (j + 1) / land_steps
-                # Smooth cubic descent
-                z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
-                if z < cutoff_z:
-                    break
-                real_sp_log.append({'t': time.time() - flight_start,
-                                    'pos': np.array([land_x, land_y, z])})
-                cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
-                time.sleep(1.0 / land_freq)
+                for j in range(land_steps):
+                    if link_status['lost'] or link_status['disconnect']:
+                        print("[REAL] Link died during landing — aborting "
+                              "descent loop.")
+                        break
+                    frac = (j + 1) / land_steps
+                    # Smooth cubic descent
+                    z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
+                    if z < cutoff_z:
+                        break
+                    real_sp_log.append({'t': time.time() - flight_start,
+                                        'pos': np.array([land_x, land_y, z])})
+                    try:
+                        cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
+                    except Exception as e:
+                        print(f"[REAL] send_position_setpoint failed: {e}")
+                        break
+                    time.sleep(1.0 / land_freq)
 
-            # Notify end of setpoints — this tells the firmware the PC-side
-            # commander is stopping cleanly, rather than vanishing (watchdog
-            # timeout).  The firmware then idles the motors gracefully without
-            # entering a hard-locked state that would require a power cycle.
-            cf.commander.send_notify_setpoint_stop()
-            time.sleep(0.1)
+                # Notify end of setpoints — tells the firmware the PC-side
+                # commander is stopping cleanly, so it idles the motors
+                # gracefully instead of hard-locking on watchdog timeout.
+                try:
+                    cf.commander.send_notify_setpoint_stop()
+                except Exception:
+                    pass
+                time.sleep(0.1)
 
-            log_state.stop()
-            log_att.stop()
+            try:
+                log_state.stop()
+                log_att.stop()
+            except Exception:
+                pass
 
             # Stop OptiTrack streaming thread cleanly
             mocap_stop.set()
             mocap_thread.join(timeout=2.0)
+
+            # ─── Link health summary ──────────────────────────
+            print(f"[LINK] Summary — min_quality={link_status['min_quality']:.0f}%  "
+                  f"low_quality_events={link_status['n_low_events']}  "
+                  f"connection_lost={link_status['lost']}  "
+                  f"disconnected={link_status['disconnect']}")
+            if link_status['reason']:
+                print(f"[LINK] Failure reason: {link_status['reason']}")
 
             print("[REAL] Landed and cleaned up.")
 
@@ -1340,9 +1445,9 @@ MODES:
     parser.add_argument('--natnet-server-ip', default='192.168.0.24',
                         help='IP address of the Motive PC / NatNet server '
                              '(default: 192.168.0.24)')
-    parser.add_argument('--natnet-client-ip', default='192.168.0.100',
+    parser.add_argument('--natnet-client-ip', default='192.168.0.56', # 192.168.0.100 if ethernet, 192.168.0.56 if wifi on TPLink-A2BC
                         help='IP address of this PC on the OptiTrack network '
-                             '(default: 192.168.0.100)')
+                             '(default: 192.168.0.56)')
     parser.add_argument('--natnet-unicast', action='store_true',
                         help='Use unicast instead of multicast (default: multicast)')
     parser.add_argument('--rigid-body-id', default=4, type=int,

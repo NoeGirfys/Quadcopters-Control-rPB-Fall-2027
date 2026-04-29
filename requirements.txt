@@ -4,3 +4,4 @@
 -e ./gym-pybullet-drones 
 motioncapture
 cflib
+cfclient
