@@ -73,8 +73,6 @@ from crazyflie_firmware.constants import UINT16_MAX  # noqa: E402
 from crazyflie_firmware.firmware import (  # noqa: E402
     Lpf2pData,
     PidObject,
-    CrazyfliePositionController,
-    CrazyflieAttitudeController,
     CrazyfliePowerDistribution,
     cap_angle,
     CrazyflieFirmwarePID,
@@ -703,6 +701,243 @@ def _plot_jitter(times, dts, target_freq):
 
 
 # ===================================================================
+#  Flight-quality metrics — circle phase only
+# ===================================================================
+
+_TAKEOFF_DURATION = 2  # seconds — must match generate_trajectory
+
+
+def compute_and_save_metrics(real_log, real_sp_log, duration_sec,
+                              positioning_system, output_dir):
+    """Compute and persist tracking metrics for the circle phase.
+
+    Position RMSE is computed against interpolated setpoints (state
+    estimates and setpoints come at different rates, so np.interp is
+    used to align them).
+
+    Velocity / attitude / gyro are reported as σ (std-dev).  RMSE
+    against those setpoints would require logging internal PID outputs
+    from the drone (e.g. posCtlPid.xVel), whose variable names depend
+    on the firmware version and are not standardised — left as a TODO.
+    """
+    import json
+    from datetime import datetime
+
+    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    circle_start = float(_TAKEOFF_DURATION)
+    circle_end   = float(duration_sec - _TAKEOFF_DURATION)
+
+    if not real_log or not real_sp_log:
+        print("[METRICS] No flight data — skipping.")
+        return None
+
+    all_t    = np.array([e['t']                                          for e in real_log])
+    all_pos  = np.array([[e['x'],    e['y'],    e['z']]                  for e in real_log])
+    all_vel  = np.array([[e['vx'],   e['vy'],   e['vz']]                 for e in real_log])
+    all_rpy  = np.array([[e['roll'], e['pitch'], e['yaw']]               for e in real_log])
+    all_gyro = np.array([[e.get('gx', 0.0), e.get('gy', 0.0),
+                          e.get('gz', 0.0)]                              for e in real_log])
+
+    sp_t   = np.array([e['t']   for e in real_sp_log])
+    sp_pos = np.array([e['pos'] for e in real_sp_log])
+
+    # ── Filter to circle phase ────────────────────────────────────────────
+    mask = (all_t >= circle_start) & (all_t <= circle_end)
+    t    = all_t[mask]
+    pos  = all_pos[mask]
+    vel  = all_vel[mask]
+    rpy  = all_rpy[mask]
+    gyro = all_gyro[mask]
+
+    if len(t) < 2:
+        print("[METRICS] Circle phase too short — skipping metrics.")
+        return None
+
+    # ── Interpolate setpoints onto state-estimate timestamps ──────────────
+    # np.interp clamps to boundary values outside the range — safe here.
+    sp_interp = np.column_stack([
+        np.interp(t, sp_t, sp_pos[:, 0]),
+        np.interp(t, sp_t, sp_pos[:, 1]),
+        np.interp(t, sp_t, sp_pos[:, 2]),
+    ])
+
+    pos_err = pos - sp_interp                        # (N, 3) signed error
+    err_3d  = np.linalg.norm(pos_err, axis=1)        # (N,) Euclidean 3-D error
+
+    metrics = {
+        'positioning_system': positioning_system,
+        'timestamp':          timestamp,
+        'circle_phase_s':     [circle_start, circle_end],
+        'n_samples':          int(len(t)),
+        'position_tracking': {
+            'rmse_3d_m':    float(np.sqrt(np.mean(err_3d ** 2))),
+            'rmse_x_m':     float(np.sqrt(np.mean(pos_err[:, 0] ** 2))),
+            'rmse_y_m':     float(np.sqrt(np.mean(pos_err[:, 1] ** 2))),
+            'rmse_z_m':     float(np.sqrt(np.mean(pos_err[:, 2] ** 2))),
+            'mae_3d_m':     float(np.mean(err_3d)),
+            'max_err_3d_m': float(np.max(err_3d)),
+            'std_err_3d_m': float(np.std(err_3d)),
+        },
+        'position_std_m': {
+            'x': float(np.std(pos[:, 0])),
+            'y': float(np.std(pos[:, 1])),
+            'z': float(np.std(pos[:, 2])),
+        },
+        'velocity_std_m_s': {
+            'vx': float(np.std(vel[:, 0])),
+            'vy': float(np.std(vel[:, 1])),
+            'vz': float(np.std(vel[:, 2])),
+        },
+        'attitude_std_deg': {
+            'roll':  float(np.std(rpy[:, 0])),
+            'pitch': float(np.std(rpy[:, 1])),
+            'yaw':   float(np.std(rpy[:, 2])),
+        },
+        'attitude_rate_std_deg_s': {
+            'gx': float(np.std(gyro[:, 0])),
+            'gy': float(np.std(gyro[:, 1])),
+            'gz': float(np.std(gyro[:, 2])),
+        },
+    }
+
+    # ── Print summary ─────────────────────────────────────────────────────
+    pt = metrics['position_tracking']
+    ps = metrics['position_std_m']
+    vs = metrics['velocity_std_m_s']
+    at = metrics['attitude_std_deg']
+    ar = metrics['attitude_rate_std_deg_s']
+
+    print("\n" + "=" * 62)
+    print(f" METRICS  [{positioning_system.upper()}]  "
+          f"circle {circle_start:.0f}–{circle_end:.0f} s  ({len(t)} samples)")
+    print("=" * 62)
+    print(f"  Pos RMSE 3-D        : {pt['rmse_3d_m']*100:6.2f} cm")
+    print(f"  Pos RMSE x / y / z  : "
+          f"{pt['rmse_x_m']*100:.2f} / {pt['rmse_y_m']*100:.2f} / {pt['rmse_z_m']*100:.2f} cm")
+    print(f"  Pos MAE  3-D        : {pt['mae_3d_m']*100:6.2f} cm"
+          f"   max: {pt['max_err_3d_m']*100:.2f} cm")
+    print(f"  Pos std  x / y / z  : "
+          f"{ps['x']*100:.2f} / {ps['y']*100:.2f} / {ps['z']*100:.2f} cm")
+    print(f"  Vel std vx / vy / vz: "
+          f"{vs['vx']:.3f} / {vs['vy']:.3f} / {vs['vz']:.3f} m/s")
+    print(f"  Att std  r / p / y  : "
+          f"{at['roll']:.2f} / {at['pitch']:.2f} / {at['yaw']:.2f} °")
+    print(f"  Rate std gx/gy/gz   : "
+          f"{ar['gx']:.1f} / {ar['gy']:.1f} / {ar['gz']:.1f} °/s")
+    print("=" * 62 + "\n")
+
+    # ── Save JSON ──────────────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir,
+                             f'metrics_{positioning_system}_{timestamp}.json')
+    with open(json_path, 'w') as fh:
+        json.dump(metrics, fh, indent=2)
+    print(f"[METRICS] JSON  → {json_path}")
+
+    # ── Plot ───────────────────────────────────────────────────────────────
+    _plot_metrics(t, pos, sp_interp, pos_err, err_3d, vel, rpy, gyro,
+                  metrics, positioning_system, timestamp, output_dir)
+
+    return metrics
+
+
+def _plot_metrics(t, pos, sp_interp, pos_err, err_3d, vel, rpy, gyro,
+                  metrics, positioning_system, timestamp, output_dir):
+    """4-row × 3-column figure: position tracking, error, attitude, gyro + top-view."""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping metrics plot.")
+        return
+
+    tr = t - t[0]   # time relative to circle start [s]
+    pt = metrics['position_tracking']
+    at = metrics['attitude_std_deg']
+    ar = metrics['attitude_rate_std_deg_s']
+
+    fig = plt.figure(figsize=(18, 14))
+    fig.suptitle(
+        f"Flight Quality — {positioning_system.upper()}  |  {timestamp}  |  "
+        f"Pos-RMSE 3-D = {pt['rmse_3d_m']*100:.2f} cm",
+        fontsize=13,
+    )
+    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.50, wspace=0.35)
+
+    # ── Row 0: position tracking ──────────────────────────────────────────
+    for col, (lbl, axis) in enumerate(zip(['x [m]', 'y [m]', 'z [m]'], 'xyz')):
+        ax = fig.add_subplot(gs[0, col])
+        ax.plot(tr, pos[:, col],       color='tomato',    lw=1.5, label='estimated')
+        ax.plot(tr, sp_interp[:, col], color='steelblue', lw=1.0,
+                ls='--', label='setpoint')
+        ax.set_ylabel(lbl)
+        ax.set_title(f'Position {axis}')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 1: position error ─────────────────────────────────────────────
+    for col, axis in enumerate('xy'):
+        ax = fig.add_subplot(gs[1, col])
+        ax.plot(tr, pos_err[:, col], color='darkorange', lw=1.2)
+        ax.axhline(0, color='k', lw=0.5, ls=':')
+        ax.set_ylabel(f'err {axis} [m]')
+        ax.set_title(f'Error {axis}')
+        ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[1, 2])
+    ax.plot(tr, err_3d, color='firebrick', lw=1.2, label='|err|')
+    ax.axhline(pt['rmse_3d_m'], color='steelblue', ls='--', lw=1.0,
+               label=f"RMSE {pt['rmse_3d_m']*100:.2f} cm")
+    ax.axhline(pt['mae_3d_m'],  color='seagreen',  ls=':',  lw=1.0,
+               label=f"MAE  {pt['mae_3d_m']*100:.2f} cm")
+    ax.set_ylabel('3-D error [m]')
+    ax.set_title('3-D Position Error')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    # ── Row 2: attitude ────────────────────────────────────────────────────
+    att_cfg = [('roll [°]',  'roll',  'dodgerblue'),
+               ('pitch [°]', 'pitch', 'darkorange'),
+               ('yaw [°]',   'yaw',   'seagreen')]
+    for col, (lbl, key, clr) in enumerate(att_cfg):
+        ax = fig.add_subplot(gs[2, col])
+        ax.plot(tr, rpy[:, col], color=clr, lw=1.2)
+        ax.set_ylabel(lbl)
+        ax.set_title(f'{lbl.split(" ")[0]}  (σ = {at[key]:.2f}°)')
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 3: gyro gx, gy + top-view X-Y trajectory ─────────────────────
+    for col, (lbl, gkey, clr) in enumerate(
+            [('gx [°/s]', 'gx', 'purple'), ('gy [°/s]', 'gy', 'teal')]):
+        ax = fig.add_subplot(gs[3, col])
+        ax.plot(tr, gyro[:, col], color=clr, lw=1.0)
+        ax.set_ylabel(lbl)
+        ax.set_title(f'Gyro {["X","Y"][col]}  (σ = {ar[gkey]:.1f} °/s)')
+        ax.set_xlabel('Time [s]')
+        ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[3, 2])
+    ax.plot(sp_interp[:, 0], sp_interp[:, 1],
+            color='steelblue', ls='--', lw=1.0, label='setpoint', zorder=2)
+    sc = ax.scatter(pos[:, 0], pos[:, 1], c=tr, cmap='plasma',
+                    s=3, zorder=3, label='estimated')
+    plt.colorbar(sc, ax=ax, label='t [s]')
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_aspect('equal')
+    ax.set_title('Top-view (X-Y)')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    os.makedirs(output_dir, exist_ok=True)
+    png_path = os.path.join(output_dir,
+                            f'metrics_{positioning_system}_{timestamp}.png')
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    print(f"[PLOT]    PNG   → {png_path}")
+    plt.show()
+
+
+# ===================================================================
 #  Push Python PID constants → real Crazyflie firmware via cflib
 # ===================================================================
 
@@ -766,17 +1001,17 @@ def push_pid_gains_to_drone(cf):
 #  MAIN — Real drone modes
 # ===================================================================
 
-def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
+def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
              duration_sec=15, hover_height=0.5, radius=0.5,
-             push_gains=False):
-    """Run with a real Crazyflie drone.
+             push_gains=False, positioning_system='unknown'):
+    """Run with a real Crazyflie drone in position-setpoint mode.
+
+    All PIDs (position, velocity, attitude, rate) run on the drone.
+    The PC sends only position setpoints at 10 Hz via
+    send_position_setpoint(x, y, z, yaw).
 
     Parameters
     ----------
-    mode : str
-        'attitude' — PC runs pos+vel PIDs, sends attitude+thrust to drone
-        'rate'     — PC runs pos+vel+att PIDs, sends rate+thrust to drone
-        'position' — Sends position setpoint, drone runs all PIDs
     uri : str
         Crazyflie radio URI
     push_gains : bool
@@ -789,20 +1024,10 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
     cflib.crtp.init_drivers()
 
-    # Control rate for the PC-side loop
-    if mode == "position":
-        CTRL_FREQ = 10     # position setpoints don't need high rate
-    else:
-        CTRL_FREQ = 100    # attitude / rate commands: 100 Hz is typical
-
+    CTRL_FREQ = 10   # position setpoints don't need high rate
     waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
                                     hover_height=hover_height, radius=radius)
 
-    # We only need the position controller for 'attitude' and 'rate' modes
-    pos_ctrl = CrazyfliePositionController() if mode != "position" else None
-    att_ctrl = CrazyflieAttitudeController() if mode == "rate"    else None
-
-    print(f"[REAL] Mode: {mode}")
     print(f"[REAL] Connecting to {uri} ...")
 
     cache_dir = os.path.join(SCRIPT_DIR, 'cache')
@@ -820,16 +1045,6 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         if push_gains:
             push_pid_gains_to_drone(cf)
 
-        # For rate mode, disable the onboard stabilizer's attitude PID
-        # so send_setpoint sends rate commands directly.
-        # [FW] The firmware checks flightmode.stabModeRoll/Pitch/Yaw params.
-        if mode == "rate":
-            cf.param.set_value('flightmode.stabModeRoll',  '0')
-            cf.param.set_value('flightmode.stabModeRoll',  '0')
-            cf.param.set_value('flightmode.stabModePitch', '0')
-            cf.param.set_value('flightmode.stabModeYaw',   '0')
-            print("[REAL] Rate mode: disabled onboard attitude stabilization")
-
         # Set up logging to read back state (position + velocity + attitude)
         # This requires a positioning system (Lighthouse / Loco / MoCap)
         from cflib.crazyflie.log import LogConfig
@@ -845,11 +1060,11 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
         log_att.add_variable('stabilizer.roll',  'float')
         log_att.add_variable('stabilizer.pitch', 'float')
         log_att.add_variable('stabilizer.yaw',   'float')
-        # Gyro for rate mode
-        if mode == "rate":
-            log_att.add_variable('gyro.x', 'float')
-            log_att.add_variable('gyro.y', 'float')
-            log_att.add_variable('gyro.z', 'float')
+
+        log_rate = LogConfig(name='AngRate', period_in_ms=10)
+        log_rate.add_variable('gyro.x', 'float')
+        log_rate.add_variable('gyro.y', 'float')
+        log_rate.add_variable('gyro.z', 'float')
 
         # Shared state dict updated by log callbacks
         drone_state = {
@@ -874,26 +1089,31 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
             if flight_start is not None:
                 real_log.append({
                     't':     time.time() - flight_start,
-                    'x':     drone_state['x'],   'y':   drone_state['y'],   'z':   drone_state['z'],
-                    'vx':    drone_state['vx'],  'vy':  drone_state['vy'],  'vz':  drone_state['vz'],
-                    'roll':  drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
+                    'x':  drone_state['x'],    'y':  drone_state['y'],    'z':  drone_state['z'],
+                    'vx': drone_state['vx'],   'vy': drone_state['vy'],   'vz': drone_state['vz'],
+                    'roll': drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
+                    'gx': drone_state['gyro_x'], 'gy': drone_state['gyro_y'], 'gz': drone_state['gyro_z'],
                 })
 
         def _att_cb(timestamp, data, logconf):
             drone_state['roll']  = data['stabilizer.roll']
             drone_state['pitch'] = data['stabilizer.pitch']
             drone_state['yaw']   = data['stabilizer.yaw']
-            if mode == "rate":
-                drone_state['gyro_x'] = data['gyro.x']
-                drone_state['gyro_y'] = data['gyro.y']
-                drone_state['gyro_z'] = data['gyro.z']
+
+        def _rate_cb(timestamp, data, logconf):
+            drone_state['gyro_x'] = data['gyro.x']
+            drone_state['gyro_y'] = data['gyro.y']
+            drone_state['gyro_z'] = data['gyro.z']
 
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
+        log_rate.data_received_cb.add_callback(_rate_cb)
         cf.log.add_config(log_state)
         cf.log.add_config(log_att)
+        cf.log.add_config(log_rate)
         log_state.start()
         log_att.start()
+        log_rate.start()
 
         # ── Reset Kalman estimator ────────────────────────────────────
         # Without this, the drone's position estimate keeps the value from
@@ -937,55 +1157,8 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
 
-                # Log setpoint for every control step (all modes)
                 real_sp_log.append({'t': time.time() - flight_start, 'pos': sp_pos.copy()})
-
-                if mode == "position":
-                    # ─── Mode: position ───────────────────────────
-                    # All PIDs run on the drone.
-                    # send_position_setpoint(x, y, z, yaw)
-                    cf.commander.send_position_setpoint(
-                        sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
-
-                elif mode == "attitude":
-                    # ─── Mode: attitude ───────────────────────────
-                    # PC runs pos+vel PIDs → sends attitude + thrust
-                    # Drone runs attitude + rate PIDs.
-                    #
-                    # send_setpoint(roll, pitch, yawrate, thrust)
-                    #   roll, pitch: degrees
-                    #   yawrate: deg/s
-                    #   thrust: uint16 [0..65535]
-                    state_pos = [drone_state['x'], drone_state['y'], drone_state['z']]
-                    state_vel = [drone_state['vx'], drone_state['vy'], drone_state['vz']]
-                    yaw_deg   = drone_state['yaw']
-
-                    thrust, roll_d, pitch_d = pos_ctrl.update(
-                        sp_pos, state_pos, state_vel, yaw_deg)
-
-                    cf.commander.send_setpoint(
-                        roll_d, pitch_d, sp_yaw_rate, int(thrust))
-
-                elif mode == "rate":
-                    # ─── Mode: rate ───────────────────────────────
-                    # PC runs pos+vel+attitude PIDs → sends rate + thrust
-                    # Drone runs only rate PID.
-                    #
-                    # With stabMode disabled, send_setpoint interprets
-                    # roll/pitch as rate commands (deg/s).
-                    state_pos = [drone_state['x'], drone_state['y'], drone_state['z']]
-                    state_vel = [drone_state['vx'], drone_state['vy'], drone_state['vz']]
-                    rpy_deg   = [drone_state['roll'], drone_state['pitch'], drone_state['yaw']]
-
-                    thrust, roll_d, pitch_d = pos_ctrl.update(
-                        sp_pos, state_pos, state_vel, rpy_deg[2])
-
-                    roll_rate_d, pitch_rate_d, yaw_rate_d = att_ctrl.correct_attitude(
-                        rpy_deg[0], rpy_deg[1], rpy_deg[2],
-                        roll_d, pitch_d, 0.0)  # yaw desired = 0
-
-                    cf.commander.send_setpoint(
-                        roll_rate_d, pitch_rate_d, yaw_rate_d, int(thrust))
+                cf.commander.send_position_setpoint(sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
 
                 # --- Timing ---
                 if i % (CTRL_FREQ * 1) == 0:
@@ -1032,16 +1205,6 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
-            # Uses position mode for simplicity and safety (the onboard
-            # PIDs handle attitude even if we were in rate mode before).
-            #
-            # First, restore normal stabilization so send_position_setpoint works.
-            if mode == "rate":
-                cf.param.set_value('flightmode.stabModeRoll',  '1')
-                cf.param.set_value('flightmode.stabModePitch', '1')
-                cf.param.set_value('flightmode.stabModeYaw',   '1')
-                time.sleep(0.05)
-
             land_x = drone_state['x']
             land_y = drone_state['y']
             land_z = drone_state['z']
@@ -1073,12 +1236,7 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
 
             log_state.stop()
             log_att.stop()
-
-            # Restore normal flight mode (if not already done above)
-            if mode == "rate":
-                # Already restored above before landing
-                pass
-
+            log_rate.stop()
             print("[REAL] Landed and cleaned up.")
 
         # ─── Post-flight: run headless sim + comparison plot ──────────────
@@ -1097,6 +1255,12 @@ def run_real(mode, uri="radio://0/80/2M/E7E7E7E7E7",
                 print("[REAL] Génération du graphique de jitter...")
                 _plot_jitter(loop_time_log, loop_dt_log, CTRL_FREQ)
             # --------------------------------------------------
+
+            # ── Flight-quality metrics (circle phase only) ─────────────
+            metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
+            compute_and_save_metrics(real_log, real_sp_log, duration_sec,
+                                     positioning_system, metrics_dir)
+            # -----------------------------------------------------------
 
             print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
             if HAS_PYBULLET_DRONES:
@@ -1119,13 +1283,11 @@ def main():
         epilog="""
 MODES:
   sim        Full firmware PID in Python → RPMs → PyBullet  (default)
-  attitude   Pos+vel PIDs on PC → send_setpoint(att, thrust) to drone
-  rate       Pos+vel+att PIDs on PC → send_setpoint(rate, thrust)
-  position   Only trajectory → send_position_setpoint (all PIDs on drone)
+  position   Real drone: trajectory only → send_position_setpoint (all PIDs on drone)
         """)
     parser.add_argument('--mode', default='sim',
-                        choices=['sim', 'attitude', 'rate', 'position'],
-                        help='Control mode (default: sim)')
+                        choices=['sim', 'position'],
+                        help='sim: full firmware PID in PyBullet | position: real drone, all PIDs on-board (default: sim)')
     parser.add_argument('--duration', default=10, type=float,
                         help='Flight duration in seconds (default: 10)')
     parser.add_argument('--height', default=1.0, type=float,
@@ -1140,6 +1302,9 @@ MODES:
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
                         help='Overwrite drone PID gains with Python constants before flying')
+    parser.add_argument('--positioning', default='unknown',
+                        choices=['flowdeck', 'lighthouse', 'loco', 'mocap', 'unknown'],
+                        help='Positioning system used — labels output files (default: unknown)')
     args = parser.parse_args()
 
     if args.mode == 'sim':
@@ -1147,9 +1312,10 @@ MODES:
                 hover_height=args.height, radius=args.radius,
                 simulate_flow_deck=args.flow_deck_sim)
     else:
-        run_real(mode=args.mode, uri=args.uri,
+        run_real(uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
-                 radius=args.radius, push_gains=args.push_gains)
+                 radius=args.radius, push_gains=args.push_gains,
+                 positioning_system=args.positioning)
 
 
 if __name__ == "__main__":
