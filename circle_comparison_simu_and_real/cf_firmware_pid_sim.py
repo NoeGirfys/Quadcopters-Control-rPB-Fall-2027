@@ -725,17 +725,94 @@ def _plot_jitter(t_wall_log: list, t_nominal_log: list, target_freq: float) -> N
 
 
 # ===================================================================
+#  Log resampling — align all async callback streams to a common grid
+# ===================================================================
+
+def _check_gaps(arr, label, max_gap_factor=2.5):
+    """Warn if any inter-sample gap exceeds max_gap_factor × median interval."""
+    if len(arr) < 2:
+        return
+    dt = np.diff(arr[:, 0])
+    nominal = np.median(dt)
+    if nominal <= 0:
+        return
+    gaps = np.where(dt > max_gap_factor * nominal)[0]
+    if len(gaps):
+        print(f"[WARN] {label}: {len(gaps)} gap(s) détecté(s) "
+              f"(max {dt[gaps].max()*1000:.0f} ms, nominal {nominal*1000:.0f} ms)")
+
+
+def resample_logs(logs, fs=20.0):
+    """Interpole tous les flux de log sur une grille temporelle commune.
+
+    Chaque flux (state, att, rate, vel_sp) est enregistré indépendamment
+    par son callback avec son propre timestamp.  Cette fonction les aligne
+    sur une grille régulière à `fs` Hz par interpolation linéaire.
+
+    Parameters
+    ----------
+    logs : dict with keys 'state', 'att', 'rate', 'vel_sp'
+        Each value is a list of tuples (t, col1, col2, ...) where t is
+        time.time() - flight_start in seconds.
+    fs : float
+        Resampling frequency [Hz].  Should be <= the log callback rate
+        (default LOG_MS = 50 ms → 20 Hz).
+
+    Returns
+    -------
+    dict with keys:
+        't'      — common time grid (N,)
+        'state'  — (N, 6)  x, y, z, vx, vy, vz
+        'att'    — (N, 6)  roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+        'rate'   — (N, 6)  gx, gy, gz, sp_gx, sp_gy, sp_gz
+        'vel_sp' — (N, 6)  sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz
+    """
+    arrays = {}
+    for key in ('state', 'att', 'rate', 'vel_sp'):
+        raw = logs[key]
+        if len(raw) < 2:
+            raise ValueError(f"[RESAMPLE] Flux '{key}' trop court ({len(raw)} samples)")
+        arr = np.array(raw, dtype=float)
+        _check_gaps(arr, key)
+        arrays[key] = arr
+
+    # Common time window: intersection of all streams
+    t_start = max(arr[0, 0]  for arr in arrays.values())
+    t_end   = min(arr[-1, 0] for arr in arrays.values())
+    if t_end <= t_start:
+        raise ValueError("[RESAMPLE] Pas de fenêtre temporelle commune entre les flux.")
+
+    t_grid = np.arange(t_start, t_end, 1.0 / fs)
+
+    def interp_cols(arr):
+        return np.column_stack([
+            np.interp(t_grid, arr[:, 0], arr[:, c])
+            for c in range(1, arr.shape[1])
+        ])
+
+    return {
+        't':      t_grid,
+        'state':  interp_cols(arrays['state']),    # x, y, z, vx, vy, vz
+        'att':    interp_cols(arrays['att']),      # roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+        'rate':   interp_cols(arrays['rate']),     # gx, gy, gz, sp_gx, sp_gy, sp_gz
+        'vel_sp': interp_cols(arrays['vel_sp']),   # sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz
+    }
+
+
+# ===================================================================
 #  Flight-quality metrics — circle phase only
 # ===================================================================
 
 _TAKEOFF_DURATION = 2  # seconds — must match generate_trajectory
 
 
-def compute_and_save_metrics(real_log, duration_sec,
+def compute_and_save_metrics(resampled, duration_sec,
                               positioning_system, output_dir):
     """Compute and persist tracking metrics for the circle phase.
 
-    All setpoints come from the drone's own log at 100 Hz — no interpolation.
+    Accepts the output of resample_logs() — all streams are already aligned
+    on a common time grid, so no further interpolation is needed here.
+
     posCtl.targetX/Y/Z and posCtl.targetVX/VY/VZ are in the body-yaw-aligned
     (BYA) frame and are rotated back to the world frame using the concurrent
     yaw estimate before computing errors.
@@ -745,6 +822,11 @@ def compute_and_save_metrics(real_log, duration_sec,
       Velocity  : posCtl.targetVX/VY/VZ (BYA→world) vs  stateEstimate.vx/vy/vz
       Attitude  : controller.roll/pitch/yaw          vs  stabilizer.roll/pitch/yaw
       Rate      : controller.rollRate/pitchRate/yawRate vs gyro.x/y/z
+
+    Parameters
+    ----------
+    resampled : dict returned by resample_logs()
+        Keys: 't', 'state', 'att', 'rate', 'vel_sp'
     """
     import json
     from datetime import datetime
@@ -753,24 +835,23 @@ def compute_and_save_metrics(real_log, duration_sec,
     circle_start = float(_TAKEOFF_DURATION)
     circle_end   = float(duration_sec - _TAKEOFF_DURATION)
 
-    if not real_log:
-        print("[METRICS] No flight data — skipping.")
+    if resampled is None or len(resampled.get('t', [])) < 2:
+        print("[METRICS] No resampled flight data — skipping.")
         return None
 
-    all_t      = np.array([e['t']                                               for e in real_log])
-    all_pos    = np.array([[e['x'],       e['y'],       e['z']]                 for e in real_log])
-    all_vel    = np.array([[e['vx'],      e['vy'],      e['vz']]                for e in real_log])
-    all_sp_bya = np.array([[e.get('sp_x', 0.0), e.get('sp_y', 0.0),
-                             e.get('sp_z', 0.0)]                                for e in real_log])
-    all_sv_bya = np.array([[e.get('sp_vx', 0.0), e.get('sp_vy', 0.0),
-                             e.get('sp_vz', 0.0)]                               for e in real_log])
-    all_rpy    = np.array([[e['roll'],    e['pitch'],   e['yaw']]               for e in real_log])
-    all_sp_att = np.array([[e.get('sp_roll', 0.0), e.get('sp_pitch', 0.0),
-                             e.get('sp_yaw',  0.0)]                             for e in real_log])
-    all_gyro   = np.array([[e.get('gx', 0.0),  e.get('gy', 0.0),
-                             e.get('gz', 0.0)]                                  for e in real_log])
-    all_sp_gyr = np.array([[e.get('sp_gx', 0.0), e.get('sp_gy', 0.0),
-                             e.get('sp_gz', 0.0)]                               for e in real_log])
+    all_t      = resampled['t']
+    # state  columns: x, y, z, vx, vy, vz
+    all_pos    = resampled['state'][:, 0:3]
+    all_vel    = resampled['state'][:, 3:6]
+    # vel_sp columns: sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz  (BYA frame)
+    all_sp_bya = resampled['vel_sp'][:, 0:3]
+    all_sv_bya = resampled['vel_sp'][:, 3:6]
+    # att    columns: roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+    all_rpy    = resampled['att'][:, 0:3]
+    all_sp_att = resampled['att'][:, 3:6]
+    # rate   columns: gx, gy, gz, sp_gx, sp_gy, sp_gz
+    all_gyro   = resampled['rate'][:, 0:3]
+    all_sp_gyr = resampled['rate'][:, 3:6]
 
     # ── Filter to circle phase ────────────────────────────────────────────
     mask   = (all_t >= circle_start) & (all_t <= circle_end)
@@ -1136,18 +1217,26 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         cf = scf.cf
         print("[REAL] Connected!")
 
-        # On s'assure de désactiver l'écart-type adaptatif
-        cf.param.set_value('motion.adaptive', '0')
+        # ── Positioning-system-specific parameters ────────────────────
+        # FlowDeck-only: disable adaptive std-dev and raise fixed std-dev
+        # to reduce Kalman oscillations caused by optical-flow noise.
+        # These parameters must NOT be written when using Lighthouse/Loco/MoCap
+        # as they are irrelevant and could confuse the Kalman filter.
+        if positioning_system == 'flowdeck':
+            # On s'assure de désactiver l'écart-type adaptatif
+            cf.param.set_value('motion.adaptive', '0')
 
-        # On augmente l'écart-type fixe du Flowdeck (par défaut à 2.0)
-        # La valeur de 10.0 est un bon point de départ pour lisser les oscillations selon les tests de Bitcraze
-        cf.param.set_value('motion.flowStdFixed', '10.0')
+            # On augmente l'écart-type fixe du Flowdeck (par défaut à 2.0)
+            # La valeur de 10.0 est un bon point de départ pour lisser les oscillations selon les tests de Bitcraze
+            cf.param.set_value('motion.flowStdFixed', '10.0')
 
         if push_gains:
             push_pid_gains_to_drone(cf)
 
-        # Set up logging to read back state (position + velocity + attitude)
-        # This requires a positioning system (Lighthouse / Loco / MoCap)
+        # Set up logging to read back the full PID cascade state.
+        # Works with any positioning system (Lighthouse, FlowDeck, Loco, MoCap).
+        # Each LogConfig fires its callback independently; timestamps are recorded
+        # per-callback and streams are resampled onto a common grid after the flight.
         from cflib.crazyflie.log import LogConfig
         LOG_MS = 50 # 20 Hz
         log_state = LogConfig(name='State', period_in_ms=LOG_MS)  
@@ -1185,73 +1274,63 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_vel_sp.add_variable('posCtl.targetVY', 'float')
         log_vel_sp.add_variable('posCtl.targetVZ', 'float')
 
-        # Shared state dict updated by log callbacks
-        drone_state = {
-            'x': 0, 'y': 0, 'z': 0, 'vx': 0, 'vy': 0, 'vz': 0,
-            'sp_x': 0, 'sp_y': 0, 'sp_z': 0,          # pos setpoints (BYA → world in metrics)
-            'sp_vx': 0, 'sp_vy': 0, 'sp_vz': 0,        # vel setpoints (BYA → world in metrics)
-            'roll': 0, 'pitch': 0, 'yaw': 0,
-            'sp_roll': 0, 'sp_pitch': 0, 'sp_yaw': 0,  # att setpoints [deg]
-            'gyro_x': 0, 'gyro_y': 0, 'gyro_z': 0,
-            'sp_gx': 0, 'sp_gy': 0, 'sp_gz': 0,        # rate setpoints [deg/s]
+        # Per-stream raw logs — each callback appends (t, col1, col2, ...).
+        # Using independent lists avoids the temporal skew that arises when a
+        # single snapshot dict is read by one callback but was last written by
+        # a different callback up to LOG_MS ms earlier.
+        raw_logs = {
+            'state':  [],   # (t, x, y, z, vx, vy, vz)
+            'att':    [],   # (t, roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw)
+            'rate':   [],   # (t, gx, gy, gz, sp_gx, sp_gy, sp_gz)
+            'vel_sp': [],   # (t, sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz)
         }
 
-        # Timestamped data logs — filled during flight for comparison plot
-        real_log    = []   # one entry per _state_cb callback (~100 Hz)
-        real_sp_log = []   # one entry per setpoint command sent
-        flight_start = None  # set just before the main flight loop
+        # Lightweight shared dict used only for pre-flight position readout
+        # (start_xy) and for the landing fallback.
+        drone_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+
+        # Timestamped setpoint log — one entry per send_position_setpoint call
+        real_sp_log = []
+        flight_start = None   # set just before the main flight loop
 
         def _state_cb(timestamp, data, logconf):
-            drone_state['x']  = data['stateEstimate.x']
-            drone_state['y']  = data['stateEstimate.y']
-            drone_state['z']  = data['stateEstimate.z']
-            drone_state['vx'] = data['stateEstimate.vx']
-            drone_state['vy'] = data['stateEstimate.vy']
-            drone_state['vz'] = data['stateEstimate.vz']
-            # Record full state snapshot (attitude values come from last _att_cb)
+            drone_pos['x'] = data['stateEstimate.x']
+            drone_pos['y'] = data['stateEstimate.y']
+            drone_pos['z'] = data['stateEstimate.z']
             if flight_start is not None:
-                real_log.append({
-                    't':  time.time() - flight_start,
-                    # actual position & velocity (world frame)
-                    'x':  drone_state['x'],     'y':  drone_state['y'],     'z':  drone_state['z'],
-                    'vx': drone_state['vx'],    'vy': drone_state['vy'],    'vz': drone_state['vz'],
-                    # pos/vel setpoints from pos-PID — body-yaw-aligned; converted in metrics
-                    'sp_x':  drone_state['sp_x'],  'sp_y':  drone_state['sp_y'],  'sp_z':  drone_state['sp_z'],
-                    'sp_vx': drone_state['sp_vx'], 'sp_vy': drone_state['sp_vy'], 'sp_vz': drone_state['sp_vz'],
-                    # actual attitude [deg]
-                    'roll': drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
-                    # attitude setpoints from vel-PID [deg]
-                    'sp_roll': drone_state['sp_roll'], 'sp_pitch': drone_state['sp_pitch'],
-                    'sp_yaw':  drone_state['sp_yaw'],
-                    # actual angular rates [deg/s]
-                    'gx': drone_state['gyro_x'], 'gy': drone_state['gyro_y'], 'gz': drone_state['gyro_z'],
-                    # rate setpoints from att-PID [deg/s]
-                    'sp_gx': drone_state['sp_gx'], 'sp_gy': drone_state['sp_gy'], 'sp_gz': drone_state['sp_gz'],
-                })
+                t = time.time() - flight_start
+                raw_logs['state'].append((
+                    t,
+                    data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.z'],
+                    data['stateEstimate.vx'], data['stateEstimate.vy'], data['stateEstimate.vz'],
+                ))
 
         def _att_cb(timestamp, data, logconf):
-            drone_state['roll']     = data['stabilizer.roll']
-            drone_state['pitch']    = data['stabilizer.pitch']
-            drone_state['yaw']      = data['stabilizer.yaw']
-            drone_state['sp_roll']  = data['controller.roll']
-            drone_state['sp_pitch'] = data['controller.pitch']
-            drone_state['sp_yaw']   = data['controller.yaw']
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['att'].append((
+                    t,
+                    data['stabilizer.roll'],  data['stabilizer.pitch'],  data['stabilizer.yaw'],
+                    data['controller.roll'],  data['controller.pitch'],   data['controller.yaw'],
+                ))
 
         def _rate_cb(timestamp, data, logconf):
-            drone_state['gyro_x'] = data['gyro.x']
-            drone_state['gyro_y'] = data['gyro.y']
-            drone_state['gyro_z'] = data['gyro.z']
-            drone_state['sp_gx']  = data['controller.rollRate']
-            drone_state['sp_gy']  = data['controller.pitchRate']
-            drone_state['sp_gz']  = data['controller.yawRate']
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['rate'].append((
+                    t,
+                    data['gyro.x'],               data['gyro.y'],               data['gyro.z'],
+                    data['controller.rollRate'],  data['controller.pitchRate'],  data['controller.yawRate'],
+                ))
 
         def _vel_sp_cb(timestamp, data, logconf):
-            drone_state['sp_x']  = data['posCtl.targetX']
-            drone_state['sp_y']  = data['posCtl.targetY']
-            drone_state['sp_z']  = data['posCtl.targetZ']
-            drone_state['sp_vx'] = data['posCtl.targetVX']
-            drone_state['sp_vy'] = data['posCtl.targetVY']
-            drone_state['sp_vz'] = data['posCtl.targetVZ']
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['vel_sp'].append((
+                    t,
+                    data['posCtl.targetX'],  data['posCtl.targetY'],  data['posCtl.targetZ'],
+                    data['posCtl.targetVX'], data['posCtl.targetVY'], data['posCtl.targetVZ'],
+                ))
 
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
@@ -1276,9 +1355,9 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         
         # --- NOUVEAU PLACEMENT ICI ---
         # Maintenant les logs sont à jour avec la vraie position absolue Lighthouse
-        start_xy = np.array([drone_state['x'], drone_state['y']]) # <-- Note les crochets []
-        print(f"[REAL] Estimator ready — pos=({drone_state['x']:.3f}, "
-              f"{drone_state['y']:.3f}, {drone_state['z']:.3f})")
+        start_xy = np.array([drone_pos['x'], drone_pos['y']]) # <-- Note les crochets []
+        print(f"[REAL] Estimator ready — pos=({drone_pos['x']:.3f}, "
+              f"{drone_pos['y']:.3f}, {drone_pos['z']:.3f})")
 
         # ── Generate trajectory centered on the drone's actual start ──
         waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
@@ -1336,8 +1415,8 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                 # --- Timing ---
                 if i % (CTRL_FREQ * 1) == 0:
                     t = i / CTRL_FREQ
-                    print(f"  t={t:5.1f}s  pos=[{drone_state['x']:+.3f}, "
-                          f"{drone_state['y']:+.3f}, {drone_state['z']:.3f}]  "
+                    print(f"  t={t:5.1f}s  pos=[{drone_pos['x']:+.3f}, "
+                          f"{drone_pos['y']:+.3f}, {drone_pos['z']:.3f}]  "
                           f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
 
                 t_wall_log.append(t_iter_wall)
@@ -1354,9 +1433,9 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
-            land_x = drone_state['x']
-            land_y = drone_state['y']
-            land_z = drone_state['z']
+            land_x = drone_pos['x']
+            land_y = drone_pos['y']
+            land_z = drone_pos['z']
             land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
             land_freq = 20  # Hz — position setpoints don't need high rate
             land_steps = int(land_freq * land_duration)
@@ -1364,7 +1443,6 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
             print(f"[REAL] Landing from z={land_z:.2f}m over {land_duration:.1f}s...")
 
-            land_start = time.time()
             for j in range(land_steps):
                 frac = (j + 1) / land_steps
                 # Smooth cubic descent
@@ -1373,7 +1451,11 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                     break
                 real_sp_log.append({'t': time.time() - flight_start,
                                     'pos': np.array([land_x, land_y, z])})
-                cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
+                try:
+                    cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
+                except Exception as e:
+                    print(f"[REAL] send_position_setpoint failed during landing: {e}")
+                    break
                 time.sleep(1.0 / land_freq)
 
             # Notify end of setpoints — this tells the firmware the PC-side
@@ -1389,43 +1471,56 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             log_vel_sp.stop()
             print("[REAL] Landed and cleaned up.")
 
-        # ─── Post-flight: run headless sim + comparison plot ──────────────
-        if real_log:
-            real_t   = np.array([e['t']   for e in real_log])
-            real_pos = np.array([[e['x'],  e['y'],  e['z']]       for e in real_log])
-            real_vel = np.array([[e['vx'], e['vy'], e['vz']]      for e in real_log])
-            real_rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
-            sp_t_arr = np.array([e['t']   for e in real_sp_log])
-            sp_arr   = np.array([e['pos'] for e in real_sp_log])
+        # ─── Post-flight: resample all streams + comparison plot ─────────────
+        # Check that at least the state stream has data before proceeding
+        if any(len(v) < 2 for v in raw_logs.values()):
+            print("[REAL] Insufficient log data for resampling — skipping metrics.")
+        else:
+            try:
+                resampled = resample_logs(raw_logs, fs=20.0)
+            except ValueError as e:
+                print(f"[REAL] Resampling failed: {e} — skipping metrics.")
+                resampled = None
 
-            real_pos[:, 0] -= start_xy[0]
-            real_pos[:, 1] -= start_xy[1]
+            if resampled is not None:
+                # Rebuild real_pos / real_vel / real_rpy from resampled state for
+                # the comparison plot (same format expected by _plot_comparison).
+                real_t   = resampled['t']
+                real_pos = resampled['state'][:, 0:3].copy()
+                real_vel = resampled['state'][:, 3:6].copy()
+                real_rpy = resampled['att'][:, 0:3].copy()
 
-            sp_arr[:, 0]   -= start_xy[0]
-            sp_arr[:, 1]   -= start_xy[1]
+                sp_t_arr = np.array([e['t']   for e in real_sp_log]) if real_sp_log else np.array([])
+                sp_arr   = np.array([e['pos'] for e in real_sp_log]) if real_sp_log else np.zeros((0, 3))
 
+                # Remove trajectory world-frame offset so overlay with sim is aligned
+                real_pos[:, 0] -= start_xy[0]
+                real_pos[:, 1] -= start_xy[1]
+                if sp_arr.size > 0:
+                    sp_arr[:, 0] -= start_xy[0]
+                    sp_arr[:, 1] -= start_xy[1]
 
-            real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
-                             sp_t=sp_t_arr, sp=sp_arr)
+                real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
+                                 sp_t=sp_t_arr, sp=sp_arr)
 
-            if t_wall_log:
-                print("[REAL] Generating timing plot...")
-                _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
+                if t_wall_log:
+                    print("[REAL] Generating timing plot...")
+                    _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
 
-            # ── Flight-quality metrics (circle phase only) ─────────────
-            metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
-            compute_and_save_metrics(real_log, duration_sec,
-                                     positioning_system, metrics_dir)
-            # -----------------------------------------------------------
+                # ── Flight-quality metrics (circle phase only) ─────────────
+                metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
+                compute_and_save_metrics(resampled, duration_sec,
+                                         positioning_system, metrics_dir)
+                # -----------------------------------------------------------
 
-            print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
-            if HAS_PYBULLET_DRONES:
-                sim_data = run_sim(duration_sec=duration_sec, gui=False,
-                                   hover_height=hover_height, radius=radius, plot=False,
-                                   simulate_flow_deck=False)
-                _plot_comparison(real_data, sim_data)
-            else:
-                print("[REAL] pybullet-drones not found — skipping comparison plot.")
+                print("[REAL] Running headless simulation for comparison...")
+                if HAS_PYBULLET_DRONES:
+                    sim_data = run_sim(duration_sec=duration_sec, gui=False,
+                                       hover_height=hover_height, radius=radius, plot=False,
+                                       simulate_flow_deck=False)
+                    _plot_comparison(real_data, sim_data)
+                else:
+                    print("[REAL] pybullet-drones not found — skipping comparison plot.")
 
 
 # ===================================================================
