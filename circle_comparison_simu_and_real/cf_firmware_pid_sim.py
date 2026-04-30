@@ -1183,6 +1183,51 @@ def push_pid_gains_to_drone(cf):
 
 
 # ===================================================================
+#  Positioning system detection
+# ===================================================================
+
+def detect_positioning_system(cf) -> dict:
+    """Detect installed positioning decks via firmware deck parameters.
+
+    Reads deck.bcFlow2 and deck.bcLighthouse4 to determine which
+    positioning systems are physically present on the drone.
+
+    Returns
+    -------
+    dict with keys:
+        'has_flowdeck'  : bool
+        'has_lighthouse': bool
+        'name'          : str — 'flowdeck', 'lighthouse',
+                          'flowdeck+lighthouse', or 'unknown'
+    """
+    has_flowdeck = False
+    has_lighthouse = False
+
+    try:
+        has_flowdeck = int(cf.param.get_value('deck.bcFlow2')) != 0
+    except Exception:
+        pass
+
+    try:
+        has_lighthouse = int(cf.param.get_value('deck.bcLighthouse4')) != 0
+    except Exception:
+        pass
+
+    active = []
+    if has_flowdeck:
+        active.append('flowdeck')
+    if has_lighthouse:
+        active.append('lighthouse')
+
+    name = '+'.join(active) if active else 'unknown'
+
+    print(f"[DECK]  bcFlow2={int(has_flowdeck)}  bcLighthouse4={int(has_lighthouse)}"
+          f"  ->  positioning='{name}'")
+
+    return {'has_flowdeck': has_flowdeck, 'has_lighthouse': has_lighthouse, 'name': name}
+
+
+# ===================================================================
 #  MAIN — Real drone modes
 # ===================================================================
 
@@ -1216,6 +1261,12 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
     with SyncCrazyflie(uri, cf=Crazyflie(rw_cache=cache_dir)) as scf:
         cf = scf.cf
         print("[REAL] Connected!")
+
+        # ── Auto-detect installed positioning decks ───────────────────
+        deck_info = detect_positioning_system(cf)
+        if positioning_system == 'unknown':
+            positioning_system = deck_info['name']
+            print(f"[REAL] Auto-detected positioning_system='{positioning_system}'")
 
         # ── Positioning-system-specific parameters ────────────────────
         # FlowDeck-only: disable adaptive std-dev and raise fixed std-dev
@@ -1273,6 +1324,35 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_vel_sp.add_variable('posCtl.targetVX', 'float')  # vel setpoint BYA [m/s]
         log_vel_sp.add_variable('posCtl.targetVY', 'float')
         log_vel_sp.add_variable('posCtl.targetVZ', 'float')
+
+        # ── Deck status monitoring ────────────────────────────────────
+        # Live snapshot updated by callbacks; values shown in the periodic
+        # status line and in the post-flight summary.
+        #   motion.squal    : optical surface quality [0–255] — 0 = bad/no signal
+        #   range.zrange    : VL53L1x distance to ground [mm]
+        #   lighthouse.status : 0=no BS, 1=received/missing data, 2=estimator OK
+        #   lighthouse.bsReceive / bsActive : base-station bitmasks
+        pos_sys_status = {
+            'flow_squal': 0,
+            'flow_range': 0,
+            'lh_status':  0,
+            'lh_bs_rx':   0,
+            'lh_bs_act':  0,
+        }
+
+        log_flow_status = None
+        log_lh_status   = None
+
+        if deck_info['has_flowdeck']:
+            log_flow_status = LogConfig(name='FlowStatus', period_in_ms=LOG_MS)
+            log_flow_status.add_variable('motion.squal', 'uint8_t')
+            log_flow_status.add_variable('range.zrange', 'uint16_t')
+
+        if deck_info['has_lighthouse']:
+            log_lh_status = LogConfig(name='LhStatus', period_in_ms=LOG_MS)
+            log_lh_status.add_variable('lighthouse.status',    'uint8_t')
+            log_lh_status.add_variable('lighthouse.bsReceive', 'uint16_t')
+            log_lh_status.add_variable('lighthouse.bsActive',  'uint16_t')
 
         # Per-stream raw logs — each callback appends (t, col1, col2, ...).
         # Using independent lists avoids the temporal skew that arises when a
@@ -1332,6 +1412,15 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                     data['posCtl.targetVX'], data['posCtl.targetVY'], data['posCtl.targetVZ'],
                 ))
 
+        def _flow_status_cb(timestamp, data, logconf):
+            pos_sys_status['flow_squal'] = data['motion.squal']
+            pos_sys_status['flow_range'] = data['range.zrange']
+
+        def _lh_status_cb(timestamp, data, logconf):
+            pos_sys_status['lh_status'] = data['lighthouse.status']
+            pos_sys_status['lh_bs_rx']  = data['lighthouse.bsReceive']
+            pos_sys_status['lh_bs_act'] = data['lighthouse.bsActive']
+
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
         log_rate.data_received_cb.add_callback(_rate_cb)
@@ -1344,6 +1433,16 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_att.start()
         log_rate.start()
         log_vel_sp.start()
+
+        if log_flow_status is not None:
+            log_flow_status.data_received_cb.add_callback(_flow_status_cb)
+            cf.log.add_config(log_flow_status)
+            log_flow_status.start()
+
+        if log_lh_status is not None:
+            log_lh_status.data_received_cb.add_callback(_lh_status_cb)
+            cf.log.add_config(log_lh_status)
+            log_lh_status.start()
 
 
         # ── Reset Kalman estimator ────────────────────────────────────
@@ -1415,9 +1514,20 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                 # --- Timing ---
                 if i % (CTRL_FREQ * 1) == 0:
                     t = i / CTRL_FREQ
+                    ps_parts = []
+                    if deck_info['has_flowdeck']:
+                        ps_parts.append(
+                            f"flow(squal={pos_sys_status['flow_squal']}"
+                            f" rng={pos_sys_status['flow_range']}mm)")
+                    if deck_info['has_lighthouse']:
+                        ps_parts.append(
+                            f"lh(st={pos_sys_status['lh_status']}"
+                            f" bs_act=0x{pos_sys_status['lh_bs_act']:02x})")
+                    ps_str = '  ' + '  '.join(ps_parts) if ps_parts else ''
                     print(f"  t={t:5.1f}s  pos=[{drone_pos['x']:+.3f}, "
                           f"{drone_pos['y']:+.3f}, {drone_pos['z']:.3f}]  "
-                          f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
+                          f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]"
+                          f"{ps_str}")
 
                 t_wall_log.append(t_iter_wall)
                 t_nominal_log.append(i / CTRL_FREQ)
@@ -1469,7 +1579,26 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             log_att.stop()
             log_rate.stop()
             log_vel_sp.stop()
+            if log_flow_status is not None:
+                log_flow_status.stop()
+            if log_lh_status is not None:
+                log_lh_status.stop()
             print("[REAL] Landed and cleaned up.")
+
+        # ── Positioning system summary ────────────────────────────────────────
+        print("\n[POS_SYS] Detected: " + positioning_system)
+        if deck_info['has_flowdeck']:
+            squal = pos_sys_status['flow_squal']
+            rng   = pos_sys_status['flow_range']
+            squal_warn = '  <- WARNING: squal=0 (optical sensor not tracking)' if squal == 0 else ''
+            rng_warn   = '  <- WARNING: range=0 (range sensor inactive)' if rng == 0 else ''
+            print(f"[POS_SYS] FlowDeck   — squal={squal}{squal_warn}  range={rng} mm{rng_warn}")
+        if deck_info['has_lighthouse']:
+            bs_act  = pos_sys_status['lh_bs_act']
+            bs_rx   = pos_sys_status['lh_bs_rx']
+            lh_warn = '  <- WARNING: no active base stations' if bs_act == 0 else ''
+            print(f"[POS_SYS] Lighthouse — status={pos_sys_status['lh_status']}  "
+                  f"bsReceive=0x{bs_rx:04x}  bsActive=0x{bs_act:04x}{lh_warn}")
 
         # ─── Post-flight: resample all streams + comparison plot ─────────────
         # Check that at least the state stream has data before proceeding
