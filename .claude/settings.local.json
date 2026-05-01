@@ -6,7 +6,14 @@
       "WebFetch(domain:www.bitcraze.io)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:arxiv.org)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(ls *.bat *.sh)",
+      "Bash(ls .venv venv env)",
+      "Bash(conda env *)",
+      "Read(//c/Users/niels/anaconda3/envs/**)",
+      "Bash(\"C:/Users/niels/anaconda3/envs/venv_cf_313/python.exe\" -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(C:/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c ' *)",
+      "Bash(\"C:/Users/niels/anaconda3/envs/venv_cf_313/python.exe\" training_MAML/train_maml.py --epochs 1 --meta-batch 1 --k-inner 2 --k-outer 2 --t-sim 0.2 --hidden 16 --dynamics linearized --tag smoke)"
     ]
   }
 }
