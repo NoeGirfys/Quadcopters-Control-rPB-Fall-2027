@@ -60,13 +60,13 @@ def compute_mass_params(m_extra: float, r_offset: tuple) -> MassParams:
     d = r_com
     norm_d2 = (d * d).sum()
     outer_d = d.unsqueeze(-1) @ d.unsqueeze(0)                 # (3,3)
-    I_drone_new = I_drone + C.M_BASE * (norm_d2 * I3 - outer_d)
+    I_drone_new = I_drone + C.M_BASE * (norm_d2 * I3 - outer_d) # inertia of the basic drone (without extra mass) around the new CoM
 
     # Point mass m_extra at r_off, expressed about the new CoM.
     s = r_off - r_com
     norm_s2 = (s * s).sum()
     outer_s = s.unsqueeze(-1) @ s.unsqueeze(0)
-    I_extra_new = m_extra * (norm_s2 * I3 - outer_s)
+    I_extra_new = m_extra * (norm_s2 * I3 - outer_s) #inertia of the extra mass around the new CoM
 
     I_total = I_drone_new + I_extra_new
     I_inv = torch.linalg.inv(I_total)

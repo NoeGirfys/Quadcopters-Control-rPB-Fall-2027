@@ -28,7 +28,15 @@ from .mass_params import MassParams
 _MOTOR_POS_T = torch.tensor(C.MOTOR_POS)        # (4, 3)
 _YAW_SIGNS_T = torch.tensor(C.YAW_SIGNS)        # (4,)
 
-
+"""
+_a = L / math.sqrt(2)
+MOTOR_POS = np.array([
+    [+_a, -_a, 0.0],   # M1 front-right
+    [-_a, -_a, 0.0],   # M2 rear-right
+    [-_a, +_a, 0.0],   # M3 rear-left
+    [+_a, +_a, 0.0],   # M4 front-left
+], dtype=np.float32)
+"""
 def _torques_body(F_i: torch.Tensor, M_yaw_i: torch.Tensor,
                   r_com: torch.Tensor) -> torch.Tensor:
     """Body torque about new CoM. F_i (B,4), r_com (1,3) -> (B,3)."""
@@ -52,7 +60,7 @@ def nonlinear_step(state: torch.Tensor, rpm: torch.Tensor,
     theta, q    = state[:, 8], state[:, 9]
     psi, r      = state[:, 10], state[:, 11]
 
-    yaw_signs = _YAW_SIGNS_T.to(rpm.device)
+    yaw_signs = _YAW_SIGNS_T.to(rpm.device) # = (-1, +1, -1, +1)
     F_i      = (rpm ** 2) * C.KF
     M_yaw_i  = (rpm ** 2) * C.KM * yaw_signs
     F_total  = F_i.sum(dim=-1)                                         # (B,)

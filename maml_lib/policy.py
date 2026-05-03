@@ -25,8 +25,8 @@ class PolicyMLP(nn.Module):
         self.register_buffer("pos_scale",
                              torch.tensor(C.POS_SCALE, dtype=torch.float32))
 
-        input_dim  = 12 + 3
-        output_dim = 4
+        input_dim  = 12 + 3 # 12D state + 3D position target
+        output_dim = 4 # thrust roll pitch yawrate
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.Tanh(),

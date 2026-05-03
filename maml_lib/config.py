@@ -87,22 +87,22 @@ MOTOR_TAU        = 0.02
 MOTOR_ALPHA      = ATTITUDE_UPDATE_DT / (MOTOR_TAU + ATTITUDE_UPDATE_DT)
 
 X_SCALE = np.array([
-    1.0, 1.0,
-    1.0, 1.0,
-    1.0, 1.0,
-    np.deg2rad(30), np.deg2rad(200),
-    np.deg2rad(30), np.deg2rad(200),
-    np.deg2rad(45), np.deg2rad(120),
+    1.0, 1.0, # x, vx
+    1.0, 1.0, # y, vy
+    1.0, 1.0, # z, vz
+    np.deg2rad(30), np.deg2rad(200), # phi, p
+    np.deg2rad(30), np.deg2rad(200), # theta, q
+    np.deg2rad(45), np.deg2rad(120), # psi, r
 ], dtype=np.float32)
 POS_SCALE = 1.0
 
 OBS_NOISE_STD = torch.tensor([
-    0.01, 0.05,
-    0.01, 0.05,
-    0.01, 0.05,
-    math.radians(2),  math.radians(10),
-    math.radians(2),  math.radians(10),
-    math.radians(2),  math.radians(10),
+    0.01, 0.05, # x, vx
+    0.01, 0.05, # y, vy
+    0.01, 0.05, # z, vz
+    math.radians(2),  math.radians(10), # phi, p
+    math.radians(2),  math.radians(10), # theta, q
+    math.radians(2),  math.radians(10), # psi, r
 ], dtype=torch.float32)
 
 Q_DIAG = np.array([
