@@ -16,15 +16,8 @@ Outer loop:
 ``maml_order=2`` (default) propagates gradients through the inner-loop
 gradients (full MAML). ``maml_order=1`` is FOMAML: cheaper, no
 second-order graph.
-
-Task pool:
-  ``meta_train`` accepts either a single ``Task`` (fresh sampling at
-  every meta-iteration) or a list of ``Task`` (fixed pool — at each
-  epoch we draw ``meta_batch`` of them). The pool form is preferred for
-  smoother training curves and structured task families (e.g. one task
-  per motor).
 """
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, List
 
 import numpy as np
 import torch
@@ -42,7 +35,6 @@ except ImportError:                                # PyTorch < 2.0
 from .cost import trajectory_cost
 from .rollout import rollout
 from .mass_params import MassParams
-from .tasks import Task
 
 
 def _sample_x0(x0_pool: torch.Tensor, k: int,
@@ -50,7 +42,7 @@ def _sample_x0(x0_pool: torch.Tensor, k: int,
     """
     Draw k initial points without puting them back in the pool ( => can not select
     twice the same initial point). If one asks more than available,
-    returns all the pool. Enables to make the batchs inner and outer.
+    returns all the pool. Enables to make the batchs inner and outer.    
     """
     B0 = x0_pool.shape[0]
     if k >= B0:
@@ -78,93 +70,9 @@ def _clip_grads(grads, max_norm: float = 1.0):
     return [g * coef for g in grads]
 
 
-def _pick_task_indices(n_tasks: int, meta_batch: int,
-                       gen: torch.Generator) -> List[int]:
-    """Indices of the tasks to use in this meta-update.
-
-    * meta_batch <= n_tasks  ->  random subset, without replacement
-    * meta_batch  > n_tasks  ->  with replacement (rarely needed)
-    """
-    if meta_batch <= n_tasks:
-        return torch.randperm(n_tasks, generator=gen)[:meta_batch].tolist()
-    return torch.randint(0, n_tasks, (meta_batch,), generator=gen).tolist()
-
-
-def _as_task_list(tasks: Union[Task, Sequence[Task]]) -> List[Task]:
-    """Normalise a single Task or a list/tuple of Tasks into a list."""
-    if isinstance(tasks, Task):
-        return [tasks]
-    return list(tasks)
-
-
-def _evaluate_on_masses(
-    policy: torch.nn.Module,
-    eval_masses: Sequence[MassParams],
-    x0_pool: torch.Tensor,
-    *,
-    dynamics_step: Callable,
-    n_steps: int,
-    n_inner_steps: int,
-    k_inner: int,
-    lr_inner: float,
-    terminal_weight: float,
-    z_weight: float,
-    gen: torch.Generator,
-    device: str,
-) -> dict:
-    """No-grad evaluation: for each held-out task, measure the loss before
-    and after `n_inner_steps` of inner adaptation. Returns aggregate stats.
-
-    Used to monitor true generalisation during training.
-    """
-    pre_losses, post_losses = [], []
-    for mass in eval_masses:
-        mass = mass.to(device)
-
-        # ---- Pre-adapt: original policy --------------------------------
-        with torch.no_grad():
-            X = rollout(lambda s, t: policy(s, t), x0_pool, n_steps,
-                        mass, dynamics_step)
-            L_pre = trajectory_cost(X, terminal_weight,
-                                    z_weight=z_weight).mean().item()
-        pre_losses.append(L_pre)
-
-        # ---- Inner adaptation (no graph beyond each step) --------------
-        theta = {n: p.detach().clone().requires_grad_(True)
-                 for n, p in policy.named_parameters()}
-        for _ in range(n_inner_steps):
-            x0 = _sample_x0(x0_pool, k_inner, gen)
-            X = rollout(_make_fn(policy, theta), x0, n_steps,
-                        mass, dynamics_step)
-            L = trajectory_cost(X, terminal_weight,
-                                z_weight=z_weight).mean()
-            grads = torch.autograd.grad(L, tuple(theta.values()),
-                                        create_graph=False)
-            grads = _clip_grads(grads, max_norm=1.0)
-            theta = {n: (p - lr_inner * g).detach().requires_grad_(True)
-                     for (n, p), g in zip(theta.items(), grads)}
-
-        # ---- Post-adapt loss on the FULL pool --------------------------
-        with torch.no_grad():
-            X = rollout(_make_fn(policy, theta), x0_pool, n_steps,
-                        mass, dynamics_step)
-            L_post = trajectory_cost(X, terminal_weight,
-                                     z_weight=z_weight).mean().item()
-        post_losses.append(L_post)
-
-    return {
-        "pre_mean":  float(np.mean(pre_losses)),
-        "pre_max":   float(np.max(pre_losses)),
-        "post_mean": float(np.mean(post_losses)),
-        "post_max":  float(np.max(post_losses)),
-        "pre_per_task":  pre_losses,
-        "post_per_task": post_losses,
-    }
-
-
 def meta_train(
     policy: torch.nn.Module,
-    tasks: Union[Task, Sequence[Task]],
+    task,
     x0_pool: torch.Tensor,
     *, # forces every next arguments to be named explicitely during the calling
     dynamics_step: Callable, # nonlinear or linearized
@@ -186,19 +94,10 @@ def meta_train(
     seed: int = 42,
     on_epoch_end: Callable = None,
     killer=None,
-    eval_masses: Optional[Sequence[MassParams]] = None,
-    eval_every: int = 0,
 ):
     """Meta-train ``policy`` with MAML.
 
     Args:
-        tasks:        a single ``Task`` (fresh sampling) or a list/tuple of
-                      ``Task`` (fixed pool — recommended for stability).
-        eval_masses:  optional list of *fixed* held-out ``MassParams`` used
-                      to track true generalisation. Evaluation is done with
-                      no-grad rollouts, per-task inner adaptation, then a
-                      post-adapt loss measurement on the full ``x0_pool``.
-        eval_every:   eval cadence in epochs; ``0`` (default) disables eval.
         on_epoch_end: optional ``callable(ep, policy, history)`` called once
                       per epoch, e.g. for plotting / checkpointing.
         killer:       optional ``GracefulKiller``; if its ``kill_now`` flag
@@ -207,10 +106,6 @@ def meta_train(
     torch.manual_seed(seed) # global pytorch seed (init weights, dropout, ...)
     np_rng    = np.random.default_rng(seed) # for task.sample(np_rng) that draws the added mass parameters
     torch_gen = torch.Generator(device=device).manual_seed(seed) # for _sample_x0 that draws the indices in the pool
-    eval_gen  = torch.Generator(device=device).manual_seed(seed + 1)
-
-    task_list = _as_task_list(tasks)
-    n_tasks = len(task_list)
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
     # opt = outer optimizer, for the meta step.
@@ -220,12 +115,7 @@ def meta_train(
     create_graph = (maml_order == 2)
 
     history = {"epoch": [], "meta_loss": [],
-               "inner_pre": [], "outer_loss": [],
-               # per-task averaged outer loss across the run; one list per task
-               "outer_loss_per_task": [[] for _ in range(n_tasks)],
-               # held-out eval; only filled if eval_masses is provided
-               "eval_epoch": [], "eval_pre_mean": [], "eval_post_mean": [],
-               "eval_pre_max":  [], "eval_post_max":  []}
+               "inner_pre": [], "outer_loss": []}
     # inner_pre = loss before first inner step = what the NN meta
     # does at first on the new task, without update.
     # outer_loss = loss after adaptation.
@@ -235,14 +125,9 @@ def meta_train(
         meta_loss   = 0.0
         inner_pre_vals: List[float] = []
         outer_vals:     List[float] = []
-        # accumulator: outer loss per task index, this epoch
-        outer_per_task_this_epoch: List[List[float]] = [[] for _ in range(n_tasks)]
 
-        # Decide which task indices to use for this meta-update.
-        task_indices = _pick_task_indices(n_tasks, meta_batch, torch_gen)
-
-        for ti in task_indices: # loop on the tasks of this meta-batch
-            mass = task_list[ti].sample(np_rng).to(device) # outputs a MassParams object
+        for _ in range(meta_batch): # loop on the tasks of meta training
+            mass = task.sample(np_rng).to(device) # outputs a MassParams object
 
             # --- Inner loop: differentiable adaptation -------------------
             theta = {n: p for n, p in policy.named_parameters()}
@@ -285,10 +170,9 @@ def meta_train(
             L_out = trajectory_cost(X_out, terminal_weight,
                                     z_weight=z_weight).mean()
             outer_vals.append(L_out.item())
-            outer_per_task_this_epoch[ti].append(L_out.item())
             meta_loss = meta_loss + L_out
 
-        meta_loss = meta_loss / len(task_indices)
+        meta_loss = meta_loss / meta_batch
         meta_loss.backward()
         # if create_graph=True, the graph goes back from θ' = θ - α∇L_in until
         # the original parameters. The gradients in policy.parameters().grad include
@@ -311,10 +195,6 @@ def meta_train(
         history["meta_loss"].append(float(meta_loss.item()))
         history["inner_pre"].append(float(np.mean(inner_pre_vals)))
         history["outer_loss"].append(float(np.mean(outer_vals)))
-        for ti in range(n_tasks):
-            vals = outer_per_task_this_epoch[ti]
-            history["outer_loss_per_task"][ti].append(
-                float(np.mean(vals)) if vals else float("nan"))
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
             print(f"  [ep {ep+1:4d}/{epochs}] "
@@ -322,31 +202,6 @@ def meta_train(
                   f"inner_pre={np.mean(inner_pre_vals):.4e}  " # can oscillate
                   f"outer={np.mean(outer_vals):.4e}")          # should decrease
                                                                # the diff between inner_pre and outer should decrease
-
-        # ---- Held-out evaluation (no-grad on a fixed list of MassParams)
-        if eval_masses is not None and eval_every > 0 \
-                and (ep + 1) % eval_every == 0:
-            stats = _evaluate_on_masses(
-                policy, eval_masses, x0_pool,
-                dynamics_step=dynamics_step,
-                n_steps=n_steps,
-                n_inner_steps=n_inner_steps,
-                k_inner=k_inner,
-                lr_inner=lr_inner,
-                terminal_weight=terminal_weight,
-                z_weight=z_weight,
-                gen=eval_gen,
-                device=device,
-            )
-            history["eval_epoch"].append(ep + 1)
-            history["eval_pre_mean"].append(stats["pre_mean"])
-            history["eval_post_mean"].append(stats["post_mean"])
-            history["eval_pre_max"].append(stats["pre_max"])
-            history["eval_post_max"].append(stats["post_max"])
-            print(f"    [eval @ ep {ep+1}]  "
-                  f"pre_mean={stats['pre_mean']:.4e}  "
-                  f"post_mean={stats['post_mean']:.4e}  "
-                  f"(max post={stats['post_max']:.4e})")
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history)
