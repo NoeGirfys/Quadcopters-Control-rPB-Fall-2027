@@ -40,15 +40,27 @@ from .mass_params import MassParams
 def _sample_x0(x0_pool: torch.Tensor, k: int,
                gen: torch.Generator) -> torch.Tensor:
     """
-    Draw k initial points without puting them back in the pool ( => can not select
-    twice the same initial point). If one asks more than available,
-    returns all the pool. Enables to make the batchs inner and outer.    
+    Draw k initial points without putting them back in the pool.
+    Used by maml_adapt (single batch). For meta_train, see _sample_disjoint.
     """
     B0 = x0_pool.shape[0]
-    if k >= B0:
-        return x0_pool
+    if k > B0:
+        raise ValueError(f"k ({k}) > pool size ({B0}).")
     idx = torch.randperm(B0, generator=gen, device=x0_pool.device)[:k]
     return x0_pool[idx]
+
+
+def _sample_disjoint(x0_pool: torch.Tensor, k_in: int, k_out: int,
+                     gen: torch.Generator):
+    """Draw k_in + k_out distinct points and split into two disjoint batches."""
+    B0 = x0_pool.shape[0]
+    if k_in + k_out > B0:
+        raise ValueError(
+            f"k_inner ({k_in}) + k_outer ({k_out}) > pool size ({B0}). "
+            "Increase the cube resolution or reduce k_inner/k_outer."
+        )
+    idx = torch.randperm(B0, generator=gen, device=x0_pool.device)
+    return x0_pool[idx[:k_in]], x0_pool[idx[k_in:k_in + k_out]]
 
 
 def _make_fn(policy, theta):
@@ -88,7 +100,9 @@ def meta_train(
     tau_div: float = None,
     obs_noise_std: torch.Tensor = None,
     terminal_weight: float = 50.0,
+    pos_weight: float = 10.0,
     z_weight: float = 1.0,
+    inner_grad_clip: float = 1.0,
     device: str = "cpu",
     verbose_every: int = 1,
     seed: int = 42,
@@ -129,6 +143,10 @@ def meta_train(
         for _ in range(meta_batch): # loop on the tasks of meta training
             mass = task.sample(np_rng).to(device) # outputs a MassParams object
 
+            # Sample support (x0_in) and query (x0_out) once, disjoint.
+            # x0_in is reused across all inner steps (standard MAML).
+            x0_in, x0_out = _sample_disjoint(x0_pool, k_inner, k_outer, torch_gen)
+
             # --- Inner loop: differentiable adaptation -------------------
             theta = {n: p for n, p in policy.named_parameters()}
             # theta = new dict pointing towards the current policy params
@@ -137,12 +155,13 @@ def meta_train(
             # loop without touching policy
 
             for step in range(n_inner_steps):
-                x0_in = _sample_x0(x0_pool, k_inner, torch_gen) # draw k_inner initial points in x0_pool
                 X_in = rollout(_make_fn(policy, theta), x0_in, n_steps,
                                mass, dynamics_step,
-                               tau_div=tau_div, obs_noise_std=obs_noise_std)
+                               tau_div=tau_div, obs_noise_std=obs_noise_std,
+                               gen=torch_gen)
                 # X_in is (B, n_steps, 12)
                 L_in = trajectory_cost(X_in, terminal_weight,
+                                       pos_weight=pos_weight,
                                        z_weight=z_weight).mean()
                 if step == 0:
                     inner_pre_vals.append(L_in.item())
@@ -156,18 +175,20 @@ def meta_train(
                 # If False (FOMAML), the grads are detached, theta - lr*grad is just some numerical values.
                 # Important: we do not use L_in.backward() because it would use the parameters of policy for .grad,
                 # here autograd.grad returns the gradients without storing them.
-                grads = _clip_grads(grads, max_norm=1.0)
+                if inner_grad_clip > 0:
+                    grads = _clip_grads(grads, max_norm=inner_grad_clip)
                 theta = {n: p - lr_inner * g
                          for (n, p), g in zip(theta.items(), grads)}
                 # no inner gradient: we create a new dict theta where each param has done
                 # a step in the direction -grad. Now theta is different of policy.
 
-            # --- Outer loss on a fresh batch -----------------------------
-            x0_out = _sample_x0(x0_pool, k_outer, torch_gen)
+            # --- Outer loss on the disjoint query batch ------------------
             X_out = rollout(_make_fn(policy, theta), x0_out, n_steps,
                             mass, dynamics_step,
-                            tau_div=tau_div, obs_noise_std=obs_noise_std)
+                            tau_div=tau_div, obs_noise_std=obs_noise_std,
+                            gen=torch_gen)
             L_out = trajectory_cost(X_out, terminal_weight,
+                                    pos_weight=pos_weight,
                                     z_weight=z_weight).mean()
             outer_vals.append(L_out.item())
             meta_loss = meta_loss + L_out
@@ -224,11 +245,20 @@ def maml_adapt(
     n_steps_adapt: int,
     lr_inner: float,
     terminal_weight: float = 50.0,
+    pos_weight: float = 10.0,
     z_weight: float = 1.0,
+    obs_noise_std: torch.Tensor = None,
+    tau_div: float = None,
+    inner_grad_clip: float = 1.0,
     device: str = "cpu",
+    seed: int = 0,
     verbose: bool = True,
 ):
     """Few-shot adaptation on a single test task.
+
+    The defaults for ``obs_noise_std``, ``tau_div``, ``pos_weight``,
+    ``inner_grad_clip`` should match those used in ``meta_train`` so that
+    adaptation sees the same distribution it was trained on.
 
     Returns:
         theta_adapt : dict[name -> Tensor]  adapted parameters
@@ -236,15 +266,20 @@ def maml_adapt(
     """
     theta = {n: p.detach().clone().requires_grad_(True)
              for n, p in policy.named_parameters()}
-    gen = torch.Generator(device=device).manual_seed(0)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    # Same support batch across adaptation steps (standard MAML).
+    x0 = _sample_x0(x0_pool, k_samples, gen)
     losses = []
     mass = mass.to(device)
     for s in range(n_steps_adapt):
-        x0 = _sample_x0(x0_pool, k_samples, gen)
-        X = rollout(_make_fn(policy, theta), x0, n_steps, mass, dynamics_step)
-        L = trajectory_cost(X, terminal_weight, z_weight=z_weight).mean()
+        X = rollout(_make_fn(policy, theta), x0, n_steps, mass, dynamics_step,
+                    tau_div=tau_div, obs_noise_std=obs_noise_std, gen=gen)
+        L = trajectory_cost(X, terminal_weight,
+                            pos_weight=pos_weight,
+                            z_weight=z_weight).mean()
         grads = torch.autograd.grad(L, tuple(theta.values()), create_graph=False)
-        grads = _clip_grads(grads, max_norm=1.0)
+        if inner_grad_clip > 0:
+            grads = _clip_grads(grads, max_norm=inner_grad_clip)
         theta = {n: (p - lr_inner * g).detach().requires_grad_(True)
                  for (n, p), g in zip(theta.items(), grads)}
         losses.append(float(L.item()))

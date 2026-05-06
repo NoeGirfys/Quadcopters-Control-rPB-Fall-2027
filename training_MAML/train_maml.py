@@ -78,7 +78,12 @@ def parse_args():
     p.add_argument("--obs-noise-scale", type=float, default=1.0,
                    help="0 = off, 1 = default, 2 = double")
     p.add_argument("--terminal-weight", type=float, default=50.0)
+    p.add_argument("--pos-weight",      type=float, default=10.0,
+                   help="weight on (x, y, z) in the running cost")
     p.add_argument("--z-weight",        type=float, default=1.0)
+    p.add_argument("--inner-grad-clip", type=float, default=1.0,
+                   help="max-norm clip on inner-loop gradients; "
+                        "set <=0 to disable")
 
     # Dynamics
     p.add_argument("--dynamics", choices=list(DYNAMICS.keys()),
@@ -119,6 +124,13 @@ def main():
     x0_pool = make_x0_batch(cube, device=device)
     print(f"[Train] {len(cube)} initial points, ±{args.half_side}m cube")
 
+    if args.k_inner + args.k_outer > len(cube):
+        raise ValueError(
+            f"k_inner ({args.k_inner}) + k_outer ({args.k_outer}) = "
+            f"{args.k_inner + args.k_outer} > pool size ({len(cube)}). "
+            "Disjoint support/query sampling requires k_inner + k_outer <= pool."
+        )
+
     # Task generator.
     task = OffsetMassTask(
         m_min=0.0, m_max=args.m_max,
@@ -155,7 +167,9 @@ def main():
         tau_div=tau_div,
         obs_noise_std=obs_noise,
         terminal_weight=args.terminal_weight,
+        pos_weight=args.pos_weight,
         z_weight=args.z_weight,
+        inner_grad_clip=args.inner_grad_clip,
         device=device,
         verbose_every=args.verbose_every,
         seed=args.seed,

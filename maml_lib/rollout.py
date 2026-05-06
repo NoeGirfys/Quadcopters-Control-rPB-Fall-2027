@@ -23,7 +23,8 @@ def rollout(policy_fn, x0: torch.Tensor, n_steps: int,
             mass: MassParams, dynamics_step,
             tau_div: float = None,
             log_actions: bool = False,
-            obs_noise_std: torch.Tensor = None):
+            obs_noise_std: torch.Tensor = None,
+            gen: torch.Generator = None):
     """Run ``n_steps`` NN queries (each = PID_STEPS_PER_NN PID substeps).
 
     Curriculum reset: when ``tau_div`` is set, drones whose horizontal
@@ -48,7 +49,12 @@ def rollout(policy_fn, x0: torch.Tensor, n_steps: int,
         if obs_noise_std is None:
             state_obs = state
         else:
-            state_obs = state + torch.randn_like(state) * obs_noise_std
+            if gen is None:
+                noise = torch.randn_like(state)
+            else:
+                noise = torch.randn(state.shape, dtype=state.dtype,
+                                    device=state.device, generator=gen)
+            state_obs = state + noise * obs_noise_std
 
         target_rel = compute_relative_targets(state_obs)
         action = policy_fn(state_obs, target_rel)             # (B, 4)
