@@ -8,7 +8,7 @@ Public surface:
         nonlinear_step, linearized_step, DYNAMICS,
         PolicyMLP,
         rollout, compute_relative_targets, trajectory_cost,
-        Task, OffsetMassTask, GaussianMotorTask, make_motor_tasks,
+        Task, OffsetMassTask,
         meta_train, maml_adapt,
         make_x0_batch, generate_cube_points, GracefulKiller,
     )
@@ -20,9 +20,7 @@ from .dynamics    import nonlinear_step, linearized_step, DYNAMICS
 from .policy      import PolicyMLP
 from .rollout     import rollout, compute_relative_targets
 from .cost        import trajectory_cost
-from .tasks       import (
-    Task, OffsetMassTask, GaussianMotorTask, make_motor_tasks,
-)
+from .tasks       import Task, OffsetMassTask
 from .maml        import meta_train, maml_adapt
 from .utils       import make_x0_batch, generate_cube_points, GracefulKiller
 
@@ -32,7 +30,7 @@ __all__ = [
     "nonlinear_step", "linearized_step", "DYNAMICS",
     "PolicyMLP",
     "rollout", "compute_relative_targets", "trajectory_cost",
-    "Task", "OffsetMassTask", "GaussianMotorTask", "make_motor_tasks",
+    "Task", "OffsetMassTask",
     "meta_train", "maml_adapt",
     "make_x0_batch", "generate_cube_points", "GracefulKiller",
 ]
