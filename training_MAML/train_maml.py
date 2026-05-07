@@ -90,8 +90,10 @@ def parse_args():
                    default="nonlinear")
 
     # Task ranges
+    p.add_argument("--m-min",   type=float, default=0.005,
+                   help="min extra mass [kg]")
     p.add_argument("--m-max",   type=float, default=0.015,
-                   help="max extra mass [kg] (m_min is fixed at 0)")
+                   help="max extra mass [kg]")
     p.add_argument("--dxy-max", type=float, default=0.03,
                    help="max in-plane offset (|dx|, |dy|) [m]")
     p.add_argument("--dz-min",  type=float, default=-0.03)
@@ -133,11 +135,11 @@ def main():
 
     # Task generator.
     task = OffsetMassTask(
-        m_min=0.0, m_max=args.m_max,
+        m_min=args.m_min, m_max=args.m_max,
         dx_max=args.dxy_max, dy_max=args.dxy_max,
         dz_min=args.dz_min,  dz_max=args.dz_max,
     )
-    print(f"[Task] OffsetMass  m∈[0,{args.m_max*1e3:.0f}]g  "
+    print(f"[Task] OffsetMass  m∈[{args.m_min*1e3:.0f},{args.m_max*1e3:.0f}]g  "
           f"dxy∈±{args.dxy_max*100:.1f}cm  "
           f"dz∈[{args.dz_min*100:+.1f},{args.dz_max*100:+.1f}]cm")
 
