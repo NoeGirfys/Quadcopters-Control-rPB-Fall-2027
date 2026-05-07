@@ -162,7 +162,16 @@ def main():
           f"cube ±{args.half_side}m (hover)")
 
     # --- Policy ------------------------------------------------------------
-    policy = PolicyMLP(hidden=args.hidden).to(device)
+    # Initialise the thrust bias for the hover of the *total* task mass
+    # (M_base + args.mass), assumed centred. The offset torque is what MAML
+    # adaptation has to learn to cancel via the roll/pitch outputs.
+    M_total = C.M_BASE + args.mass
+    hover_thrust_u16 = (M_total * C.G * C.UINT16_MAX) / (4 * C.CF2_THRUST_MAX_PER_MOTOR)
+    print(f"[Policy] hover thrust (M_total={M_total*1e3:.1f}g) "
+          f"≈ {hover_thrust_u16:.0f}  "
+          f"(baseline was {C.HOVER_THRUST_U16_BASE:.0f})")
+    policy = PolicyMLP(hidden=args.hidden,
+                       hover_thrust_u16=hover_thrust_u16).to(device)
 
     # --- Sim-to-real obs noise --------------------------------------------
     obs_noise = ((C.OBS_NOISE_STD * args.obs_noise_scale).to(device)

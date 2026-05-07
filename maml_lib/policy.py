@@ -18,7 +18,7 @@ from . import config as C
 class PolicyMLP(nn.Module):
     """T=1 MLP controller, drop-in replacement for ConcurrentPolicyMLP."""
 
-    def __init__(self, hidden: int = 64):
+    def __init__(self, hidden: int = 64, hover_thrust_u16: float = None):
         super().__init__()
         self.register_buffer("x_scale",
                              torch.tensor(C.X_SCALE, dtype=torch.float32))
@@ -34,14 +34,20 @@ class PolicyMLP(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden, output_dim),
         )
-        self._init_hover()
+        if hover_thrust_u16 is None:
+            hover_thrust_u16 = C.HOVER_THRUST_U16_BASE
+        self._init_hover(hover_thrust_u16)
 
-    def _init_hover(self):
+    def _init_hover(self, hover_thrust_u16: float):
         last = self.net[-1]
         nn.init.normal_(last.weight, std=0.01)
         nn.init.zeros_(last.bias)
-        # bias on thrust so sigmoid(b) * UINT16_MAX = baseline hover thrust
-        hover_ratio = C.HOVER_THRUST_U16_BASE / C.UINT16_MAX
+        # bias on thrust so sigmoid(b) * UINT16_MAX = the requested hover thrust
+        # (typically the hover thrust for the average task total mass, assumed
+        # centred — the offset induces a torque that MAML adaptation will learn
+        # to cancel via the roll/pitch outputs, whose biases stay at 0).
+        hover_ratio = hover_thrust_u16 / C.UINT16_MAX
+        hover_ratio = float(min(max(hover_ratio, 1e-4), 1.0 - 1e-4))
         thrust_bias = float(np.log(hover_ratio / (1.0 - hover_ratio)))
         last.bias.data[0] = thrust_bias
         # roll, pitch, yaw_rate biases stay at 0 -> tanh(0) * max = 0
