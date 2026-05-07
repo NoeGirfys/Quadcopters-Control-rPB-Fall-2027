@@ -84,6 +84,3 @@ def compute_mass_params(m_extra: float, r_offset: tuple) -> MassParams:
     )
 
 
-def baseline_mass_params() -> MassParams:
-    """Baseline drone (no extra mass). Useful for debugging / sanity checks."""
-    return compute_mass_params(0.0, (0.0, 0.0, 0.0))

@@ -1,21 +1,15 @@
 """MAML (Finn et al. 2017, https://arxiv.org/abs/1703.03400) for the
 Crazyflie offset-mass setting.
 
-Inner loop:
-  Sample one task (MassParams), do ``n_inner_steps`` differentiable
-  gradient updates on a batch of ``k_inner`` initial states. Each update
-  uses the current adapted ``theta`` (parameter dict) via
-  ``functional_call``.
+This module is now specialised to the *Gaussian-motor* task setup:
 
-Outer loop:
-  After the inner steps, evaluate the adapted ``theta`` on a fresh batch
-  of ``k_outer`` initial states and accumulate the loss into the meta
-  loss. Average over ``meta_batch`` tasks per epoch, then back-prop into
-  the original parameters.
-
-``maml_order=2`` (default) propagates gradients through the inner-loop
-gradients (full MAML). ``maml_order=1`` is FOMAML: cheaper, no
-second-order graph.
+  * a fixed list of ``Task`` objects (typically 3 ``GaussianMotorTask``)
+    is shared across all epochs;
+  * each epoch samples one ``MassParams`` per task, runs the inner-loop
+    adaptation on a fixed ``x0_train`` batch, and computes the meta loss
+    on a fixed ``x0_eval`` batch (disjoint from x0_train);
+  * sampled mass positions are recorded in ``history`` for plotting and
+    are preserved on early Ctrl+C through ``on_epoch_end``.
 """
 from typing import Callable, List
 
@@ -35,32 +29,7 @@ except ImportError:                                # PyTorch < 2.0
 from .cost import trajectory_cost
 from .rollout import rollout
 from .mass_params import MassParams
-
-
-def _sample_x0(x0_pool: torch.Tensor, k: int,
-               gen: torch.Generator) -> torch.Tensor:
-    """
-    Draw k initial points without putting them back in the pool.
-    Used by maml_adapt (single batch). For meta_train, see _sample_disjoint.
-    """
-    B0 = x0_pool.shape[0]
-    if k > B0:
-        raise ValueError(f"k ({k}) > pool size ({B0}).")
-    idx = torch.randperm(B0, generator=gen, device=x0_pool.device)[:k]
-    return x0_pool[idx]
-
-
-def _sample_disjoint(x0_pool: torch.Tensor, k_in: int, k_out: int,
-                     gen: torch.Generator):
-    """Draw k_in + k_out distinct points and split into two disjoint batches."""
-    B0 = x0_pool.shape[0]
-    if k_in + k_out > B0:
-        raise ValueError(
-            f"k_inner ({k_in}) + k_outer ({k_out}) > pool size ({B0}). "
-            "Increase the cube resolution or reduce k_inner/k_outer."
-        )
-    idx = torch.randperm(B0, generator=gen, device=x0_pool.device)
-    return x0_pool[idx[:k_in]], x0_pool[idx[k_in:k_in + k_out]]
+from .tasks import Task
 
 
 def _make_fn(policy, theta):
@@ -84,16 +53,14 @@ def _clip_grads(grads, max_norm: float = 1.0):
 
 def meta_train(
     policy: torch.nn.Module,
-    task,
-    x0_pool: torch.Tensor,
-    *, # forces every next arguments to be named explicitely during the calling
+    tasks: List[Task],
+    x0_train: torch.Tensor,
+    x0_eval: torch.Tensor,
+    *, # forces every next argument to be named explicitly
     dynamics_step: Callable, # nonlinear or linearized
-    n_steps: int, # length of a rollout (NN steps at 100 Hz)
+    n_steps: int, # length of a rollout (NN steps at NN_FREQ)
     epochs: int, # total number of meta-updates
-    meta_batch: int, # nb tasks per meta-update
-    k_inner: int,
     n_inner_steps: int, # nb inner updates
-    k_outer: int,
     lr_outer: float,
     lr_inner: float,
     maml_order: int = 2,
@@ -109,17 +76,29 @@ def meta_train(
     on_epoch_end: Callable = None,
     killer=None,
 ):
-    """Meta-train ``policy`` with MAML.
+    """Meta-train ``policy`` with MAML over a fixed list of tasks.
 
     Args:
-        on_epoch_end: optional ``callable(ep, policy, history)`` called once
-                      per epoch, e.g. for plotting / checkpointing.
-        killer:       optional ``GracefulKiller``; if its ``kill_now`` flag
-                      is set after an epoch the loop exits cleanly.
+        tasks         : meta_batch is implicitly ``len(tasks)``; one
+                        MassParams is sampled per task per epoch.
+        x0_train      : (N_train, 12) fixed support batch, reused across
+                        all tasks and epochs (inner loss).
+        x0_eval       : (N_eval,  12) fixed query batch, disjoint from
+                        x0_train (outer loss).
+        on_epoch_end  : optional ``callable(ep, policy, history)`` called
+                        once per epoch, e.g. for checkpointing/plotting.
+        killer        : optional ``GracefulKiller``; if its ``kill_now``
+                        flag is set after an epoch the loop exits cleanly.
+
+    Returns:
+        policy, history
+        history["sampled_positions"] is a list of length ``len(tasks)``.
+        Element k is the chronological list of (dx, dy, dz) tuples
+        sampled from ``tasks[k]``.
     """
     torch.manual_seed(seed) # global pytorch seed (init weights, dropout, ...)
-    np_rng    = np.random.default_rng(seed) # for task.sample(np_rng) that draws the added mass parameters
-    torch_gen = torch.Generator(device=device).manual_seed(seed) # for _sample_x0 that draws the indices in the pool
+    np_rng    = np.random.default_rng(seed) # for task.sample(np_rng)
+    torch_gen = torch.Generator(device=device).manual_seed(seed) # for obs noise
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
     # opt = outer optimizer, for the meta step.
@@ -127,39 +106,42 @@ def meta_train(
     # it updates a dict theta separated.
 
     create_graph = (maml_order == 2)
+    M = len(tasks)
+    if M == 0:
+        raise ValueError("`tasks` must contain at least one Task.")
 
-    history = {"epoch": [], "meta_loss": [],
-               "inner_pre": [], "outer_loss": []}
-    # inner_pre = loss before first inner step = what the NN meta
-    # does at first on the new task, without update.
-    # outer_loss = loss after adaptation.
+    x0_train = x0_train.to(device)
+    x0_eval  = x0_eval.to(device)
+
+    history = {
+        "epoch": [], "meta_loss": [],
+        "inner_pre": [], "outer_loss": [],
+        "sampled_positions": [[] for _ in range(M)],
+    }
+    # inner_pre = loss before the first inner step (oscillates).
+    # outer_loss = loss after adaptation (should decrease).
+    # sampled_positions[k] = chronological list of (dx, dy, dz) for tasks[k].
 
     for ep in range(epochs):
         opt.zero_grad()
-        meta_loss   = 0.0
+        meta_loss = 0.0
         inner_pre_vals: List[float] = []
         outer_vals:     List[float] = []
 
-        for _ in range(meta_batch): # loop on the tasks of meta training
-            mass = task.sample(np_rng).to(device) # outputs a MassParams object
-
-            # Sample support (x0_in) and query (x0_out) once, disjoint.
-            # x0_in is reused across all inner steps (standard MAML).
-            x0_in, x0_out = _sample_disjoint(x0_pool, k_inner, k_outer, torch_gen)
+        for t_idx, task in enumerate(tasks):
+            mass = task.sample(np_rng).to(device)
+            history["sampled_positions"][t_idx].append(tuple(mass.r_offset))
 
             # --- Inner loop: differentiable adaptation -------------------
             theta = {n: p for n, p in policy.named_parameters()}
-            # theta = new dict pointing towards the current policy params
-            # at this point, theta["net.0.weight"] = policy.net[0].weight
-            # (same tensor in memory). theta will be updated in the inner
-            # loop without touching policy
+            # theta = new dict pointing towards the current policy params.
+            # theta will be updated in the inner loop without touching policy.
 
             for step in range(n_inner_steps):
-                X_in = rollout(_make_fn(policy, theta), x0_in, n_steps,
+                X_in = rollout(_make_fn(policy, theta), x0_train, n_steps,
                                mass, dynamics_step,
                                tau_div=tau_div, obs_noise_std=obs_noise_std,
                                gen=torch_gen)
-                # X_in is (B, n_steps, 12)
                 L_in = trajectory_cost(X_in, terminal_weight,
                                        pos_weight=pos_weight,
                                        z_weight=z_weight).mean()
@@ -169,21 +151,16 @@ def meta_train(
                 grads = torch.autograd.grad(
                     L_in, tuple(theta.values()),
                     create_graph=create_graph)
-                # compute the ∂L_in/∂theta for each param in theta. It is here that
-                # create_graph acts : if True (MAML 2nd order), the grads are attached
-                # to the graph, theta - lr*grad stays differentiable with respect to policy.parameters().
-                # If False (FOMAML), the grads are detached, theta - lr*grad is just some numerical values.
-                # Important: we do not use L_in.backward() because it would use the parameters of policy for .grad,
-                # here autograd.grad returns the gradients without storing them.
+                # create_graph=True (MAML 2nd order) keeps the inner grads
+                # attached to the graph so theta - lr*grad stays differentiable
+                # w.r.t. policy.parameters(). False = FOMAML (1st-order approx).
                 if inner_grad_clip > 0:
                     grads = _clip_grads(grads, max_norm=inner_grad_clip)
                 theta = {n: p - lr_inner * g
                          for (n, p), g in zip(theta.items(), grads)}
-                # no inner gradient: we create a new dict theta where each param has done
-                # a step in the direction -grad. Now theta is different of policy.
 
-            # --- Outer loss on the disjoint query batch ------------------
-            X_out = rollout(_make_fn(policy, theta), x0_out, n_steps,
+            # --- Outer loss on the fixed disjoint query batch ------------
+            X_out = rollout(_make_fn(policy, theta), x0_eval, n_steps,
                             mass, dynamics_step,
                             tau_div=tau_div, obs_noise_std=obs_noise_std,
                             gen=torch_gen)
@@ -193,15 +170,12 @@ def meta_train(
             outer_vals.append(L_out.item())
             meta_loss = meta_loss + L_out
 
-        meta_loss = meta_loss / meta_batch
+        meta_loss = meta_loss / M
         meta_loss.backward()
         # if create_graph=True, the graph goes back from θ' = θ - α∇L_in until
-        # the original parameters. The gradients in policy.parameters().grad include
-        # the second derivatives.
-        # if create_graph=False, the graph goes back only from L_out to theta (the
-        # adapted values). Because theta is not linked anymore to policy.parameters()
-        # for the graph, the gradients propagated to policy.parameters() are now
-        # just an approximation at the first order (FOMAML).
+        # the original parameters; policy.parameters().grad include the second
+        # derivatives. If False, gradients into policy.parameters() are the
+        # FOMAML first-order approximation.
 
         # NaN firewall before stepping
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any()
@@ -220,9 +194,8 @@ def meta_train(
         if verbose_every and ((ep + 1) % verbose_every == 0):
             print(f"  [ep {ep+1:4d}/{epochs}] "
                   f"meta={meta_loss.item():.4e}  "
-                  f"inner_pre={np.mean(inner_pre_vals):.4e}  " # can oscillate
-                  f"outer={np.mean(outer_vals):.4e}")          # should decrease
-                                                               # the diff between inner_pre and outer should decrease
+                  f"inner_pre={np.mean(inner_pre_vals):.4e}  "
+                  f"outer={np.mean(outer_vals):.4e}")
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history)
@@ -237,11 +210,10 @@ def meta_train(
 def maml_adapt(
     policy: torch.nn.Module,
     mass: MassParams,
-    x0_pool: torch.Tensor,
+    x0: torch.Tensor,
     *,
     dynamics_step: Callable,
     n_steps: int,
-    k_samples: int,
     n_steps_adapt: int,
     lr_inner: float,
     terminal_weight: float = 50.0,
@@ -254,11 +226,15 @@ def maml_adapt(
     seed: int = 0,
     verbose: bool = True,
 ):
-    """Few-shot adaptation on a single test task.
+    """Few-shot adaptation on a single test task (e.g. the held-out motor).
 
-    The defaults for ``obs_noise_std``, ``tau_div``, ``pos_weight``,
+    The defaults for ``obs_noise_std``, ``tau_div``, ``pos_weight`` and
     ``inner_grad_clip`` should match those used in ``meta_train`` so that
     adaptation sees the same distribution it was trained on.
+
+    Args:
+        x0 : (N, 12) support batch of initial states; reused across all
+             adaptation steps (standard MAML).
 
     Returns:
         theta_adapt : dict[name -> Tensor]  adapted parameters
@@ -267,10 +243,9 @@ def maml_adapt(
     theta = {n: p.detach().clone().requires_grad_(True)
              for n, p in policy.named_parameters()}
     gen = torch.Generator(device=device).manual_seed(seed)
-    # Same support batch across adaptation steps (standard MAML).
-    x0 = _sample_x0(x0_pool, k_samples, gen)
     losses = []
     mass = mass.to(device)
+    x0 = x0.to(device)
     for s in range(n_steps_adapt):
         X = rollout(_make_fn(policy, theta), x0, n_steps, mass, dynamics_step,
                     tau_div=tau_div, obs_noise_std=obs_noise_std, gen=gen)

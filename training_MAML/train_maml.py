@@ -1,4 +1,4 @@
-"""Train a Crazyflie controller with MAML over offset-mass tasks.
+"""Train a Crazyflie controller with MAML over Gaussian-motor tasks.
 
 The policy has the same role as
 ``training_regulation_simu_and_real/train_nn_cf_pid.py``: it replaces the
@@ -6,23 +6,32 @@ firmware position+velocity PIDs and outputs
 ``[thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s]`` at NN_FREQ. The
 firmware attitude+rate PIDs run downstream at ATTITUDE_RATE.
 
-A *task* is a drone with an extra mass attached at an arbitrary body
-offset. This perturbs total mass, centre of mass, and the inertia tensor
-(full Steiner correction). MAML learns an initialisation that adapts in
-a few gradient steps to any specific configuration.
+Setup
+-----
+Four task distributions, one centred on each motor's body-frame xy.
+Three are used for training, one is held out as the *target* task for
+later few-shot adaptation. The extra mass is fixed (10 g default) and
+attached at z = 0; only (dx, dy) is sampled from a 2D Gaussian.
 
-The policy is trained to bring the drone to the origin; to fly to any
-other point at deployment, shift the input the same way as in
-``fly_nn_cf_pid.py``.
+Each epoch:
+  * one (dx, dy) is drawn from each of the 3 training distributions
+    -> 3 tasks per meta-update;
+  * adaptation (inner loop) uses a *fixed* hover x0 batch ``x0_train``
+    drawn uniformly in the cube at start-up;
+  * the meta loss is computed on a *fixed* disjoint batch ``x0_eval``,
+    same hover convention.
+
+Both x0 batches and the chronological list of sampled task offsets are
+saved into the checkpoint after every epoch, so a Ctrl+C preserves the
+full training map.
 
 Usage examples:
 
     cd training_MAML
     python train_maml.py
     python train_maml.py --dynamics linearized --maml-order 1
-    python train_maml.py --epochs 1000 --meta-batch 8 --k-inner 8 \\
-                         --n-inner-steps 1 --lr-outer 1e-3 --lr-inner 5e-2 \\
-                         --t-sim 2.0 --hidden 64 --tag exp1
+    python train_maml.py --epochs 1000 --target-motor 2 --sigma 0.005 \\
+                         --n-x0-train 64 --n-x0-eval 64 --t-sim 2.0 --tag exp1
 """
 import argparse
 import os
@@ -37,15 +46,15 @@ if PARENT_DIR not in sys.path:
 
 from maml_lib import (
     config as C,
-    PolicyMLP, OffsetMassTask, meta_train,
-    make_x0_batch, generate_cube_points, GracefulKiller,
+    PolicyMLP, GaussianMotorTask, meta_train,
+    sample_hover_x0, plot_training_map, GracefulKiller,
     DYNAMICS,
 )
 
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="MAML training for CF2 with offset-mass tasks.",
+        description="MAML training for CF2 with Gaussian-motor tasks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     # Core training
@@ -54,24 +63,25 @@ def parse_args():
                    help="meta (outer) learning rate")
     p.add_argument("--lr-inner",      type=float, default=1e-2,
                    help="inner-loop (per-task) learning rate")
-    p.add_argument("--meta-batch",    type=int,   default=4,
-                   help="number of tasks sampled per meta update")
-    p.add_argument("--k-inner",       type=int,   default=8,
-                   help="number of trajectories used to compute the inner loss")
     p.add_argument("--n-inner-steps", type=int,   default=1,
                    help="number of inner-loop gradient steps per task "
                         "(MAML paper uses 1)")
-    p.add_argument("--k-outer",       type=int,   default=8,
-                   help="number of trajectories used to compute the outer loss")
     p.add_argument("--maml-order",    type=int,   default=2, choices=[1, 2],
                    help="1 = FOMAML, 2 = full second-order MAML")
     p.add_argument("--hidden",        type=int,   default=64)
 
+    # x0 batches (drawn once at start)
+    p.add_argument("--n-x0-train", type=int, default=32,
+                   help="number of fixed initial states for the inner loss")
+    p.add_argument("--n-x0-eval",  type=int, default=32,
+                   help="number of fixed initial states for the meta loss "
+                        "(disjoint from train)")
+    p.add_argument("--half-side",  type=float, default=0.3,
+                   help="cube half-side for x0 sampling [m]")
+
     # Rollout
     p.add_argument("--t-sim",         type=float, default=2.0,
                    help="rollout duration [s]")
-    p.add_argument("--half-side",     type=float, default=0.3,
-                   help="initial-position cube half-side [m]")
     p.add_argument("--tau-div",       type=float, default=2.0,
                    help="curriculum divergence threshold [m]; "
                         "set <=0 to disable")
@@ -89,15 +99,19 @@ def parse_args():
     p.add_argument("--dynamics", choices=list(DYNAMICS.keys()),
                    default="nonlinear")
 
-    # Task ranges
-    p.add_argument("--m-min",   type=float, default=0.005,
-                   help="min extra mass [kg]")
-    p.add_argument("--m-max",   type=float, default=0.015,
-                   help="max extra mass [kg]")
-    p.add_argument("--dxy-max", type=float, default=0.03,
-                   help="max in-plane offset (|dx|, |dy|) [m]")
-    p.add_argument("--dz-min",  type=float, default=-0.03)
-    p.add_argument("--dz-max",  type=float, default=+0.05)
+    # Task definition (Gaussian-motor)
+    p.add_argument("--mass",   type=float, default=0.010,
+                   help="fixed extra mass for every task [kg]")
+    p.add_argument("--sigma",  type=float, default=0.005,
+                   help="std of the 2D Gaussian over (dx, dy) [m]")
+    p.add_argument("--target-motor", type=int, default=0, choices=[0, 1, 2, 3],
+                   help="motor index held out from training "
+                        "(0=front-right, 1=rear-right, 2=rear-left, 3=front-left)")
+
+    # Logging
+    p.add_argument("--plot-every", type=int, default=25,
+                   help="regenerate the position map every N epochs "
+                        "(set <=0 to only plot at the end)")
 
     # Misc
     p.add_argument("--seed", type=int, default=42)
@@ -112,57 +126,115 @@ def main():
 
     print(f"[Device] {device}")
     print(f"[Config] dynamics={args.dynamics}  maml_order={args.maml_order}")
-    print(f"[Config] epochs={args.epochs}  meta_batch={args.meta_batch}  "
-          f"k_inner={args.k_inner}  n_inner_steps={args.n_inner_steps}  "
-          f"k_outer={args.k_outer}")
+    print(f"[Config] epochs={args.epochs}  n_inner_steps={args.n_inner_steps}")
     print(f"[Config] lr_outer={args.lr_outer}  lr_inner={args.lr_inner}")
     print(f"[Config] hover thrust (baseline) ≈ {C.HOVER_THRUST_U16_BASE:.0f}")
 
     n_steps = int(args.t_sim * C.NN_FREQ)
     print(f"[Config] n_steps_per_rollout={n_steps} ({args.t_sim}s @ {C.NN_FREQ}Hz)")
 
-    # Pool of initial states (cube vertices/edges/faces/center).
-    cube = generate_cube_points(args.half_side)
-    x0_pool = make_x0_batch(cube, device=device)
-    print(f"[Train] {len(cube)} initial points, ±{args.half_side}m cube")
+    # --- Task setup: 4 motor distributions, hold out args.target_motor -----
+    motor_centers = [(float(C.MOTOR_POS[i, 0]), float(C.MOTOR_POS[i, 1]))
+                     for i in range(4)]
+    training_motor_indices = [i for i in range(4) if i != args.target_motor]
+    training_tasks = [
+        GaussianMotorTask(motor_xy=motor_centers[i],
+                          sigma=args.sigma,
+                          m_extra=args.mass,
+                          motor_idx=i)
+        for i in training_motor_indices
+    ]
+    target_task = GaussianMotorTask(motor_xy=motor_centers[args.target_motor],
+                                    sigma=args.sigma,
+                                    m_extra=args.mass,
+                                    motor_idx=args.target_motor)
+    print(f"[Tasks]  3 training motors {training_motor_indices}, "
+          f"target = motor #{args.target_motor}  "
+          f"σ={args.sigma*100:.2f}cm  m={args.mass*1e3:.0f}g")
 
-    if args.k_inner + args.k_outer > len(cube):
-        raise ValueError(
-            f"k_inner ({args.k_inner}) + k_outer ({args.k_outer}) = "
-            f"{args.k_inner + args.k_outer} > pool size ({len(cube)}). "
-            "Disjoint support/query sampling requires k_inner + k_outer <= pool."
-        )
+    # --- Fixed x0 batches (sampled once, reproducible from seed) -----------
+    x0_gen = torch.Generator(device=device).manual_seed(args.seed)
+    n_total = args.n_x0_train + args.n_x0_eval
+    x0_all = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
+    x0_train = x0_all[:args.n_x0_train].contiguous()
+    x0_eval  = x0_all[args.n_x0_train:].contiguous()
+    print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}  "
+          f"cube ±{args.half_side}m (hover)")
 
-    # Task generator.
-    task = OffsetMassTask(
-        m_min=args.m_min, m_max=args.m_max,
-        dx_max=args.dxy_max, dy_max=args.dxy_max,
-        dz_min=args.dz_min,  dz_max=args.dz_max,
-    )
-    print(f"[Task] OffsetMass  m∈[{args.m_min*1e3:.0f},{args.m_max*1e3:.0f}]g  "
-          f"dxy∈±{args.dxy_max*100:.1f}cm  "
-          f"dz∈[{args.dz_min*100:+.1f},{args.dz_max*100:+.1f}]cm")
-
-    # Policy.
+    # --- Policy ------------------------------------------------------------
     policy = PolicyMLP(hidden=args.hidden).to(device)
 
-    # Sim-to-real obs noise.
+    # --- Sim-to-real obs noise --------------------------------------------
     obs_noise = ((C.OBS_NOISE_STD * args.obs_noise_scale).to(device)
                  if args.obs_noise_scale > 0 else None)
 
     tau_div = args.tau_div if args.tau_div > 0 else None
 
+    # --- Output paths ------------------------------------------------------
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    tag = f"_{args.tag}" if args.tag else ""
+    base_name = (f"maml_{args.dynamics}_h{args.hidden}_"
+                 f"ep{args.epochs}_o{args.maml_order}_"
+                 f"tm{args.target_motor}{tag}")
+    ckpt_path = os.path.join(out_dir, base_name + ".pt")
+    map_path  = os.path.join(out_dir, base_name + "_map.png")
+
+    common_save_payload = {
+        "args":               vars(args),
+        "x_scale":            C.X_SCALE,
+        "pos_scale":          C.POS_SCALE,
+        "nn_freq":            C.NN_FREQ,
+        "att_rate":           C.ATTITUDE_RATE,
+        "motor_centers":      motor_centers,
+        "target_motor":       args.target_motor,
+        "training_motor_indices": training_motor_indices,
+        "sigma":              args.sigma,
+        "m_extra":            args.mass,
+        "x0_train":           x0_train.detach().cpu(),
+        "x0_eval":            x0_eval.detach().cpu(),
+    }
+
+    def save_checkpoint(policy_module, history):
+        payload = dict(common_save_payload)
+        payload["state_dict"] = {k: v.detach().cpu()
+                                 for k, v in policy_module.state_dict().items()}
+        payload["history"]    = history
+        # atomic write: temp file then rename, so a Ctrl+C mid-save won't
+        # leave a half-written checkpoint.
+        tmp = ckpt_path + ".tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, ckpt_path)
+
+    def save_plot(history):
+        try:
+            plot_training_map(
+                map_path,
+                sampled_positions=history["sampled_positions"],
+                motor_centers=motor_centers,
+                target_motor=args.target_motor,
+                training_motor_indices=training_motor_indices,
+                sigma=args.sigma,
+                x0_train=x0_train,
+                x0_eval=x0_eval,
+                half_side=args.half_side,
+            )
+        except Exception as e:  # plotting must never kill training
+            print(f"[Plot] failed: {e}")
+
+    def on_epoch_end(ep, policy_module, history):
+        # always save the checkpoint so Ctrl+C preserves the full map
+        save_checkpoint(policy_module, history)
+        if args.plot_every > 0 and ((ep + 1) % args.plot_every == 0):
+            save_plot(history)
+
     killer = GracefulKiller()
 
     policy, history = meta_train(
-        policy, task, x0_pool,
+        policy, training_tasks, x0_train, x0_eval,
         dynamics_step=DYNAMICS[args.dynamics],
         n_steps=n_steps,
         epochs=args.epochs,
-        meta_batch=args.meta_batch,
-        k_inner=args.k_inner,
         n_inner_steps=args.n_inner_steps,
-        k_outer=args.k_outer,
         lr_outer=args.lr_outer,
         lr_inner=args.lr_inner,
         maml_order=args.maml_order,
@@ -175,26 +247,15 @@ def main():
         device=device,
         verbose_every=args.verbose_every,
         seed=args.seed,
+        on_epoch_end=on_epoch_end,
         killer=killer,
     )
 
-    # Save checkpoint.
-    out_dir = os.path.dirname(os.path.abspath(__file__))
-    tag = f"_{args.tag}" if args.tag else ""
-    ckpt_name = (f"maml_{args.dynamics}_h{args.hidden}_"
-                 f"ep{args.epochs}_mb{args.meta_batch}_"
-                 f"o{args.maml_order}{tag}.pt")
-    ckpt_path = os.path.join(out_dir, ckpt_name)
-    torch.save({
-        "state_dict": policy.cpu().state_dict(),
-        "args":       vars(args),
-        "history":    history,
-        "x_scale":    C.X_SCALE,
-        "pos_scale":  C.POS_SCALE,
-        "nn_freq":    C.NN_FREQ,
-        "att_rate":   C.ATTITUDE_RATE,
-    }, ckpt_path)
+    # Final save (in case plot_every did not align with last epoch).
+    save_checkpoint(policy, history)
+    save_plot(history)
     print(f"[Saved] {ckpt_path}")
+    print(f"[Saved] {map_path}")
     print("Done.")
 
 

@@ -1,4 +1,4 @@
 from .base import Task
-from .offset_mass import OffsetMassTask
+from .gaussian_motor import GaussianMotorTask
 
-__all__ = ["Task", "OffsetMassTask"]
+__all__ = ["Task", "GaussianMotorTask"]
