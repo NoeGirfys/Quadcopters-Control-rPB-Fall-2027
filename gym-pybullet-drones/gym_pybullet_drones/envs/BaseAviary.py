@@ -343,7 +343,7 @@ class BaseAviary(gym.Env):
         for _ in range(self.PYB_STEPS_PER_CTRL):
             #### Update and store the drones kinematic info for certain
             #### Between aggregate steps for certain types of update ###
-            if self.PYB_STEPS_PER_CTRL > 1 and self.PHYSICS in [Physics.DYN, Physics.PYB_GND, Physics.PYB_DRAG, Physics.PYB_DW, Physics.PYB_GND_DRAG_DW]:
+            if self.PYB_STEPS_PER_CTRL > 1 and self.PHYSICS in [Physics.DYN, Physics.DYN_OFFSET, Physics.PYB_GND, Physics.PYB_DRAG, Physics.PYB_DW, Physics.PYB_GND_DRAG_DW]:
                 self._updateAndStoreKinematicInformation()
             #### Step the simulation using the desired physics update ##
             for i in range (self.NUM_DRONES):
@@ -351,6 +351,8 @@ class BaseAviary(gym.Env):
                     self._physics(clipped_action[i, :], i)
                 elif self.PHYSICS == Physics.DYN:
                     self._dynamics(clipped_action[i, :], i)
+                elif self.PHYSICS == Physics.DYN_OFFSET:
+                    self._dynamics_offset_mass(clipped_action[i, :], i)
                 elif self.PHYSICS == Physics.PYB_GND:
                     self._physics(clipped_action[i, :], i)
                     self._groundEffect(clipped_action[i, :], i)
@@ -365,8 +367,8 @@ class BaseAviary(gym.Env):
                     self._groundEffect(clipped_action[i, :], i)
                     self._drag(self.last_clipped_action[i, :], i)
                     self._downwash(i)
-            #### PyBullet computes the new state, unless Physics.DYN ###
-            if self.PHYSICS != Physics.DYN:
+            #### PyBullet computes the new state, unless explicit dynamics ###
+            if self.PHYSICS != Physics.DYN and self.PHYSICS != Physics.DYN_OFFSET:
                 p.stepSimulation(physicsClientId=self.CLIENT)
             #### Save the last applied action (e.g. to compute drag) ###
             self.last_clipped_action = clipped_action
@@ -473,7 +475,7 @@ class BaseAviary(gym.Env):
         self.rpy = np.zeros((self.NUM_DRONES, 3))
         self.vel = np.zeros((self.NUM_DRONES, 3))
         self.ang_v = np.zeros((self.NUM_DRONES, 3))
-        if self.PHYSICS == Physics.DYN:
+        if self.PHYSICS == Physics.DYN or self.PHYSICS == Physics.DYN_OFFSET:
             self.rpy_rates = np.zeros((self.NUM_DRONES, 3))
         #### Set PyBullet's parameters #############################
         p.setGravity(0, 0, -self.G, physicsClientId=self.CLIENT)
@@ -875,6 +877,150 @@ class BaseAviary(gym.Env):
                             )
         #### Store the roll, pitch, yaw rates for the next step ####
         self.rpy_rates[nth_drone,:] = rpy_rates
+
+    def set_offset_mass(self, m_extra: float, r_offset):
+        """Configure an attached point mass at body-frame offset r_offset.
+
+        Stores the total mass, the new (Steiner-corrected) inertia tensor,
+        and the CoM offset in the drone's body frame. Used by
+        ``_dynamics_offset_mass`` when ``PHYSICS == Physics.DYN_OFFSET``.
+
+        Parameters
+        ----------
+        m_extra : float
+            Extra point mass attached to the drone [kg].
+        r_offset : array-like (3,)
+            (dx, dy, dz) attachment point in the drone body frame [m],
+            measured from the drone's geometric centre (URDF origin).
+        """
+        r_off = np.asarray(r_offset, dtype=np.float64).reshape(3)
+        M_total = float(self.M) + float(m_extra)
+        # CoM shift: r_com is the vector from the original CoM (=URDF origin
+        # for the standard CF2X URDF) to the new CoM.
+        r_com = (float(m_extra) / M_total) * r_off
+
+        I3 = np.eye(3)
+        # Drone body inertia translated to the new CoM (parallel-axis from
+        # original CoM to new CoM).
+        d = r_com
+        I_drone_new = self.J + float(self.M) * (np.dot(d, d) * I3 - np.outer(d, d))
+        # Point mass inertia about the new CoM.
+        s = r_off - r_com
+        I_extra_new = float(m_extra) * (np.dot(s, s) * I3 - np.outer(s, s))
+        J_total = I_drone_new + I_extra_new
+        J_inv_total = np.linalg.inv(J_total)
+
+        self.OFFSET_M_TOTAL = M_total
+        self.OFFSET_J = J_total
+        self.OFFSET_J_INV = J_inv_total
+        self.OFFSET_R_COM = r_com
+        self.OFFSET_R_OFFSET = r_off
+        self.OFFSET_M_EXTRA = float(m_extra)
+        self.OFFSET_GRAVITY = self.G * M_total
+        print("[BaseAviary] Offset mass set: m_extra={:.4f} kg, "
+              "r_offset=({:+.4f}, {:+.4f}, {:+.4f}) m, "
+              "M_total={:.4f} kg, r_com=({:+.4f}, {:+.4f}, {:+.4f}) m".format(
+                  m_extra, *r_off, M_total, *r_com))
+
+    ################################################################################
+
+    def _dynamics_offset_mass(self,
+                              rpm,
+                              nth_drone
+                              ):
+        """Explicit dynamics with an attached offset point mass.
+
+        Mirror of ``_dynamics`` but uses ``M_total``, the Steiner-corrected
+        inertia about the new CoM, and motor lever arms measured from the
+        new CoM. Gravity acts at the CoM and contributes zero torque about
+        it (so it does not appear in the rotational equation).
+
+        Call ``set_offset_mass(m_extra, r_offset)`` before stepping with
+        ``Physics.DYN_OFFSET``.
+        """
+        if not hasattr(self, 'OFFSET_M_TOTAL'):
+            raise RuntimeError(
+                "Physics.DYN_OFFSET requires set_offset_mass(m_extra, r_offset) "
+                "to be called before stepping the environment.")
+
+        M_total   = self.OFFSET_M_TOTAL
+        J_total   = self.OFFSET_J
+        J_inv     = self.OFFSET_J_INV
+        r_com     = self.OFFSET_R_COM
+        GRAVITY_T = self.OFFSET_GRAVITY
+
+        #### Current state #########################################
+        pos = self.pos[nth_drone, :]
+        quat = self.quat[nth_drone, :]
+        vel = self.vel[nth_drone, :]
+        rpy_rates = self.rpy_rates[nth_drone, :]
+        rotation = np.array(p.getMatrixFromQuaternion(quat)).reshape(3, 3)
+
+        #### Per-motor thrust forces (body z) ######################
+        forces = np.array(rpm ** 2) * self.KF
+        thrust = np.array([0, 0, np.sum(forces)])
+        thrust_world_frame = np.dot(rotation, thrust)
+        # Translational dynamics: gravity acts at CoM but the body origin
+        # acceleration ≈ CoM acceleration (we ignore α × r_com and
+        # ω × (ω × r_com) for consistency with maml_lib.dynamics).
+        force_world_frame = thrust_world_frame - np.array([0, 0, GRAVITY_T])
+
+        #### Yaw torques (independent of lever arm) ################
+        z_torques = np.array(rpm ** 2) * self.KM
+        if self.DRONE_MODEL == DroneModel.RACE:
+            z_torques = -z_torques
+        z_torque = (-z_torques[0] + z_torques[1] - z_torques[2] + z_torques[3])
+
+        #### Roll/pitch torques about the NEW CoM ##################
+        # τ_motors = Σ (motor_pos[i] - r_com) × F_body[i],  F_body[i] = (0, 0, F_i)
+        # =>  τ_x = Σ (motor_pos_y[i] - r_com_y) * F_i
+        #     τ_y = -Σ (motor_pos_x[i] - r_com_x) * F_i
+        a = self.L / np.sqrt(2)
+        if self.DRONE_MODEL == DroneModel.CF2X:
+            # motor positions (CF2X): M1 (+a,-a), M2 (-a,-a), M3 (-a,+a), M4 (+a,+a)
+            mx = np.array([+a, -a, -a, +a])
+            my = np.array([-a, -a, +a, +a])
+        elif self.DRONE_MODEL == DroneModel.CF2P:
+            # CF2P "+" config: M1 (+L,0), M2 (0,+L), M3 (-L,0), M4 (0,-L)? Use geometry consistent with _dynamics.
+            mx = np.array([+self.L, 0.0, -self.L, 0.0])
+            my = np.array([0.0, +self.L, 0.0, -self.L])
+        elif self.DRONE_MODEL == DroneModel.RACE:
+            mx = np.array([+a, -a, -a, +a])
+            my = np.array([-a, -a, +a, +a])
+        else:
+            raise NotImplementedError(
+                f"DYN_OFFSET not implemented for {self.DRONE_MODEL}")
+
+        F_total_body = float(np.sum(forces))
+        x_torque = float(np.sum((my - r_com[1]) * forces))
+        y_torque = float(np.sum(-(mx - r_com[0]) * forces))
+        torques = np.array([x_torque, y_torque, z_torque])
+
+        #### Gyroscopic coupling (uses the new inertia tensor) #####
+        torques = torques - np.cross(rpy_rates, np.dot(J_total, rpy_rates))
+        rpy_rates_deriv = np.dot(J_inv, torques)
+        no_pybullet_dyn_accs = force_world_frame / M_total
+
+        #### Update state ##########################################
+        vel = vel + self.PYB_TIMESTEP * no_pybullet_dyn_accs
+        rpy_rates = rpy_rates + self.PYB_TIMESTEP * rpy_rates_deriv
+        pos = pos + self.PYB_TIMESTEP * vel
+        quat = self._integrateQ(quat, rpy_rates, self.PYB_TIMESTEP)
+
+        #### Set PyBullet's state ##################################
+        p.resetBasePositionAndOrientation(self.DRONE_IDS[nth_drone],
+                                          pos,
+                                          quat,
+                                          physicsClientId=self.CLIENT
+                                          )
+        p.resetBaseVelocity(self.DRONE_IDS[nth_drone],
+                            vel,
+                            np.dot(rotation, rpy_rates),
+                            physicsClientId=self.CLIENT
+                            )
+        self.rpy_rates[nth_drone, :] = rpy_rates
+
+    ################################################################################
 
     def _integrateQ(self, quat, omega, dt):
         omega_norm = np.linalg.norm(omega)
