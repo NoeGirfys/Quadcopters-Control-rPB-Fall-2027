@@ -1,0 +1,183 @@
+\documentclass[11pt,a4paper]{article}
+
+% --------------------- Packages ---------------------
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{setspace}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{physics}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{bbm}
+%\renewcommand\thesubfigure{\thefigure\alph{subfigure}}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+\usepackage[nameinlink,capitalize]{cleveref}
+\usepackage{cancel}
+\usepackage{comment}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{needspace}
+
+\usepackage{cellspace}
+\setlength\cellspacetoplimit{6pt}    % Espace vide au-dessus
+\setlength\cellspacebottomlimit{6pt} % Espace vide en-dessous
+
+% --------------------- Formatting ---------------------
+\numberwithin{equation}{section}
+\setlist[itemize]{topsep=2pt,itemsep=2pt,parsep=0pt}
+\setlist[enumerate]{topsep=2pt,itemsep=2pt,parsep=0pt}
+\onehalfspacing
+
+% --------------------- Macros ---------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Ker}{\operatorname{Ker}}
+\newcommand{\Ims}{\operatorname{Im}}
+\newcommand{\Ext}{\operatorname{Ext}}
+\newcommand{\sign}{\operatorname{sign}}
+\newcommand{\BallLoneL}{\mathcal{B}_L := \{\, s \in \R^N : \|Ls\|_1 \le 1 \,\}}
+\newcommand{\BL}{\mathcal{B}_L}
+\newcommand{\Argmin}{\operatorname*{arg\,min}}
+\DeclareMathOperator*{\argmin}{arg\,min}
+
+\begin{document}
+
+\begin{comment}
+% --- Début de la Page de Titre Personnalisée ---
+\begin{titlepage}
+    \centering
+    
+    % Espace pour un logo (décommentez la ligne ci-dessous si vous avez une image)
+    \includegraphics[width=0.4\textwidth]{EPFL_Logo.png}
+    \vspace{1cm}
+    
+    {\scshape\LARGE École Polytechnique Fédérale de Lausanne \par} % Nom de l'université
+    \vspace{1cm}
+    
+    {\scshape\Large Semester Project Report\par}
+    \vspace{1.5cm}
+    
+    % Titre du projet
+    {\LARGE\bfseries Inverse Problems with $\ell_1$ Regularization:\\[0.4em] Extreme Points of the Regularization Polytope \\ and Analysis vs Synthesis Formulations \par}
+    
+    \vspace{2cm}
+    
+    % Auteur
+    {\Large\itshape Niels \textsc{RIGAUD} \par}
+    
+    \vfill % Pousse le reste vers le bas de la page
+    
+    % Informations d'encadrement
+    \begin{flushleft} \large
+        \textbf{Professor:} \\
+        Prof. Unser \\[1em] % [1em] ajoute de l'espace vertical
+        
+        \textbf{Co-Supervisors:} \\
+        Bassam El Rawas \\
+        Martin Zach
+    \end{flushleft}
+    
+    \vfill
+    
+    % Date / Année
+    {\large Fall 2025 \par} % Ou mettez une date fixe : "June 2025"
+
+\end{titlepage}
+% --- Fin de la Page de Titre ---
+\end{comment}
+
+% ----- Title Page -----
+\newgeometry{top=2.5cm,bottom=2.5cm,left=2.5cm,right=2.5cm}
+\begin{titlepage}
+    \centering
+    \includegraphics[width=6cm]{Report_Latex_Overleaf/images/EPFL_Logo.png} \\
+    \vspace{0.3cm}
+    {\LARGE \bfseries ÉCOLE POLYTECHNIQUE\\
+    FÉDÉRALE DE LAUSANNE\par}
+    \vspace{1cm}
+    
+    \noindent\rule{\textwidth}{0.4pt}
+    {\LARGE \bfseries Meta-Learning NN-control\\on Crazyflie Quadcopter\par}
+    
+    \noindent\rule{\textwidth}{0.4pt}
+    \vspace{1cm}
+    
+    {\Large \bfseries SEMESTER PROJECT\par}
+    \vspace{0.5cm}
+    
+    {\large \bfseries DECODE \par}
+    \vspace{2 cm}
+    
+    \noindent
+    \begin{minipage}[t]{0.5\textwidth}
+        {\large \textit{Student:}\\
+        Niels Rigaud\\
+        SCIPER: 341284\par}
+    \end{minipage}%
+    \hfill
+    \begin{minipage}[t]{0.45\textwidth}
+        \raggedleft
+        {\large \textit{Professor:}\\
+        G. Ferrari Trecate \par}
+    \end{minipage}
+    \vspace{1.5cm}
+    
+    {\large \textit{Supervisors:}\\
+    Simone Baratto\\Nicolas Kirsch\\Daniele Martinelli}
+    \vfill
+    
+    {\large Spring 2026\par}
+\end{titlepage}
+\restoregeometry
+
+\pagenumbering{roman}
+
+\tableofcontents
+\cleardoublepage
+\pagenumbering{arabic}
+
+% =====================================================
+\section{Introduction}
+\subsection{Motivation}
+\subsection{Context}
+\section{Problem Formulation}
+\subsection{Quadcopter Model}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{Report_Latex_Overleaf/images/Quadcopter_Picture.png}
+    \caption{Schematic Representation of a Quadcopter [PUT SOURCE ???]}
+    \label{fig:Report_Latex_Overleaf/images/Quadcopter_Picture.png}
+\end{figure}
+
+\subsection{Control Problem}
+\subsubsection{Classical Control Policy}
+\subsubsection{Neural Network Policy}
+\subsubsection{Cost Function and Optimization Problem}
+\subsubsection{Back-Propagation Through Time and Curriculum Reset}
+\section{Simulation}
+\section{Learning Classic Regulation}
+\subsection{Simulation}
+\subsection{Reality}
+\section{Model-Agnostic Meta-Learning (MAML)}
+\section{Results}
+\subsection{Simulation}
+\subsection{Reality}
+\section{Conclusion}
+
+\newpage
+% %%%%%%%%% REFERENCES SECTION %%%%%%%%%
+\bibliographystyle{ieeetr}
+% This is the link to the refereces file. 
+\bibliography{main}
+
+\end{document}
+
