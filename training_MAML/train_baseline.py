@@ -41,58 +41,150 @@ from maml_lib import (
 )
 
 
+def _load_maml_defaults(ckpt_path: str) -> dict:
+    """Extract the subset of training hyperparameters from a MAML checkpoint
+    that should be mirrored when training the comparison baseline.
+
+    The MAML-specific ones (lr_inner, n_inner_steps, maml_order,
+    inner_grad_clip) are intentionally NOT pulled — they don't apply to
+    a non-MAML baseline. ``tag`` is also skipped so a baseline run is
+    named separately from its MAML counterpart.
+
+    Returns a dict suitable for use as ``argparse`` defaults.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved = ckpt.get("args", {})
+    actual_epochs = ckpt.get("actual_epochs",
+                             len(ckpt.get("history", {}).get("epoch", []))) \
+                    or saved.get("epochs", 500)
+    return {
+        # Core training (epochs = ACTUAL completed, not the planned CLI value)
+        "epochs":          int(actual_epochs),
+        "lr_outer":        float(saved.get("lr_outer", 1e-3)),
+        "hidden":          int(saved.get("hidden", 64)),
+        # x0 batches
+        "n_x0_train":      int(saved.get("n_x0_train", 32)),
+        "n_x0_eval":       int(saved.get("n_x0_eval", 32)),
+        "half_side":       float(saved.get("half_side", 0.3)),
+        # Rollout
+        "t_sim":           float(saved.get("t_sim", 2.0)),
+        "tau_div":         float(saved.get("tau_div", 2.0)),
+        "obs_noise_scale": float(saved.get("obs_noise_scale", 1.0)),
+        "terminal_weight": float(saved.get("terminal_weight", 50.0)),
+        "pos_weight":      float(saved.get("pos_weight", 10.0)),
+        "z_weight":        float(saved.get("z_weight", 1.0)),
+        # Dynamics
+        "dynamics":        str(saved.get("dynamics", "nonlinear")),
+        # Task definition
+        "mass":            float(saved.get("mass", 0.010)),
+        "sigma":           float(saved.get("sigma", 0.005)),
+        "target_motor":    int(saved.get("target_motor", 0)),
+        # Misc
+        "seed":            int(saved.get("seed", 42)),
+        "plot_every":      int(saved.get("plot_every", 25)),
+        "verbose_every":   int(saved.get("verbose_every", 1)),
+    }
+
+
 def parse_args():
+    # ---- Two-pass parsing: first peek at --from-maml-ckpt so its values
+    # can be used as defaults for the full parser below. Any arg the user
+    # explicitly passes on the CLI will still override the checkpoint
+    # defaults (standard argparse behaviour with --from-maml-ckpt absent
+    # or present).
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--from-maml-ckpt", type=str, default=None)
+    pre_args, _ = pre.parse_known_args()
+
+    if pre_args.from_maml_ckpt is not None:
+        d = _load_maml_defaults(pre_args.from_maml_ckpt)
+        print(f"[Init] Inheriting defaults from MAML checkpoint: "
+              f"{pre_args.from_maml_ckpt}")
+        print(f"[Init]   epochs={d['epochs']} (actual completed)  "
+              f"seed={d['seed']}  target_motor={d['target_motor']}  "
+              f"mass={d['mass']*1e3:.1f}g  σ={d['sigma']*100:.2f}cm  "
+              f"dynamics={d['dynamics']}  hidden={d['hidden']}")
+    else:
+        d = {}  # use hardcoded defaults
+
     p = argparse.ArgumentParser(
         description="Baseline training (no MAML) for CF2 with Gaussian-motor tasks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+    p.add_argument("--from-maml-ckpt", type=str, default=None,
+                   help="path to a MAML checkpoint whose hyperparameters "
+                        "(epochs, seed, target_motor, mass, sigma, n_x0_*, "
+                        "dynamics, hidden, t_sim, weights, ...) will be "
+                        "inherited as defaults. Any CLI arg explicitly "
+                        "passed still overrides the inherited default.")
+
     # Core training
-    p.add_argument("--epochs",        type=int,   default=500)
-    p.add_argument("--lr-outer",      type=float, default=1e-3,
+    p.add_argument("--epochs",        type=int,
+                   default=d.get("epochs", 500))
+    p.add_argument("--lr-outer",      type=float,
+                   default=d.get("lr_outer", 1e-3),
                    help="learning rate (Adam)")
-    p.add_argument("--hidden",        type=int,   default=64)
+    p.add_argument("--hidden",        type=int,
+                   default=d.get("hidden", 64))
 
     # x0 batches (drawn once at start)
-    p.add_argument("--n-x0-train", type=int, default=32,
+    p.add_argument("--n-x0-train", type=int,
+                   default=d.get("n_x0_train", 32),
                    help="number of fixed initial states for the training loss")
-    p.add_argument("--n-x0-eval",  type=int, default=32,
+    p.add_argument("--n-x0-eval",  type=int,
+                   default=d.get("n_x0_eval", 32),
                    help="number of fixed initial states for the held-out eval loss")
-    p.add_argument("--half-side",  type=float, default=0.3,
+    p.add_argument("--half-side",  type=float,
+                   default=d.get("half_side", 0.3),
                    help="cube half-side for x0 sampling [m]")
 
     # Rollout
-    p.add_argument("--t-sim",         type=float, default=2.0,
+    p.add_argument("--t-sim",         type=float,
+                   default=d.get("t_sim", 2.0),
                    help="rollout duration [s]")
-    p.add_argument("--tau-div",       type=float, default=2.0,
+    p.add_argument("--tau-div",       type=float,
+                   default=d.get("tau_div", 2.0),
                    help="curriculum divergence threshold [m]; "
                         "set <=0 to disable")
-    p.add_argument("--obs-noise-scale", type=float, default=1.0,
+    p.add_argument("--obs-noise-scale", type=float,
+                   default=d.get("obs_noise_scale", 1.0),
                    help="0 = off, 1 = default, 2 = double")
-    p.add_argument("--terminal-weight", type=float, default=50.0)
-    p.add_argument("--pos-weight",      type=float, default=10.0)
-    p.add_argument("--z-weight",        type=float, default=1.0)
+    p.add_argument("--terminal-weight", type=float,
+                   default=d.get("terminal_weight", 50.0))
+    p.add_argument("--pos-weight",      type=float,
+                   default=d.get("pos_weight", 10.0))
+    p.add_argument("--z-weight",        type=float,
+                   default=d.get("z_weight", 1.0))
 
     # Dynamics
     p.add_argument("--dynamics", choices=list(DYNAMICS.keys()),
-                   default="nonlinear")
+                   default=d.get("dynamics", "nonlinear"))
 
     # Task definition (mirror train_maml.py)
-    p.add_argument("--mass",   type=float, default=0.010,
+    p.add_argument("--mass",   type=float,
+                   default=d.get("mass", 0.010),
                    help="fixed extra mass for every task [kg]")
-    p.add_argument("--sigma",  type=float, default=0.005,
+    p.add_argument("--sigma",  type=float,
+                   default=d.get("sigma", 0.005),
                    help="std of the 2D Gaussian over (dx, dy) [m]")
-    p.add_argument("--target-motor", type=int, default=0, choices=[0, 1, 2, 3],
+    p.add_argument("--target-motor", type=int,
+                   default=d.get("target_motor", 0), choices=[0, 1, 2, 3],
                    help="motor index held out from training")
 
     # Logging
-    p.add_argument("--plot-every", type=int, default=25,
+    p.add_argument("--plot-every", type=int,
+                   default=d.get("plot_every", 25),
                    help="regenerate the position map every N epochs "
                         "(set <=0 to only plot at the end)")
 
     # Misc
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--tag",  type=str, default="")
-    p.add_argument("--verbose-every", type=int, default=1)
+    p.add_argument("--seed", type=int,
+                   default=d.get("seed", 42))
+    p.add_argument("--tag",  type=str, default="",
+                   help="extra suffix on the output filenames; "
+                        "NOT inherited from --from-maml-ckpt")
+    p.add_argument("--verbose-every", type=int,
+                   default=d.get("verbose_every", 1))
     return p.parse_args()
 
 
@@ -176,9 +268,10 @@ def main():
 
     def save_checkpoint(policy_module, history, path):
         payload = dict(common_save_payload)
-        payload["state_dict"] = {k: v.detach().cpu()
-                                 for k, v in policy_module.state_dict().items()}
-        payload["history"]    = history
+        payload["state_dict"]    = {k: v.detach().cpu()
+                                    for k, v in policy_module.state_dict().items()}
+        payload["history"]       = history
+        payload["actual_epochs"] = len(history.get("epoch", []))
         tmp = path + ".tmp"
         torch.save(payload, tmp)
         os.replace(tmp, path)

@@ -208,9 +208,10 @@ def main():
 
     def save_checkpoint(policy_module, history, path):
         payload = dict(common_save_payload)
-        payload["state_dict"] = {k: v.detach().cpu()
-                                 for k, v in policy_module.state_dict().items()}
-        payload["history"]    = history
+        payload["state_dict"]    = {k: v.detach().cpu()
+                                    for k, v in policy_module.state_dict().items()}
+        payload["history"]       = history
+        payload["actual_epochs"] = len(history.get("epoch", []))
         # atomic write: temp file then rename, so a Ctrl+C mid-save won't
         # leave a half-written checkpoint.
         tmp = path + ".tmp"
