@@ -207,6 +207,115 @@ def meta_train(
     return policy, history
 
 
+def baseline_train(
+    policy: torch.nn.Module,
+    tasks: List[Task],
+    x0_train: torch.Tensor,
+    x0_eval: torch.Tensor,
+    *,
+    dynamics_step: Callable,
+    n_steps: int,
+    epochs: int,
+    lr_outer: float,
+    tau_div: float = None,
+    obs_noise_std: torch.Tensor = None,
+    terminal_weight: float = 50.0,
+    pos_weight: float = 10.0,
+    z_weight: float = 1.0,
+    device: str = "cpu",
+    verbose_every: int = 1,
+    seed: int = 42,
+    on_epoch_end: Callable = None,
+    killer=None,
+):
+    """Multi-task baseline training (no MAML adaptation).
+
+    Each epoch samples one MassParams per task, runs ``policy`` on the
+    fixed ``x0_train`` batch, and averages the per-task losses into a
+    single objective whose gradient flows directly into
+    ``policy.parameters()``. Mirror of ``meta_train`` minus the inner
+    loop, so a baseline NN is trained on exactly the same task
+    distributions, x0 sets, and number of epochs.
+
+    history["train_loss"] : averaged per-task training loss (on x0_train)
+    history["eval_loss"]  : same but evaluated on x0_eval (held-out, no grad)
+    history["sampled_positions"][k] : chronological r_offset for tasks[k]
+    """
+    torch.manual_seed(seed)
+    np_rng    = np.random.default_rng(seed)
+    torch_gen = torch.Generator(device=device).manual_seed(seed)
+
+    opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
+    M = len(tasks)
+    if M == 0:
+        raise ValueError("`tasks` must contain at least one Task.")
+
+    x0_train = x0_train.to(device)
+    x0_eval  = x0_eval.to(device)
+
+    history = {
+        "epoch": [], "train_loss": [], "eval_loss": [],
+        "sampled_positions": [[] for _ in range(M)],
+    }
+
+    for ep in range(epochs):
+        opt.zero_grad()
+        train_loss = 0.0
+        train_vals: List[float] = []
+        eval_vals:  List[float] = []
+
+        for t_idx, task in enumerate(tasks):
+            mass = task.sample(np_rng).to(device)
+            history["sampled_positions"][t_idx].append(tuple(mass.r_offset))
+
+            X_tr = rollout(policy, x0_train, n_steps, mass, dynamics_step,
+                           tau_div=tau_div, obs_noise_std=obs_noise_std,
+                           gen=torch_gen)
+            L_tr = trajectory_cost(X_tr, terminal_weight,
+                                   pos_weight=pos_weight,
+                                   z_weight=z_weight).mean()
+            train_loss = train_loss + L_tr
+            train_vals.append(L_tr.item())
+
+            with torch.no_grad():
+                X_ev = rollout(policy, x0_eval, n_steps, mass, dynamics_step,
+                               tau_div=tau_div, obs_noise_std=obs_noise_std,
+                               gen=torch_gen)
+                L_ev = trajectory_cost(X_ev, terminal_weight,
+                                       pos_weight=pos_weight,
+                                       z_weight=z_weight).mean()
+            eval_vals.append(L_ev.item())
+
+        train_loss = train_loss / M
+        train_loss.backward()
+
+        has_nan = any(p.grad is not None and torch.isnan(p.grad).any()
+                      for p in policy.parameters())
+        if has_nan:
+            print(f"[ep {ep+1}] NaN in grads — skipping optimizer step.")
+        else:
+            torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
+            opt.step()
+
+        history["epoch"].append(ep + 1)
+        history["train_loss"].append(float(train_loss.item()))
+        history["eval_loss"].append(float(np.mean(eval_vals)))
+
+        if verbose_every and ((ep + 1) % verbose_every == 0):
+            print(f"  [ep {ep+1:4d}/{epochs}] "
+                  f"train={train_loss.item():.4e}  "
+                  f"eval={np.mean(eval_vals):.4e}")
+
+        if on_epoch_end is not None:
+            on_epoch_end(ep, policy, history)
+
+        if killer is not None and killer.kill_now:
+            print(f"[Arrêt propre] à l'epoch {ep+1}.")
+            break
+
+    return policy, history
+
+
 def maml_adapt(
     policy: torch.nn.Module,
     mass: MassParams,
