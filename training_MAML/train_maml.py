@@ -52,71 +52,131 @@ from maml_lib import (
 )
 
 
+def _load_resume_defaults(ckpt_path: str) -> dict:
+    """Pull the full hyperparameter set out of a previous MAML checkpoint
+    so the resumed run uses identical settings unless the user overrides
+    something on the CLI.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    saved = ckpt.get("args", {})
+    actual_epochs = ckpt.get("actual_epochs",
+                             len(ckpt.get("history", {}).get("epoch", []))) \
+                    or saved.get("epochs", 500)
+    out = dict(saved)
+    # Force the "planned epochs" default to be at least what was already
+    # done, otherwise the resumed loop would do zero iterations.
+    out["epochs"] = max(int(saved.get("epochs", 500)), int(actual_epochs))
+    return out
+
+
 def parse_args():
+    # ---- Two-pass parsing: peek at --resume so its values can be used
+    # as defaults for every other CLI arg below.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--resume", type=str, default=None)
+    pre_args, _ = pre.parse_known_args()
+
+    if pre_args.resume is not None:
+        d = _load_resume_defaults(pre_args.resume)
+        print(f"[Init] Resuming from {pre_args.resume}")
+        print(f"[Init]   inherited hyperparameters from the checkpoint; "
+              f"override any CLI arg to deviate.")
+    else:
+        d = {}
+
     p = argparse.ArgumentParser(
         description="MAML training for CF2 with Gaussian-motor tasks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--resume", type=str, default=None,
+                   help="resume training from this .pt checkpoint "
+                        "(bit-identical continuation: optimizer + RNG state "
+                        "restored). All hyperparameters default to the "
+                        "checkpoint's values; pass --epochs N to extend "
+                        "training to N total epochs.")
 
     # Core training
-    p.add_argument("--epochs",        type=int,   default=500)
-    p.add_argument("--lr-outer",      type=float, default=1e-3,
+    p.add_argument("--epochs",        type=int,
+                   default=d.get("epochs", 500))
+    p.add_argument("--lr-outer",      type=float,
+                   default=d.get("lr_outer", 1e-3),
                    help="meta (outer) learning rate")
-    p.add_argument("--lr-inner",      type=float, default=1e-2,
+    p.add_argument("--lr-inner",      type=float,
+                   default=d.get("lr_inner", 1e-2),
                    help="inner-loop (per-task) learning rate")
-    p.add_argument("--n-inner-steps", type=int,   default=1,
+    p.add_argument("--n-inner-steps", type=int,
+                   default=d.get("n_inner_steps", 1),
                    help="number of inner-loop gradient steps per task "
                         "(MAML paper uses 1)")
-    p.add_argument("--maml-order",    type=int,   default=2, choices=[1, 2],
+    p.add_argument("--maml-order",    type=int,
+                   default=d.get("maml_order", 2), choices=[1, 2],
                    help="1 = FOMAML, 2 = full second-order MAML")
-    p.add_argument("--hidden",        type=int,   default=64)
+    p.add_argument("--hidden",        type=int,
+                   default=d.get("hidden", 64))
 
     # x0 batches (drawn once at start)
-    p.add_argument("--n-x0-train", type=int, default=32,
+    p.add_argument("--n-x0-train", type=int,
+                   default=d.get("n_x0_train", 32),
                    help="number of fixed initial states for the inner loss")
-    p.add_argument("--n-x0-eval",  type=int, default=32,
+    p.add_argument("--n-x0-eval",  type=int,
+                   default=d.get("n_x0_eval", 32),
                    help="number of fixed initial states for the meta loss "
                         "(disjoint from train)")
-    p.add_argument("--half-side",  type=float, default=0.3,
+    p.add_argument("--half-side",  type=float,
+                   default=d.get("half_side", 0.3),
                    help="cube half-side for x0 sampling [m]")
 
     # Rollout
-    p.add_argument("--t-sim",         type=float, default=2.0,
+    p.add_argument("--t-sim",         type=float,
+                   default=d.get("t_sim", 2.0),
                    help="rollout duration [s]")
-    p.add_argument("--tau-div",       type=float, default=2.0,
+    p.add_argument("--tau-div",       type=float,
+                   default=d.get("tau_div", 2.0),
                    help="curriculum divergence threshold [m]; "
                         "set <=0 to disable")
-    p.add_argument("--obs-noise-scale", type=float, default=1.0,
+    p.add_argument("--obs-noise-scale", type=float,
+                   default=d.get("obs_noise_scale", 1.0),
                    help="0 = off, 1 = default, 2 = double")
-    p.add_argument("--terminal-weight", type=float, default=50.0)
-    p.add_argument("--pos-weight",      type=float, default=10.0,
+    p.add_argument("--terminal-weight", type=float,
+                   default=d.get("terminal_weight", 50.0))
+    p.add_argument("--pos-weight",      type=float,
+                   default=d.get("pos_weight", 10.0),
                    help="weight on (x, y, z) in the running cost")
-    p.add_argument("--z-weight",        type=float, default=1.0)
-    p.add_argument("--inner-grad-clip", type=float, default=1.0,
+    p.add_argument("--z-weight",        type=float,
+                   default=d.get("z_weight", 1.0))
+    p.add_argument("--inner-grad-clip", type=float,
+                   default=d.get("inner_grad_clip", 1.0),
                    help="max-norm clip on inner-loop gradients; "
                         "set <=0 to disable")
 
     # Dynamics
     p.add_argument("--dynamics", choices=list(DYNAMICS.keys()),
-                   default="nonlinear")
+                   default=d.get("dynamics", "nonlinear"))
 
     # Task definition (Gaussian-motor)
-    p.add_argument("--mass",   type=float, default=0.010,
+    p.add_argument("--mass",   type=float,
+                   default=d.get("mass", 0.010),
                    help="fixed extra mass for every task [kg]")
-    p.add_argument("--sigma",  type=float, default=0.005,
+    p.add_argument("--sigma",  type=float,
+                   default=d.get("sigma", 0.005),
                    help="std of the 2D Gaussian over (dx, dy) [m]")
-    p.add_argument("--target-motor", type=int, default=0, choices=[0, 1, 2, 3],
+    p.add_argument("--target-motor", type=int,
+                   default=d.get("target_motor", 0), choices=[0, 1, 2, 3],
                    help="motor index held out from training "
                         "(0=front-right, 1=rear-right, 2=rear-left, 3=front-left)")
 
     # Logging
-    p.add_argument("--plot-every", type=int, default=25,
+    p.add_argument("--plot-every", type=int,
+                   default=d.get("plot_every", 25),
                    help="regenerate the position map every N epochs "
                         "(set <=0 to only plot at the end)")
 
     # Misc
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--tag",  type=str, default="")
-    p.add_argument("--verbose-every", type=int, default=1)
+    p.add_argument("--seed", type=int,
+                   default=d.get("seed", 42))
+    p.add_argument("--tag",  type=str,
+                   default=d.get("tag", ""))
+    p.add_argument("--verbose-every", type=int,
+                   default=d.get("verbose_every", 1))
     return p.parse_args()
 
 
@@ -152,14 +212,25 @@ def main():
           f"target = motor #{args.target_motor}  "
           f"σ={args.sigma*100:.2f}cm  m={args.mass*1e3:.0f}g")
 
-    # --- Fixed x0 batches (sampled once, reproducible from seed) -----------
-    x0_gen = torch.Generator(device=device).manual_seed(args.seed)
-    n_total = args.n_x0_train + args.n_x0_eval
-    x0_all = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
-    x0_train = x0_all[:args.n_x0_train].contiguous()
-    x0_eval  = x0_all[args.n_x0_train:].contiguous()
-    print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}  "
-          f"cube ±{args.half_side}m (hover)")
+    # --- Resume: load the checkpoint up-front (need it for x0, weights, RNG) -
+    ckpt = None
+    if args.resume is not None:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+
+    # --- Fixed x0 batches --------------------------------------------------
+    if ckpt is not None:
+        x0_train = ckpt["x0_train"].to(device)
+        x0_eval  = ckpt["x0_eval"].to(device)
+        print(f"[x0]    n_train={x0_train.shape[0]}  n_eval={x0_eval.shape[0]}  "
+              f"(restored from checkpoint)")
+    else:
+        x0_gen = torch.Generator(device=device).manual_seed(args.seed)
+        n_total = args.n_x0_train + args.n_x0_eval
+        x0_all = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
+        x0_train = x0_all[:args.n_x0_train].contiguous()
+        x0_eval  = x0_all[args.n_x0_train:].contiguous()
+        print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}  "
+              f"cube ±{args.half_side}m (hover)")
 
     # --- Policy ------------------------------------------------------------
     # Initialise the thrust bias for the hover of the *total* task mass
@@ -172,6 +243,10 @@ def main():
           f"(baseline was {C.HOVER_THRUST_U16_BASE:.0f})")
     policy = PolicyMLP(hidden=args.hidden,
                        hover_thrust_u16=hover_thrust_u16).to(device)
+    if ckpt is not None:
+        policy.load_state_dict(ckpt["state_dict"])
+        print(f"[Policy] restored weights from checkpoint "
+              f"(actual_epochs={ckpt.get('actual_epochs', '?')}).")
 
     # --- Sim-to-real obs noise --------------------------------------------
     obs_noise = ((C.OBS_NOISE_STD * args.obs_noise_scale).to(device)
@@ -206,12 +281,23 @@ def main():
         "x0_eval":            x0_eval.detach().cpu(),
     }
 
-    def save_checkpoint(policy_module, history, path):
+    def save_checkpoint(policy_module, history, path,
+                        optimizer=None, np_rng=None, torch_gen=None):
         payload = dict(common_save_payload)
         payload["state_dict"]    = {k: v.detach().cpu()
                                     for k, v in policy_module.state_dict().items()}
         payload["history"]       = history
         payload["actual_epochs"] = len(history.get("epoch", []))
+        # Fields needed for a bit-identical resume.
+        if optimizer is not None:
+            payload["optimizer_state"] = optimizer.state_dict()
+        if np_rng is not None:
+            payload["np_rng_state"]    = np_rng.bit_generator.state
+        if torch_gen is not None:
+            payload["torch_gen_state"] = torch_gen.get_state().cpu()
+        payload["torch_rng_state"]     = torch.get_rng_state().cpu()
+        if torch.cuda.is_available():
+            payload["torch_cuda_rng_state"] = torch.cuda.get_rng_state().cpu()
         # atomic write: temp file then rename, so a Ctrl+C mid-save won't
         # leave a half-written checkpoint.
         tmp = path + ".tmp"
@@ -234,13 +320,44 @@ def main():
         except Exception as e:  # plotting must never kill training
             print(f"[Plot] failed: {e}")
 
-    def on_epoch_end(ep, policy_module, history):
-        # always save the checkpoint so Ctrl+C preserves the full map
-        save_checkpoint(policy_module, history, working_ckpt)
+    def on_epoch_end(ep, policy_module, history,
+                     optimizer=None, np_rng=None, torch_gen=None, **_):
+        # always save the checkpoint so Ctrl+C preserves the full map +
+        # everything needed to resume bit-identically.
+        save_checkpoint(policy_module, history, working_ckpt,
+                        optimizer=optimizer, np_rng=np_rng, torch_gen=torch_gen)
         if args.plot_every > 0 and ((ep + 1) % args.plot_every == 0):
             save_plot(history, working_map)
 
     killer = GracefulKiller()
+
+    # Build resume_state from the checkpoint, if any. Validate that all
+    # required RNG / optimizer fields are present — older checkpoints
+    # (pre-resume support) lack them and can't be resumed bit-identically.
+    resume_state = None
+    if ckpt is not None:
+        required = ("optimizer_state", "np_rng_state",
+                    "torch_gen_state", "torch_rng_state", "history")
+        missing = [k for k in required if k not in ckpt]
+        if missing:
+            raise RuntimeError(
+                f"Cannot resume from {args.resume}: missing keys {missing}. "
+                "This checkpoint was saved by an older version of "
+                "train_maml.py. Re-train from scratch.")
+        resume_state = {
+            "optimizer_state":      ckpt["optimizer_state"],
+            "np_rng_state":         ckpt["np_rng_state"],
+            "torch_gen_state":      ckpt["torch_gen_state"],
+            "torch_rng_state":      ckpt["torch_rng_state"],
+            "history":              ckpt["history"],
+        }
+        if "torch_cuda_rng_state" in ckpt:
+            resume_state["torch_cuda_rng_state"] = ckpt["torch_cuda_rng_state"]
+        done = len(ckpt["history"].get("epoch", []))
+        if done >= args.epochs:
+            print(f"[Resume] checkpoint already has {done} epochs "
+                  f">= --epochs {args.epochs}; nothing to do. "
+                  f"Pass --epochs > {done} to extend.")
 
     policy, history = meta_train(
         policy, training_tasks, x0_train, x0_eval,
@@ -262,21 +379,32 @@ def main():
         seed=args.seed,
         on_epoch_end=on_epoch_end,
         killer=killer,
+        resume_state=resume_state,
     )
 
     # Final save under the "actual epochs" name (matches len(history)).
+    # on_epoch_end has already written working_ckpt with the full state
+    # (policy + optimizer + RNG + history) at the end of the last epoch,
+    # so we just rename rather than re-save (which would have no access
+    # to the optimizer/RNG objects from this scope and would break
+    # resume-ability of the final file).
     actual_epochs = len(history["epoch"])
     final_ckpt = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}.pt")
     final_map  = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}_map.png")
-    save_checkpoint(policy, history, final_ckpt)
+    if os.path.exists(working_ckpt):
+        os.replace(working_ckpt, final_ckpt)
+    elif actual_epochs > 0:
+        # Defensive fallback: no working file (shouldn't happen) — save
+        # what we can (policy + history) without resume state.
+        save_checkpoint(policy, history, final_ckpt)
+    # Regenerate the plot under the final name (plot_every may not have
+    # hit the last epoch). This re-renders from history alone.
     save_plot(history, final_map)
-    # Clean up the in-progress files (they are now superseded by the final ones).
-    for stale in (working_ckpt, working_map):
-        if os.path.exists(stale):
-            try:
-                os.remove(stale)
-            except OSError:
-                pass
+    if os.path.exists(working_map):
+        try:
+            os.remove(working_map)
+        except OSError:
+            pass
     print(f"[Saved] {final_ckpt}")
     print(f"[Saved] {final_map}")
     print("Done.")

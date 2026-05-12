@@ -59,7 +59,7 @@ def meta_train(
     *, # forces every next argument to be named explicitly
     dynamics_step: Callable, # nonlinear or linearized
     n_steps: int, # length of a rollout (NN steps at NN_FREQ)
-    epochs: int, # total number of meta-updates
+    epochs: int, # total number of meta-updates (absolute, not "extra")
     n_inner_steps: int, # nb inner updates
     lr_outer: float,
     lr_inner: float,
@@ -75,6 +75,7 @@ def meta_train(
     seed: int = 42,
     on_epoch_end: Callable = None,
     killer=None,
+    resume_state: dict = None,
 ):
     """Meta-train ``policy`` with MAML over a fixed list of tasks.
 
@@ -85,10 +86,19 @@ def meta_train(
                         all tasks and epochs (inner loss).
         x0_eval       : (N_eval,  12) fixed query batch, disjoint from
                         x0_train (outer loss).
-        on_epoch_end  : optional ``callable(ep, policy, history)`` called
-                        once per epoch, e.g. for checkpointing/plotting.
+        on_epoch_end  : optional ``callable(ep, policy, history, **state)``
+                        called once per epoch. ``state`` includes
+                        ``optimizer``, ``np_rng`` and ``torch_gen`` so the
+                        callback can persist a full resumable checkpoint.
         killer        : optional ``GracefulKiller``; if its ``kill_now``
                         flag is set after an epoch the loop exits cleanly.
+        resume_state  : optional dict with keys ``history``,
+                        ``optimizer_state``, ``np_rng_state``,
+                        ``torch_gen_state``, ``torch_rng_state``
+                        (+ optional ``torch_cuda_rng_state``). When given,
+                        the training resumes bit-identically from the
+                        last saved epoch instead of starting fresh; the
+                        ``seed`` argument is ignored.
 
     Returns:
         policy, history
@@ -96,33 +106,54 @@ def meta_train(
         Element k is the chronological list of (dx, dy, dz) tuples
         sampled from ``tasks[k]``.
     """
-    torch.manual_seed(seed) # global pytorch seed (init weights, dropout, ...)
-    np_rng    = np.random.default_rng(seed) # for task.sample(np_rng)
-    torch_gen = torch.Generator(device=device).manual_seed(seed) # for obs noise
+    M = len(tasks)
+    if M == 0:
+        raise ValueError("`tasks` must contain at least one Task.")
+
+    create_graph = (maml_order == 2)
+    x0_train = x0_train.to(device)
+    x0_eval  = x0_eval.to(device)
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
     # opt = outer optimizer, for the meta step.
     # The inner loop does not update policy.parameters(),
     # it updates a dict theta separated.
 
-    create_graph = (maml_order == 2)
-    M = len(tasks)
-    if M == 0:
-        raise ValueError("`tasks` must contain at least one Task.")
+    if resume_state is None:
+        # ---- Fresh start ------------------------------------------
+        torch.manual_seed(seed)
+        np_rng    = np.random.default_rng(seed)
+        torch_gen = torch.Generator(device=device).manual_seed(seed)
+        history = {
+            "epoch": [], "meta_loss": [],
+            "inner_pre": [], "outer_loss": [],
+            "sampled_positions": [[] for _ in range(M)],
+        }
+        start_epoch = 0
+    else:
+        # ---- Resume bit-identically from a previous run -----------
+        torch.set_rng_state(resume_state["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
+            torch.cuda.set_rng_state(resume_state["torch_cuda_rng_state"].cpu())
+        np_rng = np.random.default_rng()
+        np_rng.bit_generator.state = resume_state["np_rng_state"]
+        torch_gen = torch.Generator(device=device)
+        torch_gen.set_state(resume_state["torch_gen_state"].cpu())
+        opt.load_state_dict(resume_state["optimizer_state"])
+        history = resume_state["history"]
+        # Defensive: ensure history has the expected keys.
+        for k, v in [("epoch", []), ("meta_loss", []),
+                     ("inner_pre", []), ("outer_loss", []),
+                     ("sampled_positions", [[] for _ in range(M)])]:
+            history.setdefault(k, v)
+        start_epoch = len(history["epoch"])
+        print(f"[Resume] from epoch {start_epoch}/{epochs}.")
 
-    x0_train = x0_train.to(device)
-    x0_eval  = x0_eval.to(device)
-
-    history = {
-        "epoch": [], "meta_loss": [],
-        "inner_pre": [], "outer_loss": [],
-        "sampled_positions": [[] for _ in range(M)],
-    }
     # inner_pre = loss before the first inner step (oscillates).
     # outer_loss = loss after adaptation (should decrease).
     # sampled_positions[k] = chronological list of (dx, dy, dz) for tasks[k].
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         opt.zero_grad()
         meta_loss = 0.0
         inner_pre_vals: List[float] = []
@@ -198,7 +229,8 @@ def meta_train(
                   f"outer={np.mean(outer_vals):.4e}")
 
         if on_epoch_end is not None:
-            on_epoch_end(ep, policy, history)
+            on_epoch_end(ep, policy, history,
+                         optimizer=opt, np_rng=np_rng, torch_gen=torch_gen)
 
         if killer is not None and killer.kill_now:
             print(f"[Arrêt propre] à l'epoch {ep+1}.")
