@@ -7,11 +7,13 @@ This script replicates the EXACT PID control pipeline from the Crazyflie
 firmware (crazyflie-firmware-master), and uses it to fly a drone
 (takeoff → circle → land) inside the gym-pybullet-drones simulator.
 
-An optional --mode argument selects the target:
+An optional --mode argument selects how much of the pipeline runs on the PC
+vs. on the real Crazyflie via Crazyradio:
 
   sim        – Full pipeline in Python → RPMs → PyBullet           (default)
-  position   – OptiTrack mocap → extpose to drone; PC streams
-               send_position_setpoint (all PIDs on drone)
+  attitude   – pos + vel PIDs on PC    → send_setpoint (att+thrust to drone)
+  rate       – pos + vel + att PIDs    → send_setpoint in rate mode
+  position   – trajectory only         → send_position_setpoint (all PIDs on drone)
 
 Firmware source references are given as comments of the form:
   # [FW] path/to/file.c:LINE
@@ -56,17 +58,7 @@ try:
 except ImportError:
     HAS_CFLIB = False
 
-# ---------------------------------------------------------------------------
-# NatNet SDK (OptiTrack streaming for real drone, position mode)
-# Bundled in ./NatNetSDK/ — added to sys.path lazily inside the streamer
-# so that import failures only affect real-drone runs.
-# ---------------------------------------------------------------------------
-import threading
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-NATNET_DIR = os.path.join(SCRIPT_DIR, "NatNetSDK")
-HAS_NATNET = os.path.isdir(NATNET_DIR) and os.path.isfile(
-    os.path.join(NATNET_DIR, "NatNetClient.py"))
 
 # ---------------------------------------------------------------------------
 # Firmware constants and classes — from crazyflie_firmware
@@ -389,7 +381,7 @@ def obs_to_firmware_state(obs):
 # ===================================================================
 
 def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
-            simulate_flow_deck=False, setpoint_freq_hz=100):
+            simulate_flow_deck=False):
     """Run the full firmware PID pipeline in PyBullet simulation.
 
     Parameters
@@ -398,13 +390,6 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
         If True, replace the perfect PyBullet state with a simulated Flow
         deck v2 estimate (noise + delay) before feeding it to the position
         PID.  This reproduces the oscillations seen on the real drone.
-    setpoint_freq_hz : float
-        Rate at which a new position setpoint is handed to the firmware PID,
-        matching the radio packet rate on the real drone (default 10 Hz).
-        The internal PID still runs at CTRL_FREQ (500 Hz); between setpoint
-        updates the controller holds the last received setpoint — exactly
-        the behavior of the real firmware between two send_position_setpoint
-        packets.
     """
     if not HAS_PYBULLET_DRONES:
         print("ERROR: gym-pybullet-drones not found. Install it first.")
@@ -456,21 +441,16 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
     else:
         flow_deck = None
 
-    # Generate the setpoint trajectory at the radio packet rate, then run
-    # the sim at CTRL_FREQ — each setpoint is held for CTRL_FREQ/setpoint_freq_hz
-    # PID cycles, mirroring the real drone where the firmware keeps the last
-    # send_position_setpoint value until the next radio packet arrives.
-    setpoint_waypoints = generate_trajectory(int(setpoint_freq_hz), duration_sec,
-                                             hover_height=hover_height, radius=radius)
-    n_steps = int(CTRL_FREQ * duration_sec)
-    n_sp    = len(setpoint_waypoints)
+    # Generate trajectory
+    waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
+                                    hover_height=hover_height, radius=radius)
+    n_steps = len(waypoints)
 
-    print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz, "
-          f"Setpoint freq: {setpoint_freq_hz} Hz")
+    print(f"[SIM] PyBullet freq: {PYB_FREQ} Hz, Control freq: {CTRL_FREQ} Hz")
     print(f"[SIM] MAX_RPM: {MAX_RPM:.1f}, HOVER_RPM: {HOVER_RPM:.1f}, KF: {KF:.4e}")
     print(f"[SIM] Firmware THRUST_MAX/motor: {CF2_THRUST_MAX_PER_MOTOR*1000:.1f} mN, "
           f"RPM at THRUST_MAX: {math.sqrt(CF2_THRUST_MAX_PER_MOTOR/KF):.1f}")
-    print(f"[SIM] Trajectory: {n_steps} PID steps ({n_sp} setpoints), {duration_sec}s")
+    print(f"[SIM] Trajectory: {n_steps} steps, {duration_sec}s")
     print(f"[SIM] Phases: takeoff 3s → circle {duration_sec-6}s → land 3s")
 
     action = np.full((1, 4), HOVER_RPM)
@@ -500,10 +480,8 @@ def run_sim(duration_sec=15, gui=True, hover_height=0.5, radius=0.5, plot=True,
         else:
             pos_ctrl, vel_ctrl = pos, vel
 
-        # --- Get setpoint (held between radio packets, like the real drone) ---
-        # Each setpoint is kept for CTRL_FREQ/setpoint_freq_hz PID cycles.
-        sp_idx = min(i * n_sp // n_steps, n_sp - 1)
-        sp = setpoint_waypoints[sp_idx]
+        # --- Get setpoint ---
+        sp = waypoints[i]
         setpoint_pos      = sp[0:3]
         setpoint_yaw_rate = sp[3]
 
@@ -1265,26 +1243,13 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
     Parameters
     ----------
     uri : str
-        Crazyflie radio URI.
+        Crazyflie radio URI
     push_gains : bool
         If True, overwrite the drone's onboard PID gains with the Python
         constants defined at the top of this file before flying.
-    natnet_server_ip : str
-        IP address of the Motive PC on the OptiTrack network.
-    natnet_client_ip : str
-        IP address of this PC's network interface used to receive the stream.
-    natnet_multicast : bool
-        True = multicast (matches PythonSample.py's '0' choice),
-        False = unicast.
-    rigid_body_id : int
-        Streaming ID of the Crazyflie rigid body in Motive (the "User Data"
-        ID column in Motive, NOT the rigid body name).
     """
     if not HAS_CFLIB:
         print("ERROR: cflib not found. pip install cflib")
-        sys.exit(1)
-    if not HAS_NATNET:
-        print(f"ERROR: NatNet SDK not found at {NATNET_DIR}")
         sys.exit(1)
 
     cflib.crtp.init_drivers()
@@ -1480,43 +1445,6 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             log_lh_status.start()
 
 
-        # ── Start OptiTrack streaming thread ──────────────────────────
-        # The Kalman filter needs external pose packets BEFORE the reset
-        # so that it converges to the true mocap origin instead of (0,0,0).
-        mocap_stop  = threading.Event()
-        mocap_shared = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'count': 0}
-        mocap_thread = threading.Thread(
-            target=_natnet_streamer,
-            kwargs=dict(cf=cf,
-                        server_ip=natnet_server_ip,
-                        client_ip=natnet_client_ip,
-                        use_multicast=natnet_multicast,
-                        rigid_body_id=rigid_body_id,
-                        stop_event=mocap_stop, shared=mocap_shared,
-                        rate_hz=mocap_rate_hz),
-            daemon=True)
-        mocap_thread.start()
-
-        # Wait until the thread has streamed a few frames (or bail out).
-        t0 = time.time()
-        while mocap_shared['count'] < 30 and not mocap_stop.is_set():
-            if time.time() - t0 > 5.0:
-                print("[REAL] ERROR: no OptiTrack frames received in 5s. "
-                      "Check Motive streaming config, IP, and rigid-body name.")
-                mocap_stop.set()
-                mocap_thread.join(timeout=1.0)
-                return
-            time.sleep(0.05)
-        start_xy = (mocap_shared['x'], mocap_shared['y'])
-        print(f"[REAL] Mocap pose @ start: "
-              f"({mocap_shared['x']:.3f}, {mocap_shared['y']:.3f}, {mocap_shared['z']:.3f})")
-        print(f"[REAL] Trajectory origin set to start_xy=({start_xy[0]:+.3f}, {start_xy[1]:+.3f})")
-
-        # ── Generate trajectory centered on the drone's actual start ──
-        waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
-                                        hover_height=hover_height,
-                                        radius=radius, start_xy=start_xy)
-
         # ── Reset Kalman estimator ────────────────────────────────────
         print("[REAL] Resetting Kalman estimator...")
         cf.param.set_value('kalman.resetEstimation', '1')
@@ -1623,24 +1551,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
             land_steps = int(land_freq * land_duration)
             cutoff_z = 0.05  # m — cut motors below this height
 
-                for j in range(land_steps):
-                    if link_status['lost'] or link_status['disconnect']:
-                        print("[REAL] Link died during landing — aborting "
-                              "descent loop.")
-                        break
-                    frac = (j + 1) / land_steps
-                    # Smooth cubic descent
-                    z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
-                    if z < cutoff_z:
-                        break
-                    real_sp_log.append({'t': time.time() - flight_start,
-                                        'pos': np.array([land_x, land_y, z])})
-                    try:
-                        cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
-                    except Exception as e:
-                        print(f"[REAL] send_position_setpoint failed: {e}")
-                        break
-                    time.sleep(1.0 / land_freq)
+            print(f"[REAL] Landing from z={land_z:.2f}m over {land_duration:.1f}s...")
 
             for j in range(land_steps):
                 frac = (j + 1) / land_steps
@@ -1747,7 +1658,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Crazyflie firmware-faithful PID — sim & real drone (OptiTrack)",
+        description="Crazyflie firmware-faithful PID — sim & real drone",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
@@ -1766,7 +1677,7 @@ MODES:
     parser.add_argument('--gui', default=True, type=lambda x: x.lower() == 'true',
                         help='PyBullet GUI (default: True)')
     parser.add_argument('--uri', default='radio://0/80/2M/E7E7E7E7E7',
-                        help='Crazyflie radio URI (for real drone)')
+                        help='Crazyflie radio URI (for real modes)')
     parser.add_argument('--flow-deck-sim', action='store_true',
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
