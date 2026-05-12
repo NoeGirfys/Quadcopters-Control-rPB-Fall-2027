@@ -81,8 +81,6 @@ from crazyflie_firmware.constants import UINT16_MAX  # noqa: E402
 from crazyflie_firmware.firmware import (  # noqa: E402
     Lpf2pData,
     PidObject,
-    CrazyfliePositionController,
-    CrazyflieAttitudeController,
     CrazyfliePowerDistribution,
     cap_angle,
     CrazyflieFirmwarePID,
@@ -749,6 +747,404 @@ def _plot_jitter(t_wall_log: list, t_nominal_log: list, target_freq: float) -> N
 
 
 # ===================================================================
+#  Log resampling — align all async callback streams to a common grid
+# ===================================================================
+
+def _check_gaps(arr, label, max_gap_factor=2.5):
+    """Warn if any inter-sample gap exceeds max_gap_factor × median interval."""
+    if len(arr) < 2:
+        return
+    dt = np.diff(arr[:, 0])
+    nominal = np.median(dt)
+    if nominal <= 0:
+        return
+    gaps = np.where(dt > max_gap_factor * nominal)[0]
+    if len(gaps):
+        print(f"[WARN] {label}: {len(gaps)} gap(s) détecté(s) "
+              f"(max {dt[gaps].max()*1000:.0f} ms, nominal {nominal*1000:.0f} ms)")
+
+
+def resample_logs(logs, fs=20.0):
+    """Interpole tous les flux de log sur une grille temporelle commune.
+
+    Chaque flux (state, att, rate, vel_sp) est enregistré indépendamment
+    par son callback avec son propre timestamp.  Cette fonction les aligne
+    sur une grille régulière à `fs` Hz par interpolation linéaire.
+
+    Parameters
+    ----------
+    logs : dict with keys 'state', 'att', 'rate', 'vel_sp'
+        Each value is a list of tuples (t, col1, col2, ...) where t is
+        time.time() - flight_start in seconds.
+    fs : float
+        Resampling frequency [Hz].  Should be <= the log callback rate
+        (default LOG_MS = 50 ms → 20 Hz).
+
+    Returns
+    -------
+    dict with keys:
+        't'      — common time grid (N,)
+        'state'  — (N, 6)  x, y, z, vx, vy, vz
+        'att'    — (N, 6)  roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+        'rate'   — (N, 6)  gx, gy, gz, sp_gx, sp_gy, sp_gz
+        'vel_sp' — (N, 6)  sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz
+    """
+    arrays = {}
+    for key in ('state', 'att', 'rate', 'vel_sp'):
+        raw = logs[key]
+        if len(raw) < 2:
+            raise ValueError(f"[RESAMPLE] Flux '{key}' trop court ({len(raw)} samples)")
+        arr = np.array(raw, dtype=float)
+        _check_gaps(arr, key)
+        arrays[key] = arr
+
+    # Common time window: intersection of all streams
+    t_start = max(arr[0, 0]  for arr in arrays.values())
+    t_end   = min(arr[-1, 0] for arr in arrays.values())
+    if t_end <= t_start:
+        raise ValueError("[RESAMPLE] Pas de fenêtre temporelle commune entre les flux.")
+
+    t_grid = np.arange(t_start, t_end, 1.0 / fs)
+
+    def interp_cols(arr):
+        return np.column_stack([
+            np.interp(t_grid, arr[:, 0], arr[:, c])
+            for c in range(1, arr.shape[1])
+        ])
+
+    return {
+        't':      t_grid,
+        'state':  interp_cols(arrays['state']),    # x, y, z, vx, vy, vz
+        'att':    interp_cols(arrays['att']),      # roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+        'rate':   interp_cols(arrays['rate']),     # gx, gy, gz, sp_gx, sp_gy, sp_gz
+        'vel_sp': interp_cols(arrays['vel_sp']),   # sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz
+    }
+
+
+# ===================================================================
+#  Flight-quality metrics — circle phase only
+# ===================================================================
+
+_TAKEOFF_DURATION = 2  # seconds — must match generate_trajectory
+
+
+def compute_and_save_metrics(resampled, duration_sec,
+                              positioning_system, output_dir):
+    """Compute and persist tracking metrics for the circle phase.
+
+    Accepts the output of resample_logs() — all streams are already aligned
+    on a common time grid, so no further interpolation is needed here.
+
+    posCtl.targetX/Y/Z and posCtl.targetVX/VY/VZ are in the body-yaw-aligned
+    (BYA) frame and are rotated back to the world frame using the concurrent
+    yaw estimate before computing errors.
+
+    Cascade:
+      Position  : posCtl.targetX/Y/Z (BYA→world)  vs  stateEstimate.x/y/z
+      Velocity  : posCtl.targetVX/VY/VZ (BYA→world) vs  stateEstimate.vx/vy/vz
+      Attitude  : controller.roll/pitch/yaw          vs  stabilizer.roll/pitch/yaw
+      Rate      : controller.rollRate/pitchRate/yawRate vs gyro.x/y/z
+
+    Parameters
+    ----------
+    resampled : dict returned by resample_logs()
+        Keys: 't', 'state', 'att', 'rate', 'vel_sp'
+    """
+    import json
+    from datetime import datetime
+
+    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    circle_start = float(_TAKEOFF_DURATION)
+    circle_end   = float(duration_sec - _TAKEOFF_DURATION)
+
+    if resampled is None or len(resampled.get('t', [])) < 2:
+        print("[METRICS] No resampled flight data — skipping.")
+        return None
+
+    all_t      = resampled['t']
+    # state  columns: x, y, z, vx, vy, vz
+    all_pos    = resampled['state'][:, 0:3]
+    all_vel    = resampled['state'][:, 3:6]
+    # vel_sp columns: sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz  (BYA frame)
+    all_sp_bya = resampled['vel_sp'][:, 0:3]
+    all_sv_bya = resampled['vel_sp'][:, 3:6]
+    # att    columns: roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw
+    all_rpy    = resampled['att'][:, 0:3]
+    all_sp_att = resampled['att'][:, 3:6]
+    # rate   columns: gx, gy, gz, sp_gx, sp_gy, sp_gz
+    all_gyro   = resampled['rate'][:, 0:3]
+    all_sp_gyr = resampled['rate'][:, 3:6]
+
+    # ── Filter to circle phase ────────────────────────────────────────────
+    mask   = (all_t >= circle_start) & (all_t <= circle_end)
+    t      = all_t[mask]
+    pos    = all_pos[mask]
+    vel    = all_vel[mask]
+    sp_bya = all_sp_bya[mask];  sv_bya = all_sv_bya[mask]
+    rpy    = all_rpy[mask];     sp_att = all_sp_att[mask]
+    gyro   = all_gyro[mask];    sp_gyr = all_sp_gyr[mask]
+
+    if len(t) < 2:
+        print("[METRICS] Circle phase too short — skipping metrics.")
+        return None
+
+    # ── Body-yaw-aligned → world frame ────────────────────────────────────
+    # posCtl uses a frame rotated by the drone's current yaw around Z.
+    # Inverse rotation: x_w = x_bya·cos(ψ) − y_bya·sin(ψ)
+    #                   y_w = x_bya·sin(ψ) + y_bya·cos(ψ)
+    yaw_rad = np.radians(rpy[:, 2])
+    c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+
+    sp_interp = np.column_stack([
+        sp_bya[:, 0] * c - sp_bya[:, 1] * s,   # x world
+        sp_bya[:, 0] * s + sp_bya[:, 1] * c,   # y world
+        sp_bya[:, 2],                            # z unchanged
+    ])
+    sp_vel = np.column_stack([
+        sv_bya[:, 0] * c - sv_bya[:, 1] * s,
+        sv_bya[:, 0] * s + sv_bya[:, 1] * c,
+        sv_bya[:, 2],
+    ])
+
+    pos_err    = pos - sp_interp
+    pos_err_3d = np.linalg.norm(pos_err, axis=1)
+
+    # ── Velocity error ────────────────────────────────────────────────────
+    vel_err    = vel - sp_vel
+    vel_err_3d = np.linalg.norm(vel_err, axis=1)
+
+    # ── Attitude error (wrap yaw to [−180, 180]) ──────────────────────────
+    att_err = rpy - sp_att
+    att_err[:, 2] = ((att_err[:, 2] + 180) % 360) - 180
+
+    # ── Rate error ─────────────────────────────────────────────────────────
+    rate_err    = gyro - sp_gyr
+    rate_err_3d = np.linalg.norm(rate_err, axis=1)
+
+    def _rmse(e):  return float(np.sqrt(np.mean(e ** 2)))
+    def _mae(e):   return float(np.mean(np.abs(e)))
+    def _max(e):   return float(np.max(np.abs(e)))
+
+    metrics = {
+        'positioning_system': positioning_system,
+        'timestamp':          timestamp,
+        'circle_phase_s':     [circle_start, circle_end],
+        'n_samples':          int(len(t)),
+        'position_tracking': {
+            'rmse_3d_m':    float(np.sqrt(np.mean(pos_err_3d ** 2))),
+            'rmse_x_m':     _rmse(pos_err[:, 0]),
+            'rmse_y_m':     _rmse(pos_err[:, 1]),
+            'rmse_z_m':     _rmse(pos_err[:, 2]),
+            'mae_3d_m':     float(np.mean(pos_err_3d)),
+            'max_err_3d_m': float(np.max(pos_err_3d)),
+        },
+        'velocity_tracking': {
+            'rmse_3d_m_s':  float(np.sqrt(np.mean(vel_err_3d ** 2))),
+            'rmse_vx_m_s':  _rmse(vel_err[:, 0]),
+            'rmse_vy_m_s':  _rmse(vel_err[:, 1]),
+            'rmse_vz_m_s':  _rmse(vel_err[:, 2]),
+            'mae_3d_m_s':   float(np.mean(vel_err_3d)),
+            'max_err_3d_m_s': float(np.max(vel_err_3d)),
+        },
+        'attitude_tracking': {
+            'rmse_roll_deg':  _rmse(att_err[:, 0]),
+            'rmse_pitch_deg': _rmse(att_err[:, 1]),
+            'rmse_yaw_deg':   _rmse(att_err[:, 2]),
+            'mae_roll_deg':   _mae(att_err[:, 0]),
+            'mae_pitch_deg':  _mae(att_err[:, 1]),
+            'mae_yaw_deg':    _mae(att_err[:, 2]),
+            'max_roll_deg':   _max(att_err[:, 0]),
+            'max_pitch_deg':  _max(att_err[:, 1]),
+            'max_yaw_deg':    _max(att_err[:, 2]),
+        },
+        'rate_tracking': {
+            'rmse_3d_deg_s':  float(np.sqrt(np.mean(rate_err_3d ** 2))),
+            'rmse_gx_deg_s':  _rmse(rate_err[:, 0]),
+            'rmse_gy_deg_s':  _rmse(rate_err[:, 1]),
+            'rmse_gz_deg_s':  _rmse(rate_err[:, 2]),
+            'mae_3d_deg_s':   float(np.mean(rate_err_3d)),
+            'max_err_3d_deg_s': float(np.max(rate_err_3d)),
+        },
+    }
+
+    # ── Print summary ─────────────────────────────────────────────────────
+    pt = metrics['position_tracking']
+    vt = metrics['velocity_tracking']
+    at = metrics['attitude_tracking']
+    rt = metrics['rate_tracking']
+
+    print("\n" + "=" * 62)
+    print(f" METRICS  [{positioning_system.upper()}]  "
+          f"circle {circle_start:.0f}–{circle_end:.0f} s  ({len(t)} samples)")
+    print("=" * 62)
+    print(f"  [Position]  RMSE 3-D    : {pt['rmse_3d_m']*100:6.2f} cm")
+    print(f"              RMSE x/y/z  : {pt['rmse_x_m']*100:.2f} / "
+          f"{pt['rmse_y_m']*100:.2f} / {pt['rmse_z_m']*100:.2f} cm")
+    print(f"              MAE 3-D     : {pt['mae_3d_m']*100:.2f} cm   "
+          f"max: {pt['max_err_3d_m']*100:.2f} cm")
+    print(f"  [Velocity]  RMSE 3-D    : {vt['rmse_3d_m_s']*100:6.2f} cm/s")
+    print(f"              RMSE vx/vy/vz: {vt['rmse_vx_m_s']*100:.2f} / "
+          f"{vt['rmse_vy_m_s']*100:.2f} / {vt['rmse_vz_m_s']*100:.2f} cm/s")
+    print(f"  [Attitude]  RMSE r/p/y  : {at['rmse_roll_deg']:.2f} / "
+          f"{at['rmse_pitch_deg']:.2f} / {at['rmse_yaw_deg']:.2f} °")
+    print(f"              MAE  r/p/y  : {at['mae_roll_deg']:.2f} / "
+          f"{at['mae_pitch_deg']:.2f} / {at['mae_yaw_deg']:.2f} °")
+    print(f"  [Rate]      RMSE 3-D    : {rt['rmse_3d_deg_s']:6.1f} °/s")
+    print(f"              RMSE gx/gy/gz: {rt['rmse_gx_deg_s']:.1f} / "
+          f"{rt['rmse_gy_deg_s']:.1f} / {rt['rmse_gz_deg_s']:.1f} °/s")
+    print("=" * 62 + "\n")
+
+    # ── Save JSON ──────────────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir,
+                             f'metrics_{positioning_system}_{timestamp}.json')
+    with open(json_path, 'w') as fh:
+        json.dump(metrics, fh, indent=2)
+    print(f"[METRICS] JSON  → {json_path}")
+
+    # ── Plot ───────────────────────────────────────────────────────────────
+    _plot_metrics(
+        t, pos, sp_interp, pos_err, pos_err_3d,
+        vel, sp_vel, vel_err_3d,
+        rpy, sp_att,
+        gyro, sp_gyr, rate_err_3d,
+        metrics, positioning_system, timestamp, output_dir,
+    )
+
+    return metrics
+
+
+def _plot_metrics(t, pos, sp_interp, pos_err, pos_err_3d,
+                  vel, sp_vel, vel_err_3d,
+                  rpy, sp_att,
+                  gyro, sp_gyr, rate_err_3d,
+                  metrics, positioning_system, timestamp, output_dir):
+    """5-row × 3-column figure covering the full PID cascade.
+
+    Row 0 — Position x/y/z vs setpoint
+    Row 1 — Velocity vx/vy/vz vs setpoint (pos-PID output)
+    Row 2 — Attitude roll/pitch vs setpoint (vel-PID output) + yaw actual
+    Row 3 — Angular rate gx/gy/gz vs setpoint (att-PID output)
+    Row 4 — 3-D position error, 3-D velocity error, top-view X-Y
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.gridspec as gridspec
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping metrics plot.")
+        return
+
+    tr = t - t[0]   # time relative to circle start [s]
+    pt = metrics['position_tracking']
+    vt = metrics['velocity_tracking']
+    at = metrics['attitude_tracking']
+    rt = metrics['rate_tracking']
+
+    fig = plt.figure(figsize=(18, 20))
+    fig.suptitle(
+        f"PID Cascade Quality — {positioning_system.upper()}  |  {timestamp}\n"
+        f"Pos RMSE {pt['rmse_3d_m']*100:.2f} cm  |  "
+        f"Vel RMSE {vt['rmse_3d_m_s']*100:.2f} cm/s  |  "
+        f"Att RMSE r/p {at['rmse_roll_deg']:.2f}/{at['rmse_pitch_deg']:.2f} °  |  "
+        f"Rate RMSE {rt['rmse_3d_deg_s']:.1f} °/s",
+        fontsize=12,
+    )
+    gs = gridspec.GridSpec(5, 3, figure=fig, hspace=0.55, wspace=0.35)
+
+    def _tracking_subplot(ax, tr, actual, setpoint, ylabel, title, clr_a='tomato', clr_s='steelblue'):
+        ax.plot(tr, actual,   color=clr_a, lw=1.5, label='actual')
+        ax.plot(tr, setpoint, color=clr_s, lw=1.0, ls='--', label='setpoint')
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 0: position ───────────────────────────────────────────────────
+    for col, (lbl, axis) in enumerate(zip(['x [m]', 'y [m]', 'z [m]'], 'xyz')):
+        _tracking_subplot(fig.add_subplot(gs[0, col]),
+                          tr, pos[:, col], sp_interp[:, col], lbl, f'Pos {axis}')
+
+    # ── Row 1: velocity ───────────────────────────────────────────────────
+    for col, (lbl, axis) in enumerate(zip(['vx [m/s]', 'vy [m/s]', 'vz [m/s]'], ['x', 'y', 'z'])):
+        _tracking_subplot(fig.add_subplot(gs[1, col]),
+                          tr, vel[:, col], sp_vel[:, col], lbl, f'Vel {axis}',
+                          clr_a='darkorange', clr_s='royalblue')
+
+    # ── Row 2: attitude (roll, pitch, yaw — all vs setpoint) ─────────────
+    att_row = [
+        ('roll [°]',  0, at['rmse_roll_deg']),
+        ('pitch [°]', 1, at['rmse_pitch_deg']),
+        ('yaw [°]',   2, at['rmse_yaw_deg']),
+    ]
+    for col, (lbl, idx, rmse) in enumerate(att_row):
+        ax = fig.add_subplot(gs[2, col])
+        ax.plot(tr, rpy[:, idx],    color='seagreen',     lw=1.5, label='actual')
+        ax.plot(tr, sp_att[:, idx], color='mediumorchid', lw=1.0, ls='--', label='setpoint')
+        ax.set_ylabel(lbl)
+        ax.set_title(f'Att {["roll","pitch","yaw"][idx]}  RMSE {rmse:.2f}°')
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 3: angular rate ───────────────────────────────────────────────
+    rate_labels = ['gx [°/s]', 'gy [°/s]', 'gz [°/s]']
+    rate_rmses  = [rt['rmse_gx_deg_s'], rt['rmse_gy_deg_s'], rt['rmse_gz_deg_s']]
+    for col in range(3):
+        ax = fig.add_subplot(gs[3, col])
+        ax.plot(tr, gyro[:, col],   color='purple',      lw=1.5, label='actual')
+        ax.plot(tr, sp_gyr[:, col], color='darkcyan',    lw=1.0, ls='--', label='setpoint')
+        ax.set_ylabel(rate_labels[col])
+        ax.set_title(f'Rate {"xyz"[col]}  RMSE {rate_rmses[col]:.1f} °/s')
+        ax.legend(fontsize=7)
+        ax.set_xlabel('Time [s]')
+        ax.grid(True, alpha=0.3)
+
+    # ── Row 4: aggregate error + top-view ────────────────────────────────
+    ax = fig.add_subplot(gs[4, 0])
+    ax.plot(tr, pos_err_3d, color='firebrick', lw=1.2)
+    ax.axhline(pt['rmse_3d_m'], color='steelblue', ls='--', lw=1.0,
+               label=f"RMSE {pt['rmse_3d_m']*100:.2f} cm")
+    ax.axhline(pt['mae_3d_m'],  color='seagreen',  ls=':',  lw=1.0,
+               label=f"MAE  {pt['mae_3d_m']*100:.2f} cm")
+    ax.set_ylabel('3-D pos error [m]')
+    ax.set_title('Position 3-D error')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[4, 1])
+    ax.plot(tr, vel_err_3d, color='darkorange', lw=1.2)
+    ax.axhline(vt['rmse_3d_m_s'], color='royalblue', ls='--', lw=1.0,
+               label=f"RMSE {vt['rmse_3d_m_s']*100:.2f} cm/s")
+    ax.axhline(vt['mae_3d_m_s'],  color='seagreen',  ls=':',  lw=1.0,
+               label=f"MAE  {vt['mae_3d_m_s']*100:.2f} cm/s")
+    ax.set_ylabel('3-D vel error [m/s]')
+    ax.set_title('Velocity 3-D error')
+    ax.set_xlabel('Time [s]')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    ax = fig.add_subplot(gs[4, 2])
+    ax.plot(sp_interp[:, 0], sp_interp[:, 1],
+            color='steelblue', ls='--', lw=1.0, label='setpoint', zorder=2)
+    sc = ax.scatter(pos[:, 0], pos[:, 1], c=tr, cmap='plasma',
+                    s=3, zorder=3, label='actual')
+    plt.colorbar(sc, ax=ax, label='t [s]')
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_aspect('equal')
+    ax.set_title('Top-view (X-Y)')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+
+    os.makedirs(output_dir, exist_ok=True)
+    png_path = os.path.join(output_dir,
+                            f'metrics_{positioning_system}_{timestamp}.png')
+    plt.savefig(png_path, dpi=150, bbox_inches='tight')
+    print(f"[PLOT]    PNG   → {png_path}")
+    plt.show()
+
+
+# ===================================================================
 #  Push Python PID constants → real Crazyflie firmware via cflib
 # ===================================================================
 
@@ -809,192 +1205,62 @@ def push_pid_gains_to_drone(cf):
 
 
 # ===================================================================
-#  OptiTrack streaming thread  (NatNet SDK → send_extpose)
+#  Positioning system detection
 # ===================================================================
 
-def _natnet_streamer(cf, server_ip, client_ip, use_multicast, rigid_body_id,
-                     stop_event, shared=None, rate_hz=None):
-    """Stream OptiTrack rigid-body pose to the Crazyflie via send_extpose,
-    using the bundled NatNet SDK directly.
+def detect_positioning_system(cf) -> dict:
+    """Detect installed positioning decks via firmware deck parameters.
 
-    Motive must be configured with:
-      • Streaming Engine ON, Up Axis = Z, Rigid Bodies ON.
-      • Multicast or Unicast matching `use_multicast`.
-      • A rigid body with streaming ID = `rigid_body_id`.
+    Reads deck.bcFlow2 and deck.bcLighthouse4 to determine which
+    positioning systems are physically present on the drone.
 
-    The NatNet client spawns its own data thread internally; the per-rigid-body
-    callback fires there.  `cf.extpos.send_extpose` is called directly from
-    that callback (cflib serializes radio writes via its own queues).
-
-    The shared dict is updated at Motive's native rate so the start-of-flight
-    handshake converges quickly.  Radio writes are optionally throttled to
-    `rate_hz`; `rate_hz=None` sends every frame.
+    Returns
+    -------
+    dict with keys:
+        'has_flowdeck'  : bool
+        'has_lighthouse': bool
+        'name'          : str — 'flowdeck', 'lighthouse',
+                          'flowdeck+lighthouse', or 'unknown'
     """
-    if not HAS_NATNET:
-        print(f"[MOCAP] NatNet SDK not found at {NATNET_DIR}")
-        stop_event.set()
-        return
-
-    if NATNET_DIR not in sys.path:
-        sys.path.insert(0, NATNET_DIR)
-    try:
-        from NatNetClient import NatNetClient  # type: ignore
-    except Exception as e:
-        print(f"[MOCAP] Failed to import NatNetClient: {e}")
-        stop_event.set()
-        return
-
-    period = (1.0 / rate_hz) if rate_hz else 0.0
-    # Watchdog thresholds (seconds)
-    RB_LOST_TIMEOUT     = 0.10   # no rigid body for 100 ms → lost
-    STREAM_LOST_TIMEOUT = 0.50   # no frame at all for 500 ms → stream down
-
-    state = {
-        'last_sent':       0.0,
-        'last_rb_time':    None,   # last time the target rigid body was seen
-        'last_frame_time': None,   # last time any frame arrived
-        'n_rb':            0,      # frames where the target RB was present
-        'n_frames':        0,      # total frames received
-        'n_sent':          0,      # extpose packets sent to drone
-        'n_lost_events':   0,      # tracking-loss transitions
-        'tracked':         False,  # current tracking state (latched)
-        'warned_send':     False,
-    }
-
-    def _on_rigid_body(new_id, position, rotation):
-        if new_id != rigid_body_id:
-            return
-        x, y, z = position
-        qx, qy, qz, qw = rotation
-        now = time.time()
-        state['n_rb'] += 1
-        state['last_rb_time'] = now
-        if not state['tracked']:
-            state['tracked'] = True
-            if state['n_lost_events'] > 0:
-                print(f"[MOCAP] Rigid body id={rigid_body_id} REGAINED "
-                      f"@ pos=({x:+.3f}, {y:+.3f}, {z:+.3f})")
-        if shared is not None:
-            shared['x'], shared['y'], shared['z'] = x, y, z
-            shared['count'] = state['n_rb']
-
-        if period > 0 and (now - state['last_sent']) < period:
-            return
-        try:
-            cf.extpos.send_extpose(x, y, z, qx, qy, qz, qw)
-        except Exception as e:
-            if not state['warned_send']:
-                print(f"[MOCAP] send_extpose error: {e}")
-                state['warned_send'] = True
-            return
-        state['last_sent'] = now
-        state['n_sent'] += 1
-
-    def _on_frame(_data_dict):
-        state['n_frames'] += 1
-        state['last_frame_time'] = time.time()
-
-    client = NatNetClient()
-    client.set_client_address(client_ip)
-    client.set_server_address(server_ip)
-    client.set_use_multicast(bool(use_multicast))
-    client.rigid_body_listener = _on_rigid_body
-    client.new_frame_listener = _on_frame
-    client.set_print_level(0)
-
-    if not client.run('d'):
-        print("[MOCAP] NatNet run() failed — could not open sockets.")
-        stop_event.set()
-        return
-
-    # Wait briefly for the server handshake to complete.
-    t0 = time.time()
-    while not client.connected() and (time.time() - t0) < 3.0:
-        if stop_event.is_set():
-            client.shutdown()
-            return
-        time.sleep(0.05)
-
-    if not client.connected():
-        print(f"[MOCAP] NatNet did not connect to {server_ip} "
-              f"(client={client_ip}, multicast={use_multicast}). "
-              f"Check Motive Streaming Engine settings.")
-        client.shutdown()
-        stop_event.set()
-        return
-
-    cast_str = "multicast" if use_multicast else "unicast"
-    rate_msg = f"throttled to {rate_hz:.0f} Hz" if rate_hz else "every frame"
-    print(f"[MOCAP] NatNet connected — server={server_ip} client={client_ip} "
-          f"{cast_str}, rigid body id={rigid_body_id} ({rate_msg})")
+    has_flowdeck = False
+    has_lighthouse = False
 
     try:
-        warned_no_frames = False
-        warned_no_rb     = False
-        while not stop_event.is_set():
-            time.sleep(0.05)
-            now = time.time()
+        has_flowdeck = int(cf.param.get_value('deck.bcFlow2')) != 0
+    except Exception:
+        pass
 
-            # ── Stream watchdog: no frame at all from Motive ──────────
-            if state['last_frame_time'] is None:
-                if (now - t0) > 3.0 and not warned_no_frames:
-                    print("[MOCAP] WARNING: no NatNet frames received yet "
-                          "— Motive streaming likely stopped.")
-                    warned_no_frames = True
-                continue
+    try:
+        has_lighthouse = int(cf.param.get_value('deck.bcLighthouse4')) != 0
+    except Exception:
+        pass
 
-            stream_age = now - state['last_frame_time']
-            if stream_age > STREAM_LOST_TIMEOUT:
-                if not warned_no_frames:
-                    print(f"[MOCAP] WARNING: NatNet stream stalled "
-                          f"({stream_age*1000:.0f} ms since last frame).")
-                    warned_no_frames = True
-            else:
-                if warned_no_frames:
-                    print(f"[MOCAP] NatNet stream resumed after "
-                          f"{stream_age*1000:.0f} ms gap.")
-                    warned_no_frames = False
+    active = []
+    if has_flowdeck:
+        active.append('flowdeck')
+    if has_lighthouse:
+        active.append('lighthouse')
 
-            # ── Tracking watchdog: frames arriving but no rigid body ──
-            if state['last_rb_time'] is None:
-                if (now - t0) > 3.0 and not warned_no_rb:
-                    print(f"[MOCAP] WARNING: no frames for rigid body "
-                          f"id={rigid_body_id} yet — check Motive streaming "
-                          f"ID and that the body is visible.")
-                    warned_no_rb = True
-                continue
+    name = '+'.join(active) if active else 'unknown'
 
-            rb_age = now - state['last_rb_time']
-            if state['tracked'] and rb_age > RB_LOST_TIMEOUT:
-                state['tracked'] = False
-                state['n_lost_events'] += 1
-                print(f"[MOCAP] *** TRACKING LOST *** rigid body id="
-                      f"{rigid_body_id} not seen for {rb_age*1000:.0f} ms "
-                      f"(stream still alive @ "
-                      f"{1.0/max(stream_age,1e-6):.0f} Hz)")
-    finally:
-        client.shutdown()
-        print(f"[MOCAP] Stopped — frames={state['n_frames']} "
-              f"rb_frames={state['n_rb']} sent={state['n_sent']} "
-              f"tracking_loss_events={state['n_lost_events']}")
+    print(f"[DECK]  bcFlow2={int(has_flowdeck)}  bcLighthouse4={int(has_lighthouse)}"
+          f"  ->  positioning='{name}'")
+
+    return {'has_flowdeck': has_flowdeck, 'has_lighthouse': has_lighthouse, 'name': name}
 
 
 # ===================================================================
-#  MAIN — Real drone (position mode, OptiTrack-fed Kalman)
+#  MAIN — Real drone modes
 # ===================================================================
 
 def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
              duration_sec=15, hover_height=0.5, radius=0.5,
-             push_gains=False,
-             natnet_server_ip="192.168.0.24",
-             natnet_client_ip="192.168.0.100",
-             natnet_multicast=True,
-             rigid_body_id=1,
-             mocap_rate_hz=None):
-    """Run with a real Crazyflie drone in position mode, fed by OptiTrack.
+             push_gains=False, positioning_system='unknown'):
+    """Run with a real Crazyflie drone in position-setpoint mode.
 
-    The PC only streams pose from Motive (via the NatNet SDK) to the drone;
-    the drone runs all PIDs internally on its Kalman estimate.
+    All PIDs (position, velocity, attitude, rate) run on the drone.
+    The PC sends only position setpoints at 10 Hz via
+    send_position_setpoint(x, y, z, yaw).
 
     Parameters
     ----------
@@ -1023,17 +1289,7 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
     cflib.crtp.init_drivers()
 
-    # Send send_position_setpoint at 100 Hz — matches the Crazyflie
-    # ecosystem convention (crazyswarm, Bitcraze examples) and keeps each
-    # setpoint step small enough to avoid the high-frequency ringing that
-    # appears at 10 Hz.  Bandwidth usage: ~20 B × 100 Hz = 2 kB/s (well
-    # within the CRTP link's ~100 kB/s).
-    CTRL_FREQ = 100
-
-    # Trajectory is generated later, after we know the mocap start position,
-    # so that takeoff happens at the drone's actual location.
-
-    print(f"[REAL] Mode: position (OptiTrack-fed Kalman)")
+    CTRL_FREQ = 100   # position setpoints don't need high rate
     print(f"[REAL] Connecting to {uri} ...")
 
     cache_dir = os.path.join(SCRIPT_DIR, 'cache')
@@ -1041,86 +1297,35 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         cf = scf.cf
         print("[REAL] Connected!")
 
-        # ─── Radio link health monitoring ─────────────────────────────
-        # The Crazyradio reports link quality (0-100 %) periodically and
-        # fires connection_lost / disconnected on hard radio failures
-        # (e.g. "Too many packets lost" from the cflib radio driver).
-        #
-        # We use these to:
-        #   1. log every degradation / loss event
-        #   2. trigger a preemptive controlled descent when the link
-        #      stays below LINK_QUALITY_ABORT_PCT for too long, before
-        #      cflib gives up entirely.
-        LINK_QUALITY_WARN_PCT  = 70.0   # transient warning threshold
-        LINK_QUALITY_ABORT_PCT = 40.0   # sustained → abort to landing
-        LINK_BAD_ABORT_SEC     = 0.5    # how long to stay below abort
+        # ── Auto-detect installed positioning decks ───────────────────
+        deck_info = detect_positioning_system(cf)
+        if positioning_system == 'unknown':
+            positioning_system = deck_info['name']
+            print(f"[REAL] Auto-detected positioning_system='{positioning_system}'")
 
-        link_status = {
-            'quality':      100.0,
-            'lost':         False,    # True after connection_lost callback
-            'disconnect':   False,    # True after disconnected callback
-            'reason':       None,     # error message from connection_lost
-            'bad_since':    None,     # time.time() when quality first dropped
-            'warn_active':  False,
-            'n_low_events': 0,
-            'min_quality':  100.0,
-        }
+        # ── Positioning-system-specific parameters ────────────────────
+        # FlowDeck-only: disable adaptive std-dev and raise fixed std-dev
+        # to reduce Kalman oscillations caused by optical-flow noise.
+        # These parameters must NOT be written when using Lighthouse/Loco/MoCap
+        # as they are irrelevant and could confuse the Kalman filter.
+        if positioning_system == 'flowdeck':
+            # On s'assure de désactiver l'écart-type adaptatif
+            cf.param.set_value('motion.adaptive', '0')
 
-        def _link_quality_cb(percent):
-            link_status['quality'] = percent
-            if percent < link_status['min_quality']:
-                link_status['min_quality'] = percent
-
-            now = time.time()
-            if percent < LINK_QUALITY_ABORT_PCT:
-                if link_status['bad_since'] is None:
-                    link_status['bad_since'] = now
-            else:
-                link_status['bad_since'] = None
-
-            if percent < LINK_QUALITY_WARN_PCT:
-                if not link_status['warn_active']:
-                    link_status['warn_active'] = True
-                    link_status['n_low_events'] += 1
-                    print(f"[LINK] WARNING: link quality dropped to "
-                          f"{percent:.0f}%")
-            else:
-                if link_status['warn_active']:
-                    print(f"[LINK] Link quality recovered ({percent:.0f}%)")
-                    link_status['warn_active'] = False
-
-        def _connection_lost_cb(uri_str, msg):
-            link_status['lost']   = True
-            link_status['reason'] = msg
-            print(f"[LINK] *** CONNECTION LOST *** {uri_str} — {msg}")
-
-        def _disconnected_cb(uri_str):
-            link_status['disconnect'] = True
-            print(f"[LINK] Disconnected from {uri_str}")
-
-        cf.link_quality_updated.add_callback(_link_quality_cb)
-        cf.connection_lost.add_callback(_connection_lost_cb)
-        cf.disconnected.add_callback(_disconnected_cb)
-
-        # ─── Estimator & external-position configuration ──────────────
-        # Force the Kalman filter (required for mocap-based localization)
-        # and set the standard deviation of the incoming extpose packets.
-        #   stabilizer.estimator: 1 = complementary, 2 = Kalman
-        #   locSrv.extPosStdDev  : position noise std [m]
-        #   locSrv.extQuatStdDev : quaternion noise std [rad]
-        cf.param.set_value('stabilizer.estimator', '2')
-        cf.param.set_value('locSrv.extPosStdDev',  '0.001')
-        cf.param.set_value('locSrv.extQuatStdDev', '0.0045')
+            # On augmente l'écart-type fixe du Flowdeck (par défaut à 2.0)
+            # La valeur de 10.0 est un bon point de départ pour lisser les oscillations selon les tests de Bitcraze
+            cf.param.set_value('motion.flowStdFixed', '10.0')
 
         if push_gains:
             push_pid_gains_to_drone(cf)
 
-        # Set up logging to read back state (position + velocity + attitude).
-        # 10 Hz (period_in_ms=100) keeps radio bandwidth low; the comparison
-        # plot still has ~10× duration samples, which is plenty.
+        # Set up logging to read back the full PID cascade state.
+        # Works with any positioning system (Lighthouse, FlowDeck, Loco, MoCap).
+        # Each LogConfig fires its callback independently; timestamps are recorded
+        # per-callback and streams are resampled onto a common grid after the flight.
         from cflib.crazyflie.log import LogConfig
-        LOG_PERIOD_MS = 100   # 10 Hz — tune this if more resolution is needed
-        log_state = LogConfig(name='State', period_in_ms=LOG_PERIOD_MS)
+        LOG_MS = 50 # 20 Hz
+        log_state = LogConfig(name='State', period_in_ms=LOG_MS)  
         log_state.add_variable('stateEstimate.x',  'float')
         log_state.add_variable('stateEstimate.y',  'float')
         log_state.add_variable('stateEstimate.z',  'float')
@@ -1128,49 +1333,152 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
         log_state.add_variable('stateEstimate.vy', 'float')
         log_state.add_variable('stateEstimate.vz', 'float')
 
-        log_att = LogConfig(name='Attitude', period_in_ms=LOG_PERIOD_MS)
-        log_att.add_variable('stabilizer.roll',  'float')
-        log_att.add_variable('stabilizer.pitch', 'float')
-        log_att.add_variable('stabilizer.yaw',   'float')
+        # actual attitude + attitude setpoints from vel-PID (6 floats = 24 bytes)
+        log_att = LogConfig(name='Attitude', period_in_ms=LOG_MS)
+        log_att.add_variable('stabilizer.roll',   'float')
+        log_att.add_variable('stabilizer.pitch',  'float')
+        log_att.add_variable('stabilizer.yaw',    'float')
+        log_att.add_variable('controller.roll',   'float')  # att setpoint from vel-PID [deg]
+        log_att.add_variable('controller.pitch',  'float')  # att setpoint from vel-PID [deg]
+        log_att.add_variable('controller.yaw',    'float')  # att setpoint from vel-PID [deg]
 
-        # Shared state dict updated by log callbacks
-        drone_state = {
-            'x': 0, 'y': 0, 'z': 0, 'vx': 0, 'vy': 0, 'vz': 0,
-            'roll': 0, 'pitch': 0, 'yaw': 0,
+        # actual gyro + rate setpoints from att-PID (6 floats = 24 bytes)
+        log_rate = LogConfig(name='AngRate', period_in_ms=LOG_MS)
+        log_rate.add_variable('gyro.x',              'float')
+        log_rate.add_variable('gyro.y',              'float')
+        log_rate.add_variable('gyro.z',              'float')
+        log_rate.add_variable('controller.rollRate',  'float')  # rate setpoint from att-PID [deg/s]
+        log_rate.add_variable('controller.pitchRate', 'float')
+        log_rate.add_variable('controller.yawRate',   'float')
+
+        # position + velocity setpoints from pos-PID, body-yaw-aligned frame (6 floats = 24 bytes)
+        log_vel_sp = LogConfig(name='PidSp', period_in_ms=LOG_MS)
+        log_vel_sp.add_variable('posCtl.targetX',  'float')  # pos setpoint BYA [m]
+        log_vel_sp.add_variable('posCtl.targetY',  'float')
+        log_vel_sp.add_variable('posCtl.targetZ',  'float')
+        log_vel_sp.add_variable('posCtl.targetVX', 'float')  # vel setpoint BYA [m/s]
+        log_vel_sp.add_variable('posCtl.targetVY', 'float')
+        log_vel_sp.add_variable('posCtl.targetVZ', 'float')
+
+        # ── Deck status monitoring ────────────────────────────────────
+        # Live snapshot updated by callbacks; values shown in the periodic
+        # status line and in the post-flight summary.
+        #   motion.squal    : optical surface quality [0–255] — 0 = bad/no signal
+        #   range.zrange    : VL53L1x distance to ground [mm]
+        #   lighthouse.status : 0=no BS, 1=received/missing data, 2=estimator OK
+        #   lighthouse.bsReceive / bsActive : base-station bitmasks
+        pos_sys_status = {
+            'flow_squal': 0,
+            'flow_range': 0,
+            'lh_status':  0,
+            'lh_bs_rx':   0,
+            'lh_bs_act':  0,
         }
 
-        # Timestamped data logs — filled during flight for comparison plot
-        real_log    = []   # one entry per _state_cb callback (~100 Hz)
-        real_sp_log = []   # one entry per setpoint command sent
-        flight_start = None  # set just before the main flight loop
+        log_flow_status = None
+        log_lh_status   = None
+
+        if deck_info['has_flowdeck']:
+            log_flow_status = LogConfig(name='FlowStatus', period_in_ms=LOG_MS)
+            log_flow_status.add_variable('motion.squal', 'uint8_t')
+            log_flow_status.add_variable('range.zrange', 'uint16_t')
+
+        if deck_info['has_lighthouse']:
+            log_lh_status = LogConfig(name='LhStatus', period_in_ms=LOG_MS)
+            log_lh_status.add_variable('lighthouse.status',    'uint8_t')
+            log_lh_status.add_variable('lighthouse.bsReceive', 'uint16_t')
+            log_lh_status.add_variable('lighthouse.bsActive',  'uint16_t')
+
+        # Per-stream raw logs — each callback appends (t, col1, col2, ...).
+        # Using independent lists avoids the temporal skew that arises when a
+        # single snapshot dict is read by one callback but was last written by
+        # a different callback up to LOG_MS ms earlier.
+        raw_logs = {
+            'state':  [],   # (t, x, y, z, vx, vy, vz)
+            'att':    [],   # (t, roll, pitch, yaw, sp_roll, sp_pitch, sp_yaw)
+            'rate':   [],   # (t, gx, gy, gz, sp_gx, sp_gy, sp_gz)
+            'vel_sp': [],   # (t, sp_x, sp_y, sp_z, sp_vx, sp_vy, sp_vz)
+        }
+
+        # Lightweight shared dict used only for pre-flight position readout
+        # (start_xy) and for the landing fallback.
+        drone_pos = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+
+        # Timestamped setpoint log — one entry per send_position_setpoint call
+        real_sp_log = []
+        flight_start = None   # set just before the main flight loop
 
         def _state_cb(timestamp, data, logconf):
-            drone_state['x']  = data['stateEstimate.x']
-            drone_state['y']  = data['stateEstimate.y']
-            drone_state['z']  = data['stateEstimate.z']
-            drone_state['vx'] = data['stateEstimate.vx']
-            drone_state['vy'] = data['stateEstimate.vy']
-            drone_state['vz'] = data['stateEstimate.vz']
-            # Record full state snapshot (attitude values come from last _att_cb)
+            drone_pos['x'] = data['stateEstimate.x']
+            drone_pos['y'] = data['stateEstimate.y']
+            drone_pos['z'] = data['stateEstimate.z']
             if flight_start is not None:
-                real_log.append({
-                    't':     time.time() - flight_start,
-                    'x':     drone_state['x'],   'y':   drone_state['y'],   'z':   drone_state['z'],
-                    'vx':    drone_state['vx'],  'vy':  drone_state['vy'],  'vz':  drone_state['vz'],
-                    'roll':  drone_state['roll'], 'pitch': drone_state['pitch'], 'yaw': drone_state['yaw'],
-                })
+                t = time.time() - flight_start
+                raw_logs['state'].append((
+                    t,
+                    data['stateEstimate.x'], data['stateEstimate.y'], data['stateEstimate.z'],
+                    data['stateEstimate.vx'], data['stateEstimate.vy'], data['stateEstimate.vz'],
+                ))
 
         def _att_cb(timestamp, data, logconf):
-            drone_state['roll']  = data['stabilizer.roll']
-            drone_state['pitch'] = data['stabilizer.pitch']
-            drone_state['yaw']   = data['stabilizer.yaw']
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['att'].append((
+                    t,
+                    data['stabilizer.roll'],  data['stabilizer.pitch'],  data['stabilizer.yaw'],
+                    data['controller.roll'],  data['controller.pitch'],   data['controller.yaw'],
+                ))
+
+        def _rate_cb(timestamp, data, logconf):
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['rate'].append((
+                    t,
+                    data['gyro.x'],               data['gyro.y'],               data['gyro.z'],
+                    data['controller.rollRate'],  data['controller.pitchRate'],  data['controller.yawRate'],
+                ))
+
+        def _vel_sp_cb(timestamp, data, logconf):
+            if flight_start is not None:
+                t = time.time() - flight_start
+                raw_logs['vel_sp'].append((
+                    t,
+                    data['posCtl.targetX'],  data['posCtl.targetY'],  data['posCtl.targetZ'],
+                    data['posCtl.targetVX'], data['posCtl.targetVY'], data['posCtl.targetVZ'],
+                ))
+
+        def _flow_status_cb(timestamp, data, logconf):
+            pos_sys_status['flow_squal'] = data['motion.squal']
+            pos_sys_status['flow_range'] = data['range.zrange']
+
+        def _lh_status_cb(timestamp, data, logconf):
+            pos_sys_status['lh_status'] = data['lighthouse.status']
+            pos_sys_status['lh_bs_rx']  = data['lighthouse.bsReceive']
+            pos_sys_status['lh_bs_act'] = data['lighthouse.bsActive']
 
         log_state.data_received_cb.add_callback(_state_cb)
         log_att.data_received_cb.add_callback(_att_cb)
+        log_rate.data_received_cb.add_callback(_rate_cb)
+        log_vel_sp.data_received_cb.add_callback(_vel_sp_cb)
         cf.log.add_config(log_state)
         cf.log.add_config(log_att)
+        cf.log.add_config(log_rate)
+        cf.log.add_config(log_vel_sp)
         log_state.start()
         log_att.start()
+        log_rate.start()
+        log_vel_sp.start()
+
+        if log_flow_status is not None:
+            log_flow_status.data_received_cb.add_callback(_flow_status_cb)
+            cf.log.add_config(log_flow_status)
+            log_flow_status.start()
+
+        if log_lh_status is not None:
+            log_lh_status.data_received_cb.add_callback(_lh_status_cb)
+            cf.log.add_config(log_lh_status)
+            log_lh_status.start()
+
 
         # ── Start OptiTrack streaming thread ──────────────────────────
         # The Kalman filter needs external pose packets BEFORE the reset
@@ -1210,15 +1518,22 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                                         radius=radius, start_xy=start_xy)
 
         # ── Reset Kalman estimator ────────────────────────────────────
-        # With extpose packets already streaming, the reset re-initializes
-        # the filter around the current mocap pose.
         print("[REAL] Resetting Kalman estimator...")
         cf.param.set_value('kalman.resetEstimation', '1')
         time.sleep(0.1)
         cf.param.set_value('kalman.resetEstimation', '0')
-        time.sleep(2.0)   # let filter converge and receive first log packets
-        print(f"[REAL] Estimator ready — pos=({drone_state['x']:.3f}, "
-              f"{drone_state['y']:.3f}, {drone_state['z']:.3f})")
+        time.sleep(2.0)   # On attend que le filtre converge ET que les paquets de logs arrivent !
+        
+        # --- NOUVEAU PLACEMENT ICI ---
+        # Maintenant les logs sont à jour avec la vraie position absolue Lighthouse
+        start_xy = np.array([drone_pos['x'], drone_pos['y']]) # <-- Note les crochets []
+        print(f"[REAL] Estimator ready — pos=({drone_pos['x']:.3f}, "
+              f"{drone_pos['y']:.3f}, {drone_pos['z']:.3f})")
+
+        # ── Generate trajectory centered on the drone's actual start ──
+        waypoints = generate_trajectory(CTRL_FREQ, duration_sec,
+                                        hover_height=hover_height,
+                                        radius=radius, start_xy=start_xy)
 
         # ── Unlock commander watchdog ─────────────────────────────────
         # The firmware requires receiving setpoints before it accepts real
@@ -1260,40 +1575,31 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
         try:
             for i in range(len(waypoints)):
-                # ─── Link health check ────────────────────────────
-                if link_status['lost'] or link_status['disconnect']:
-                    print(f"[REAL] Aborting flight loop — link lost "
-                          f"(reason: {link_status['reason']}).")
-                    break
-                if (link_status['bad_since'] is not None
-                        and (time.time() - link_status['bad_since'])
-                            > LINK_BAD_ABORT_SEC):
-                    print(f"[REAL] Aborting flight loop — link quality "
-                          f"≤ {LINK_QUALITY_ABORT_PCT:.0f}% for "
-                          f">{LINK_BAD_ABORT_SEC*1000:.0f} ms "
-                          f"(now {link_status['quality']:.0f}%).")
-                    break
-
                 t_iter_wall = time.time()
                 sp = waypoints[i]
                 sp_pos = sp[0:3]
                 sp_yaw_rate = sp[3]
 
-                # Log setpoint for every control step
                 real_sp_log.append({'t': time.time() - flight_start, 'pos': sp_pos.copy()})
-
-                # ─── Position mode ────────────────────────────────
-                # All PIDs run on the drone; mocap-fed Kalman supplies the state.
-                # send_position_setpoint(x, y, z, yaw_deg)
-                cf.commander.send_position_setpoint(
-                    sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
+                cf.commander.send_position_setpoint(sp_pos[0], sp_pos[1], sp_pos[2], 0.0)
 
                 # --- Timing ---
                 if i % (CTRL_FREQ * 1) == 0:
                     t = i / CTRL_FREQ
-                    print(f"  t={t:5.1f}s  pos=[{drone_state['x']:+.3f}, "
-                          f"{drone_state['y']:+.3f}, {drone_state['z']:.3f}]  "
-                          f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]")
+                    ps_parts = []
+                    if deck_info['has_flowdeck']:
+                        ps_parts.append(
+                            f"flow(squal={pos_sys_status['flow_squal']}"
+                            f" rng={pos_sys_status['flow_range']}mm)")
+                    if deck_info['has_lighthouse']:
+                        ps_parts.append(
+                            f"lh(st={pos_sys_status['lh_status']}"
+                            f" bs_act=0x{pos_sys_status['lh_bs_act']:02x})")
+                    ps_str = '  ' + '  '.join(ps_parts) if ps_parts else ''
+                    print(f"  t={t:5.1f}s  pos=[{drone_pos['x']:+.3f}, "
+                          f"{drone_pos['y']:+.3f}, {drone_pos['z']:.3f}]  "
+                          f"sp=[{sp_pos[0]:+.3f}, {sp_pos[1]:+.3f}, {sp_pos[2]:.3f}]"
+                          f"{ps_str}")
 
                 t_wall_log.append(t_iter_wall)
                 t_nominal_log.append(i / CTRL_FREQ)
@@ -1309,25 +1615,13 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
 
             # ─── Smooth landing ───────────────────────────────
             # Descend from current position to ~5 cm, then cut motors.
-            # Skip the active descent if the radio link is already gone —
-            # the firmware will hit its commander watchdog (~500 ms) on its
-            # own; trying to send packets only triggers more error logs.
-            link_dead = link_status['lost'] or link_status['disconnect']
-            if link_dead:
-                print(f"[REAL] Skipping smooth landing — link is down "
-                      f"(reason: {link_status['reason']}). Firmware watchdog "
-                      f"will idle the motors.")
-            else:
-                land_x = drone_state['x']
-                land_y = drone_state['y']
-                land_z = drone_state['z']
-                land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
-                land_freq = 20  # Hz — position setpoints don't need high rate
-                land_steps = int(land_freq * land_duration)
-                cutoff_z = 0.05  # m — cut motors below this height
-
-                print(f"[REAL] Landing from z={land_z:.2f}m over "
-                      f"{land_duration:.1f}s...")
+            land_x = drone_pos['x']
+            land_y = drone_pos['y']
+            land_z = drone_pos['z']
+            land_duration = max(1.0, land_z / 0.3)  # descend at ~0.3 m/s
+            land_freq = 20  # Hz — position setpoints don't need high rate
+            land_steps = int(land_freq * land_duration)
+            cutoff_z = 0.05  # m — cut motors below this height
 
                 for j in range(land_steps):
                     if link_status['lost'] or link_status['disconnect']:
@@ -1348,68 +1642,103 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                         break
                     time.sleep(1.0 / land_freq)
 
-                # Notify end of setpoints — tells the firmware the PC-side
-                # commander is stopping cleanly, so it idles the motors
-                # gracefully instead of hard-locking on watchdog timeout.
+            for j in range(land_steps):
+                frac = (j + 1) / land_steps
+                # Smooth cubic descent
+                z = land_z * (1.0 - (3 * frac**2 - 2 * frac**3))
+                if z < cutoff_z:
+                    break
+                real_sp_log.append({'t': time.time() - flight_start,
+                                    'pos': np.array([land_x, land_y, z])})
                 try:
-                    cf.commander.send_notify_setpoint_stop()
-                except Exception:
-                    pass
-                time.sleep(0.1)
+                    cf.commander.send_position_setpoint(land_x, land_y, z, 0.0)
+                except Exception as e:
+                    print(f"[REAL] send_position_setpoint failed during landing: {e}")
+                    break
+                time.sleep(1.0 / land_freq)
 
-            try:
-                log_state.stop()
-                log_att.stop()
-            except Exception:
-                pass
+            # Notify end of setpoints — this tells the firmware the PC-side
+            # commander is stopping cleanly, rather than vanishing (watchdog
+            # timeout).  The firmware then idles the motors gracefully without
+            # entering a hard-locked state that would require a power cycle.
+            cf.commander.send_notify_setpoint_stop()
+            time.sleep(0.1)
 
-            # Stop OptiTrack streaming thread cleanly
-            mocap_stop.set()
-            mocap_thread.join(timeout=2.0)
-
-            # ─── Link health summary ──────────────────────────
-            print(f"[LINK] Summary — min_quality={link_status['min_quality']:.0f}%  "
-                  f"low_quality_events={link_status['n_low_events']}  "
-                  f"connection_lost={link_status['lost']}  "
-                  f"disconnected={link_status['disconnect']}")
-            if link_status['reason']:
-                print(f"[LINK] Failure reason: {link_status['reason']}")
-
+            log_state.stop()
+            log_att.stop()
+            log_rate.stop()
+            log_vel_sp.stop()
+            if log_flow_status is not None:
+                log_flow_status.stop()
+            if log_lh_status is not None:
+                log_lh_status.stop()
             print("[REAL] Landed and cleaned up.")
 
-        # ─── Post-flight: run headless sim + comparison plot ──────────────
-        if real_log:
-            real_t   = np.array([e['t']   for e in real_log])
-            real_pos = np.array([[e['x'],  e['y'],  e['z']]       for e in real_log])
-            real_vel = np.array([[e['vx'], e['vy'], e['vz']]      for e in real_log])
-            real_rpy = np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log])
-            sp_t_arr = np.array([e['t']   for e in real_sp_log])
-            sp_arr   = np.array([e['pos'] for e in real_sp_log])
+        # ── Positioning system summary ────────────────────────────────────────
+        print("\n[POS_SYS] Detected: " + positioning_system)
+        if deck_info['has_flowdeck']:
+            squal = pos_sys_status['flow_squal']
+            rng   = pos_sys_status['flow_range']
+            squal_warn = '  <- WARNING: squal=0 (optical sensor not tracking)' if squal == 0 else ''
+            rng_warn   = '  <- WARNING: range=0 (range sensor inactive)' if rng == 0 else ''
+            print(f"[POS_SYS] FlowDeck   — squal={squal}{squal_warn}  range={rng} mm{rng_warn}")
+        if deck_info['has_lighthouse']:
+            bs_act  = pos_sys_status['lh_bs_act']
+            bs_rx   = pos_sys_status['lh_bs_rx']
+            lh_warn = '  <- WARNING: no active base stations' if bs_act == 0 else ''
+            print(f"[POS_SYS] Lighthouse — status={pos_sys_status['lh_status']}  "
+                  f"bsReceive=0x{bs_rx:04x}  bsActive=0x{bs_act:04x}{lh_warn}")
 
-            # Remove the trajectory's world-frame offset so the comparison
-            # overlays the sim (which always takes off from (0,0,0.02)).
-            if real_pos.size > 0:
+        # ─── Post-flight: resample all streams + comparison plot ─────────────
+        # Check that at least the state stream has data before proceeding
+        if any(len(v) < 2 for v in raw_logs.values()):
+            print("[REAL] Insufficient log data for resampling — skipping metrics.")
+        else:
+            try:
+                resampled = resample_logs(raw_logs, fs=20.0)
+            except ValueError as e:
+                print(f"[REAL] Resampling failed: {e} — skipping metrics.")
+                resampled = None
+
+            if resampled is not None:
+                # Rebuild real_pos / real_vel / real_rpy from resampled state for
+                # the comparison plot (same format expected by _plot_comparison).
+                real_t   = resampled['t']
+                real_pos = resampled['state'][:, 0:3].copy()
+                real_vel = resampled['state'][:, 3:6].copy()
+                real_rpy = resampled['att'][:, 0:3].copy()
+
+                sp_t_arr = np.array([e['t']   for e in real_sp_log]) if real_sp_log else np.array([])
+                sp_arr   = np.array([e['pos'] for e in real_sp_log]) if real_sp_log else np.zeros((0, 3))
+
+                # Remove trajectory world-frame offset so overlay with sim is aligned
                 real_pos[:, 0] -= start_xy[0]
                 real_pos[:, 1] -= start_xy[1]
-            if sp_arr.size > 0:
-                sp_arr[:, 0]   -= start_xy[0]
-                sp_arr[:, 1]   -= start_xy[1]
+                if sp_arr.size > 0:
+                    sp_arr[:, 0] -= start_xy[0]
+                    sp_arr[:, 1] -= start_xy[1]
 
-            real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
-                             sp_t=sp_t_arr, sp=sp_arr)
+                real_data = dict(t=real_t, pos=real_pos, vel=real_vel, rpy=real_rpy,
+                                 sp_t=sp_t_arr, sp=sp_arr)
 
-            if t_wall_log:
-                print("[REAL] Generating timing plot...")
-                _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
+                if t_wall_log:
+                    print("[REAL] Generating timing plot...")
+                    _plot_jitter(t_wall_log, t_nominal_log, CTRL_FREQ)
 
-            print("[REAL] Running headless simulation (with Flow deck model) for comparison...")
-            if HAS_PYBULLET_DRONES:
-                sim_data = run_sim(duration_sec=duration_sec, gui=False,
-                                   hover_height=hover_height, radius=radius, plot=False,
-                                   simulate_flow_deck=False)
-                _plot_comparison(real_data, sim_data)
-            else:
-                print("[REAL] pybullet-drones not found — skipping comparison plot.")
+                # ── Flight-quality metrics (circle phase only) ─────────────
+                metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
+                compute_and_save_metrics(resampled, duration_sec,
+                                         positioning_system, metrics_dir)
+                # -----------------------------------------------------------
+
+                print("[REAL] Running headless simulation for comparison...")
+                if HAS_PYBULLET_DRONES:
+                    sim_data = run_sim(duration_sec=duration_sec, gui=False,
+                                       hover_height=hover_height, radius=radius, plot=False,
+                                       simulate_flow_deck=False)
+                    _plot_comparison(real_data, sim_data)
+                else:
+                    print("[REAL] pybullet-drones not found — skipping comparison plot.")
 
 
 # ===================================================================
@@ -1422,12 +1751,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
-  sim        Full firmware PID in Python → RPMs → PyBullet           (default)
-  position   OptiTrack → extpose → send_position_setpoint (all PIDs on drone)
+  sim        Full firmware PID in Python → RPMs → PyBullet  (default)
+  position   Real drone: trajectory only → send_position_setpoint (all PIDs on drone)
         """)
     parser.add_argument('--mode', default='sim',
                         choices=['sim', 'position'],
-                        help='Control mode (default: sim)')
+                        help='sim: full firmware PID in PyBullet | position: real drone, all PIDs on-board (default: sim)')
     parser.add_argument('--duration', default=10, type=float,
                         help='Flight duration in seconds (default: 10)')
     parser.add_argument('--height', default=1.0, type=float,
@@ -1442,20 +1771,9 @@ MODES:
                         help='Simulate Flow deck v2 noise+delay in sim mode')
     parser.add_argument('--push-gains', action='store_true',
                         help='Overwrite drone PID gains with Python constants before flying')
-    parser.add_argument('--natnet-server-ip', default='192.168.0.24',
-                        help='IP address of the Motive PC / NatNet server '
-                             '(default: 192.168.0.24)')
-    parser.add_argument('--natnet-client-ip', default='192.168.0.56', # 192.168.0.100 if ethernet, 192.168.0.56 if wifi on TPLink-A2BC
-                        help='IP address of this PC on the OptiTrack network '
-                             '(default: 192.168.0.56)')
-    parser.add_argument('--natnet-unicast', action='store_true',
-                        help='Use unicast instead of multicast (default: multicast)')
-    parser.add_argument('--rigid-body-id', default=4, type=int,
-                        help='Streaming ID of the Crazyflie rigid body in Motive '
-                             '(default: 4)')
-    parser.add_argument('--mocap-rate', default=None, type=float,
-                        help='Throttle extpose packets to this rate [Hz] '
-                             '(default: send every NatNet frame)')
+    parser.add_argument('--positioning', default='unknown',
+                        choices=['flowdeck', 'lighthouse', 'loco', 'mocap', 'unknown'],
+                        help='Positioning system used — labels output files (default: unknown)')
     args = parser.parse_args()
 
     if args.mode == 'sim':
@@ -1466,11 +1784,7 @@ MODES:
         run_real(uri=args.uri,
                  duration_sec=args.duration, hover_height=args.height,
                  radius=args.radius, push_gains=args.push_gains,
-                 natnet_server_ip=args.natnet_server_ip,
-                 natnet_client_ip=args.natnet_client_ip,
-                 natnet_multicast=(not args.natnet_unicast),
-                 rigid_body_id=args.rigid_body_id,
-                 mocap_rate_hz=args.mocap_rate)
+                 positioning_system=args.positioning)
 
 
 if __name__ == "__main__":

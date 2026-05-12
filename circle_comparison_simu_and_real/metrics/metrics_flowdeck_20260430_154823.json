@@ -1,0 +1,44 @@
+{
+  "positioning_system": "flowdeck",
+  "timestamp": "20260430_154823",
+  "circle_phase_s": [
+    2.0,
+    8.0
+  ],
+  "n_samples": 120,
+  "position_tracking": {
+    "rmse_3d_m": 0.2530968597140722,
+    "rmse_x_m": 0.18592431550058341,
+    "rmse_y_m": 0.15552261712225227,
+    "rmse_z_m": 0.07282090953984009,
+    "mae_3d_m": 0.2509341461789845,
+    "max_err_3d_m": 0.3106027165477862
+  },
+  "velocity_tracking": {
+    "rmse_3d_m_s": 0.15389392811933278,
+    "rmse_vx_m_s": 0.08590194854587097,
+    "rmse_vy_m_s": 0.11597380395375494,
+    "rmse_vz_m_s": 0.05342539793503564,
+    "mae_3d_m_s": 0.1392329595001446,
+    "max_err_3d_m_s": 0.35216740197808827
+  },
+  "attitude_tracking": {
+    "rmse_roll_deg": 1.2652481698188995,
+    "rmse_pitch_deg": 0.7259604540703708,
+    "rmse_yaw_deg": 0.359367622165372,
+    "mae_roll_deg": 0.9066676408234727,
+    "mae_pitch_deg": 0.6016395832909913,
+    "mae_yaw_deg": 0.303582586251936,
+    "max_roll_deg": 3.375449248732815,
+    "max_pitch_deg": 1.8394350095451526,
+    "max_yaw_deg": 0.668789520436178
+  },
+  "rate_tracking": {
+    "rmse_3d_deg_s": 11.151460004882594,
+    "rmse_gx_deg_s": 4.373843875879235,
+    "rmse_gy_deg_s": 8.759813835355827,
+    "rmse_gz_deg_s": 5.337622275867639,
+    "mae_3d_deg_s": 10.326266881539244,
+    "max_err_3d_deg_s": 21.1271535149589
+  }
+}

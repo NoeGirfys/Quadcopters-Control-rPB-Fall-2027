@@ -15,6 +15,7 @@ class Physics(Enum):
 
     PYB = "pyb"                         # Base PyBullet physics update
     DYN = "dyn"                         # Explicit dynamics model
+    DYN_OFFSET = "dyn_offset"           # Explicit dynamics with attached offset point mass (call set_offset_mass first)
     PYB_GND = "pyb_gnd"                 # PyBullet physics update with ground effect
     PYB_DRAG = "pyb_drag"               # PyBullet physics update with drag
     PYB_DW = "pyb_dw"                   # PyBullet physics update with downwash

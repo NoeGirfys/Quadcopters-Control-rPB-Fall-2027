@@ -1,5 +1,3 @@
-# First, git clone https://github.com/utiasDSL/gym-pybullet-drones.git in your project folder
-# and need to suppress the hidden .git folder in the gym-pybullet-drones package
 #if you want to push some changes of the library on your repo
 -e ./gym-pybullet-drones 
 motioncapture

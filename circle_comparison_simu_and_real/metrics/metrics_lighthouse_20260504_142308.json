@@ -1,0 +1,44 @@
+{
+  "positioning_system": "lighthouse",
+  "timestamp": "20260504_142308",
+  "circle_phase_s": [
+    2.0,
+    8.0
+  ],
+  "n_samples": 120,
+  "position_tracking": {
+    "rmse_3d_m": 0.28982627623875323,
+    "rmse_x_m": 0.2044546106184561,
+    "rmse_y_m": 0.19104575508338187,
+    "rmse_z_m": 0.07549239736488758,
+    "mae_3d_m": 0.2872594035171999,
+    "max_err_3d_m": 0.32757649801235733
+  },
+  "velocity_tracking": {
+    "rmse_3d_m_s": 0.19126512272591842,
+    "rmse_vx_m_s": 0.12293901512657067,
+    "rmse_vy_m_s": 0.1406337768481231,
+    "rmse_vz_m_s": 0.041115526756953714,
+    "mae_3d_m_s": 0.18598208061625718,
+    "max_err_3d_m_s": 0.29548551137781964
+  },
+  "attitude_tracking": {
+    "rmse_roll_deg": 1.4186719884880963,
+    "rmse_pitch_deg": 1.0693666190762372,
+    "rmse_yaw_deg": 0.8473899222909937,
+    "mae_roll_deg": 1.1115412635029651,
+    "mae_pitch_deg": 0.8467922419107299,
+    "mae_yaw_deg": 0.6993358608157628,
+    "max_roll_deg": 4.216290739804401,
+    "max_pitch_deg": 4.1461812423557625,
+    "max_yaw_deg": 1.5631795430101363
+  },
+  "rate_tracking": {
+    "rmse_3d_deg_s": 17.974443651217236,
+    "rmse_gx_deg_s": 5.833358567721599,
+    "rmse_gy_deg_s": 13.576299127048,
+    "rmse_gz_deg_s": 10.234092749437458,
+    "mae_3d_deg_s": 15.558878021455572,
+    "max_err_3d_deg_s": 65.39036712505428
+  }
+}

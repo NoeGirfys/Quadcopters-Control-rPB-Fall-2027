@@ -33,7 +33,7 @@ from gym_pybullet_drones.utils.Logger import Logger
 from gym_pybullet_drones.utils.utils import sync, str2bool
 
 DEFAULT_DRONES = DroneModel("cf2x")
-DEFAULT_NUM_DRONES = 1
+DEFAULT_NUM_DRONES = 3
 DEFAULT_PHYSICS = Physics("pyb")
 DEFAULT_GUI = True
 DEFAULT_RECORD_VISION = False
@@ -42,7 +42,7 @@ DEFAULT_USER_DEBUG_GUI = False
 DEFAULT_OBSTACLES = True
 DEFAULT_SIMULATION_FREQ_HZ = 240
 DEFAULT_CONTROL_FREQ_HZ = 48
-DEFAULT_DURATION_SEC = 10
+DEFAULT_DURATION_SEC = 12
 DEFAULT_OUTPUT_FOLDER = 'results'
 DEFAULT_COLAB = False
 
@@ -62,11 +62,11 @@ def run(
         colab=DEFAULT_COLAB
         ):
     #### Initialize the simulation #############################
-    H = 0.5 # Initial height
-    H_STEP = .05 # Step in height between drones
-    R = .3 # Radius of the circular trajectory
+    H = .1
+    H_STEP = .05
+    R = .3
     INIT_XYZS = np.array([[R*np.cos((i/6)*2*np.pi+np.pi/2), R*np.sin((i/6)*2*np.pi+np.pi/2)-R, H+i*H_STEP] for i in range(num_drones)])
-    INIT_RPYS = np.array([[0, 0,  i * (np.pi/2)/num_drones] for i in range(num_drones)]) # Initial yaw is set so that drones are tangent to the circular trajectory. Adjust as needed for different trajectories.
+    INIT_RPYS = np.array([[0, 0,  i * (np.pi/2)/num_drones] for i in range(num_drones)])
 
     #### Initialize a circular trajectory ######################
     PERIOD = 10
@@ -111,24 +111,16 @@ def run(
                         obstacles=obstacles,
                         user_debug_gui=user_debug_gui
                         )
-    env.CAM_VIEW = p.computeViewMatrixFromYawPitchRoll(
-            distance=2.5,                   # <-- ZOOM ICI (Réduisez cette valeur, par défaut = 3.0)
-            yaw=-30,                        # Angle d'origine (gauche/droite)
-            pitch=-20,                      # Angle d'origine (haut/bas)
-            roll=0,                         # Inclinaison de base
-            cameraTargetPosition=[0, -0.15, 0.5], # Cible d'origine (centre du monde)
-            upAxisIndex=2
-        )
 
     #### Obtain the PyBullet Client ID from the environment ####
     PYB_CLIENT = env.getPyBulletClient()
 
     #### Initialize the logger #################################
-    #logger = Logger(logging_freq_hz=control_freq_hz,
-    #                num_drones=num_drones,
-    #                output_folder=output_folder,
-    #                colab=colab
-    #                )
+    logger = Logger(logging_freq_hz=control_freq_hz,
+                    num_drones=num_drones,
+                    output_folder=output_folder,
+                    colab=colab
+                    )
 
     #### Initialize the controllers ############################
     if drone in [DroneModel.CF2X, DroneModel.CF2P]:
@@ -159,16 +151,16 @@ def run(
             wp_counters[j] = wp_counters[j] + 1 if wp_counters[j] < (NUM_WP-1) else 0
 
         #### Log the simulation ####################################
-        #for j in range(num_drones):
-        #    logger.log(drone=j,
-        #               timestamp=i/env.CTRL_FREQ,
-        #               state=obs[j],
-        #               control=np.hstack([TARGET_POS[wp_counters[j], 0:2], INIT_XYZS[j, 2], INIT_RPYS[j, :], np.zeros(6)])
-        #               # control=np.hstack([INIT_XYZS[j, :]+TARGET_POS[wp_counters[j], :], INIT_RPYS[j, :], np.zeros(6)])
-        #               )
+        for j in range(num_drones):
+            logger.log(drone=j,
+                       timestamp=i/env.CTRL_FREQ,
+                       state=obs[j],
+                       control=np.hstack([TARGET_POS[wp_counters[j], 0:2], INIT_XYZS[j, 2], INIT_RPYS[j, :], np.zeros(6)])
+                       # control=np.hstack([INIT_XYZS[j, :]+TARGET_POS[wp_counters[j], :], INIT_RPYS[j, :], np.zeros(6)])
+                       )
 
         #### Printout ##############################################
-        #env.render()
+        env.render()
 
         #### Sync the simulation ###################################
         if gui:
@@ -177,44 +169,13 @@ def run(
     #### Close the environment #################################
     env.close()
 
-    #### Compiler la vidéo automatiquement avec FFmpeg #########
-    if record_video and not gui:
-        import glob # (Optionnel de le mettre en haut du script, on peut le faire ici)
-        
-        print(f"\n[INFO] Assemblage de la vidéo en cours via FFmpeg...")
-        
-        # L'environnement enregistre par défaut à 24 fps, et non à CTRL_FREQ
-        fps_video = 24 
-        
-        # Chemins
-        image_pattern = os.path.join(env.IMG_PATH, "frame_%d.png")
-        video_output = os.path.join(env.IMG_PATH, "simulation_finale.mp4")
-        
-        # Commande FFmpeg corrigée
-        commande = f'ffmpeg -y -framerate {fps_video} -i "{image_pattern}" -c:v libx264 -pix_fmt yuv420p "{video_output}" -loglevel warning'
-        os.system(commande)
-        
-        print(f"[INFO] ✅ Vidéo sauvegardée avec succès ici : {video_output}")
-        
-        #### Nettoyage des images temporaires ######################
-        print("[INFO] Suppression des frames temporaires (.png)...")
-        liste_frames = glob.glob(os.path.join(env.IMG_PATH, "frame_*.png"))
-        
-        for frame in liste_frames:
-            try:
-                os.remove(frame)
-            except Exception as e:
-                print(f"[Avertissement] Impossible de supprimer {frame} : {e}")
-                
-        print("[INFO] ✅ Dossier nettoyé !\n")
-
     #### Save the simulation results ###########################
-    #logger.save()
-    #logger.save_as_csv("pid") # Optional CSV save
+    logger.save()
+    logger.save_as_csv("pid") # Optional CSV save
 
     #### Plot the simulation results ###########################
-    #if plot:
-    #    logger.plot()
+    if plot:
+        logger.plot()
 
 if __name__ == "__main__":
     #### Define and parse (optional) arguments for the script ##
