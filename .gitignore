@@ -1,3 +1,18 @@
 *.pdf
 CLAUDE.md
 venv_MAML_SCITAS/
+
+# Fichiers auxiliaires LaTeX
+*.aux
+*.bbl
+*.blg
+*.brf
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.bcf
+*.run.xml
+*.spl
