@@ -90,9 +90,91 @@
 
 % =====================================================
 \section{Introduction}
+
 \subsection{Motivation}
+
+Autonomous quadcopters are increasingly deployed in applications that require reliable operation
+under varying and uncertain conditions, such as inspection, delivery, or search and rescue.
+A fundamental challenge in this context is that real-world flight is subject to disturbances
+and parametric variations that are difficult to model precisely: wind gusts, uneven payloads,
+sensor noise, or mechanical wear can significantly degrade the performance of a controller
+designed under nominal assumptions.
+
+Classical control approaches, such as proportional-integral-derivative (PID) cascades, are
+widely used in practice due to their simplicity and robustness. However, their performance
+degrades when the system deviates significantly from the conditions under which they were
+tuned, and re-tuning for each new scenario is time-consuming and requires expert knowledge.
+Learning-based approaches offer a more flexible alternative, as they can in principle adapt
+to complex and unknown dynamics from data. Yet standard training procedures produce a fixed
+controller that is no more adaptable than its classical counterpart once deployed: it cannot
+efficiently incorporate the few observations available at runtime to adjust its behavior.
+
+Meta-learning addresses this limitation by shifting the training objective from learning a
+single high-performing policy to learning a policy initialization that can be rapidly
+fine-tuned to a new task from a small number of gradient steps~\cite{finn2017maml}.
+Applied to quadcopter control, this paradigm promises controllers that maintain good
+performance not only in nominal conditions but also after fast in-flight adaptation to
+previously unseen disturbances.
+
+A second fundamental challenge, largely orthogonal to the controller design itself, is the
+\emph{sim-to-real gap}: controllers trained in simulation rarely transfer directly to hardware
+because the simulated dynamics do not exactly match those of the physical system.
+Closing this gap requires a simulation environment that is faithful to the real platform,
+which in turn requires careful modeling of the onboard control architecture.
+
 \subsection{Prior Work}
+
+This project builds directly on the work of Goffin~\cite{goffin2026}, who investigated the
+application of Model-Agnostic Meta-Learning (MAML) to neural network quadcopter controllers
+in the preceding semester. Goffin formulated the control problem as the regulation of a
+quadcopter to the origin in the presence of wind disturbances modeled as additive Gaussian
+noise on the translational dynamics. A multilayer perceptron (MLP) policy was trained using
+back-propagation through time (BPTT) over a finite horizon, with the full control input
+$(F, \tau_x, \tau_y, \tau_z)$ as the network output. Both a linearized and a nonlinear
+dynamics model were considered, and MAML was shown to outperform joint training when the
+test disturbance distribution differs from the training one. All experiments were conducted
+in simulation using a custom Python dynamics model; no real hardware was involved.
+
 \subsection{Contributions}
+
+The present work extends Goffin's framework in two complementary directions: making the
+simulation faithful to a specific real platform, and deploying the resulting controllers
+on actual hardware. The contributions are as follows.
+
+\begin{enumerate}
+
+    \item \textbf{Simulation environment selection and validation.}
+    The \texttt{gym-pybullet-drones} library~\cite{panerati2021} is adopted as the
+    simulation backend and its physics modes are compared against Goffin's dynamics model
+    in open loop to verify consistency.
+
+    \item \textbf{Crazyflie firmware integration.}
+    The default PID controller provided by \texttt{gym-pybullet-drones} does not match
+    the cascade PID architecture embedded in the Crazyflie firmware. The official
+    Crazyflie C firmware is ported to Python and integrated into the simulator, enabling
+    closed-loop simulations that closely replicate the real drone's control pipeline.
+
+    \item \textbf{Sim-to-real validation.}
+    The fidelity of the simulation is evaluated experimentally by commanding the real
+    Crazyflie to follow a circular trajectory and comparing the resulting flight with the
+    simulated equivalent. Two positioning systems are compared: the optical flow Flowdeck
+    and the Lighthouse system, with the latter retained for its superior accuracy.
+
+    \item \textbf{Hybrid NN-PID architecture and training.}
+    Because the Crazyflie firmware does not expose direct motor RPM commands at the
+    required bandwidth, the neural network is designed to replace only the outer two levels
+    of the cascade PID (position and velocity loops), with its outputs fed into the inner
+    attitude and rate loops. This hybrid architecture is trained in simulation and
+    evaluated both in simulation and on the real drone.
+
+    \item \textbf{MAML for offset mass compensation.}
+    MAML is applied to a disturbance type not considered by Goffin: an offset point mass
+    attached to the drone body, which shifts the center of mass and modifies the effective
+    inertia tensor. Unlike wind, this disturbance is persistent and asymmetric, making
+    fast adaptation particularly valuable. The meta-trained controller is evaluated in
+    simulation and on the real platform.
+
+\end{enumerate}
 
 % =====================================================
 \section{Background}
