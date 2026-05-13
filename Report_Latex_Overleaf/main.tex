@@ -124,12 +124,12 @@ which in turn requires careful modeling of the onboard control architecture.
 
 \subsection{Prior Work}
 
-This project builds directly on the work of Goffin~\cite{goffin2026}, who investigated the
+This project builds directly on the work of C. Goffin~\cite{goffin2026}, who investigated the
 application of Model-Agnostic Meta-Learning (MAML) to neural network quadcopter controllers
 in the preceding semester. Goffin formulated the control problem as the regulation of a
 quadcopter to the origin in the presence of wind disturbances modeled as additive Gaussian
-noise on the translational dynamics. A multilayer perceptron (MLP) policy was trained using
-back-propagation through time (BPTT) over a finite horizon, with the full control input
+noise on the translational dynamics. A multilayer perceptron (MLP) policy was trained by differentiating a
+cumulative quadratic cost through an unrolled simulation horizon, with the full control input
 $(F, \tau_x, \tau_y, \tau_z)$ as the network output. Both a linearized and a nonlinear
 dynamics model were considered, and MAML was shown to outperform joint training when the
 test disturbance distribution differs from the training one. All experiments were conducted
@@ -170,9 +170,10 @@ on actual hardware. The contributions are as follows.
     \item \textbf{MAML for offset mass compensation.}
     MAML is applied to a disturbance type not considered by Goffin: an offset point mass
     attached to the drone body, which shifts the center of mass and modifies the effective
-    inertia tensor. Unlike wind, this disturbance is persistent and asymmetric, making
-    fast adaptation particularly valuable. The meta-trained controller is evaluated in
-    simulation and on the real platform.
+    inertia tensor. Indeed, the wind disturbance is very difficult to produce and control in
+    laboratory, while we can easily stick a mass to the drone. This disturbance is persistent
+    and asymmetric, making fast adaptation particularly valuable. The meta-trained controller
+    is evaluated in simulation and on the real platform.
 
 \end{enumerate}
 
