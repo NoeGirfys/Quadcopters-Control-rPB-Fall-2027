@@ -30,6 +30,10 @@
 \setlength\cellspacetoplimit{6pt}    % Espace vide au-dessus
 \setlength\cellspacebottomlimit{6pt} % Espace vide en-dessous
 
+% --------------------- Theorem environments ---------------------
+\theoremstyle{remark}
+\newtheorem*{rmk}{Remark}
+
 % --------------------- Formatting ---------------------
 \numberwithin{equation}{section}
 \setlist[itemize]{topsep=2pt,itemsep=2pt,parsep=0pt}
@@ -178,20 +182,421 @@ on actual hardware. The contributions are as follows.
 \end{enumerate}
 
 % =====================================================
+\newpage
 \section{Background}
 \subsection{Quadcopter Dynamics}
 
+A mathematical model of the quadcopter is required to design the control policy and simulate
+its behavior. The model used here follows the standard rigid-body mechanics framework
+employed in~\cite{goffin2026}, but is adapted to the \emph{X~configuration} of the
+Crazyflie platform, which differs from the \emph{$+$~configuration} used by Goffin.
+As detailed below, this distinction changes the expressions for the body torques, since in
+the X~configuration all four rotors contribute to both roll and pitch, whereas in the
+$+$~configuration only two rotors govern each axis.
+
+\subsubsection*{Reference frames}
+
+Two reference frames are introduced (see \cref{fig:quadcopter}): the inertial frame
+$(x_I, y_I, z_I)$ fixed to the ground, and the body frame $(x_B, y_B, z_B)$ rigidly
+attached to the drone's center of mass, with $x_B$ pointing forward, $y_B$ to the left,
+and $z_B$ upward. Roll, pitch, and yaw angles about $x_B$, $y_B$, $z_B$ are denoted
+$\phi$, $\theta$, and $\psi$, respectively.
+The rotation matrix from the body frame to the inertial frame follows the ZYX Euler
+convention:
+\begin{equation}
+    R =
+    \begin{bmatrix}
+        \mathrm{c}\theta\mathrm{c}\psi &
+        \mathrm{s}\phi\mathrm{s}\theta\mathrm{c}\psi - \mathrm{c}\phi\mathrm{s}\psi &
+        \mathrm{c}\phi\mathrm{s}\theta\mathrm{c}\psi + \mathrm{s}\phi\mathrm{s}\psi \\
+        \mathrm{c}\theta\mathrm{s}\psi &
+        \mathrm{s}\phi\mathrm{s}\theta\mathrm{s}\psi + \mathrm{c}\phi\mathrm{c}\psi &
+        \mathrm{c}\phi\mathrm{s}\theta\mathrm{s}\psi - \mathrm{s}\phi\mathrm{c}\psi \\
+        -\mathrm{s}\theta & \mathrm{s}\phi\mathrm{c}\theta & \mathrm{c}\phi\mathrm{c}\theta
+    \end{bmatrix},
+    \label{eq:rotation_matrix}
+\end{equation}
+where $\mathrm{c}(\cdot)$ and $\mathrm{s}(\cdot)$ denote cosine and sine, respectively.
+
+% [FIGURE NEEDED: X-configuration top-view diagram showing motor positions M1--M4,
+%  body axes xB (forward), yB (left), arm length L, rotation directions (CW/CCW),
+%  and inertial frame (xI, yI, zI). M1: front-right CCW, M2: rear-right CW,
+%  M3: rear-left CCW, M4: front-left CW.]
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\textwidth]{images/Quadcopter_Picture.png}
-    \caption{Schematic representation of a quadcopter.}
+    \includegraphics[width=0.6\textwidth]{images/Quadcopter_Picture.png}
+    \caption{Schematic representation of the Crazyflie quadcopter in X~configuration.
+             Motors M1 (front-right) and M3 (rear-left) spin counter-clockwise (CCW);
+             motors M2 (rear-right) and M4 (front-left) spin clockwise (CW).
+             The arm length $L$ is measured from the center to each rotor.}
     \label{fig:quadcopter}
 \end{figure}
 
+\subsubsection*{Motor forces, X~configuration, and body torques}
+
+Each rotor $i\in\{1,2,3,4\}$ spinning at angular speed $\omega_i$ produces an upward
+thrust $F_i = k_t\,\omega_i^2$ and a reactive drag torque $k_d\,\omega_i^2$, where $k_t$
+and $k_d$ are the thrust and drag coefficients.
+
+In the X~configuration, no rotor is aligned with a body axis; instead, each rotor is
+offset by $45°$ from $x_B$ and $y_B$.
+Denoting $a = L/\sqrt{2}$ the projected arm length, the body-frame positions of the four
+rotors are:
+\begin{equation}
+    \mathbf{r}_1 = \begin{pmatrix}+a\\-a\end{pmatrix},\quad
+    \mathbf{r}_2 = \begin{pmatrix}-a\\-a\end{pmatrix},\quad
+    \mathbf{r}_3 = \begin{pmatrix}-a\\+a\end{pmatrix},\quad
+    \mathbf{r}_4 = \begin{pmatrix}+a\\+a\end{pmatrix},
+    \label{eq:motor_positions}
+\end{equation}
+where the components are $(x_B, y_B)$. The roll and pitch torques are obtained by
+computing the moment of each thrust force about the center of mass:
+\begin{align}
+    \tau_x &= \sum_{i=1}^{4} r_{y,i}\,F_i
+             = \frac{k_t L}{\sqrt{2}}\bigl(-\omega_1^2 - \omega_2^2 + \omega_3^2 + \omega_4^2\bigr),
+             \label{eq:tau_x}\\
+    \tau_y &= -\sum_{i=1}^{4} r_{x,i}\,F_i
+             = \frac{k_t L}{\sqrt{2}}\bigl(-\omega_1^2 + \omega_2^2 + \omega_3^2 - \omega_4^2\bigr).
+             \label{eq:tau_y}
+\end{align}
+Motors M1 and M3 spin counter-clockwise, while M2 and M4 spin clockwise.
+The resulting yaw torque is:
+\begin{equation}
+    \tau_z = k_d\bigl(-\omega_1^2 + \omega_2^2 - \omega_3^2 + \omega_4^2\bigr).
+    \label{eq:tau_z}
+\end{equation}
+
+Note that in the $+$~configuration used by Goffin~\cite{goffin2026}, each axis is
+controlled by only two motors (e.g.\ $\tau_x = k_t l (\omega_1^2 - \omega_3^2)$),
+whereas in the X~configuration, \emph{all four motors} contribute to both $\tau_x$
+and $\tau_y$.
+
+\subsubsection*{Nonlinear dynamics}
+
+Applying Newton's second law in the inertial frame and Euler's rigid-body theorem in the
+body frame yields the following nonlinear equations of motion:
+\begin{align}
+    m\ddot{x} &= F\bigl(\cos\phi\sin\theta\cos\psi + \sin\phi\sin\psi\bigr), \label{eq:nl_x}\\
+    m\ddot{y} &= F\bigl(\cos\phi\sin\theta\sin\psi - \sin\phi\cos\psi\bigr), \label{eq:nl_y}\\
+    m\ddot{z} &= F\cos\phi\cos\theta - mg, \label{eq:nl_z}\\
+    I_x\ddot{\phi}   &= \tau_x + (I_y - I_z)\dot{\theta}\dot{\psi}, \label{eq:nl_phi}\\
+    I_y\ddot{\theta} &= \tau_y + (I_z - I_x)\dot{\phi}\dot{\psi}, \label{eq:nl_theta}\\
+    I_z\ddot{\psi}   &= \tau_z + (I_x - I_y)\dot{\phi}\dot{\theta}, \label{eq:nl_psi}
+\end{align}
+where $F = \sum_{i=1}^{4} F_i$ is the total thrust, $m$ the drone mass, $g$ the
+gravitational acceleration, and $I_x$, $I_y$, $I_z$ the principal moments of inertia.
+These translational and rotational equations are independent of the motor configuration;
+only the expressions for $\tau_x$, $\tau_y$, $\tau_z$ differ between the X and $+$ layouts.
+
+\begin{rmk}
+Equations~\eqref{eq:nl_phi}--\eqref{eq:nl_psi} are written in terms of Euler angle
+derivatives $\dot{\phi}$, $\dot{\theta}$, $\dot{\psi}$.
+Euler's rigid-body theorem strictly involves the body-frame angular rates $(p,q,r)$,
+which are related to Euler angle rates through a kinematic transformation matrix.
+Near hover ($\phi \approx 0$, $\theta \approx 0$), this matrix reduces to the identity,
+so $p \approx \dot{\phi}$, $q \approx \dot{\theta}$, $r \approx \dot{\psi}$, and
+the above form is valid.
+The \texttt{gym-pybullet-drones} simulator avoids this approximation entirely by
+integrating orientation via unit quaternions, which remains exact at all attitudes.
+\end{rmk}
+
+\subsubsection*{Linearization around hover}
+
+Near the hovering equilibrium ($\phi \approx \theta \approx 0$,
+$\psi = \mathrm{const}$, zero velocities), applying the small-angle approximation
+($\sin\alpha \approx \alpha$, $\cos\alpha \approx 1$) and setting the hover thrust
+$F_0 = mg$, the dynamics simplify to:
+\begin{alignat}{2}
+    \ddot{x} &= \frac{F_0}{m}\,\theta, &\qquad
+    \ddot{\phi}   &= \frac{\tau_x}{I_x}, \\
+    \ddot{y} &= -\frac{F_0}{m}\,\phi,  &\qquad
+    \ddot{\theta} &= \frac{\tau_y}{I_y}, \\
+    \ddot{z} &= \frac{\delta F}{m},    &\qquad
+    \ddot{\psi}   &= \frac{\tau_z}{I_z},
+\end{alignat}
+where $\delta F = F - mg$ is the thrust deviation from hover. These equations are of the
+same form as in~\cite{goffin2026}; the X~configuration enters only through the expressions
+for $\tau_x$, $\tau_y$, $\tau_z$ given in \cref{eq:tau_x,eq:tau_y,eq:tau_z}.
+
+\subsubsection*{State-space representation and discretization}
+
+Defining the state vector
+$\mathbf{x} = \bigl[x,\,\dot{x},\,y,\,\dot{y},\,z,\,\dot{z},\,
+\phi,\,\dot{\phi},\,\theta,\,\dot{\theta},\,\psi,\,\dot{\psi}\bigr]^\top \in \mathbb{R}^{12}$
+and control input $\mathbf{u} = \bigl[F,\,\tau_x,\,\tau_y,\,\tau_z\bigr]^\top$,
+the linearized continuous-time dynamics take the standard form
+$\dot{\mathbf{x}} = A\mathbf{x} + B\mathbf{u}$.
+
+For numerical simulation, the continuous model is discretized with sampling period $T_s$.
+The linearized model uses a zero-order hold (ZOH) on the input:
+$\mathbf{x}_{k+1} = A_d\,\mathbf{x}_k + B_d\,\mathbf{u}_k$.
+The nonlinear model uses a forward Euler scheme:
+$\mathbf{x}_{k+1} = \mathbf{x}_k + T_s\,f(\mathbf{x}_k, \mathbf{u}_k)$,
+where $f(\cdot)$ collects the right-hand sides of
+\cref{eq:nl_x,eq:nl_y,eq:nl_z,eq:nl_phi,eq:nl_theta,eq:nl_psi}.
+
 \subsection{Crazyflie Cascade PID Architecture}
+\label{sec:cascade_pid}
+
+The Crazyflie 2.1 onboard firmware controls the quadcopter through a \emph{cascade PID}
+architecture, in which four nested feedback loops operate at different rates and pass
+their outputs as setpoints to the loop below.
+This layered design separates the slow position dynamics from the fast rotational dynamics,
+enabling the use of different gains and update frequencies at each level.
+A precise Python replica of this architecture was implemented in this work
+(as the default \texttt{gym-pybullet-drones} controller does not match the real firmware)
+and is used throughout the simulation and training pipeline.
+
+\subsubsection*{Loop hierarchy and frequencies}
+
+The four levels, from outermost to innermost, are:
+
+\begin{enumerate}
+    \item \textbf{Position loop} (100\,Hz): converts a position setpoint
+          $(x^*, y^*, z^*)$ into a velocity setpoint $(\dot{x}^*, \dot{y}^*, \dot{z}^*)$
+          using three independent PID controllers, one per axis.
+
+    \item \textbf{Velocity loop} (100\,Hz): converts the velocity setpoint into
+          a scalar thrust command $T \in [0, 65535]$ (16-bit PWM units) and desired
+          roll and pitch angles $(\phi^*, \theta^*)$ in degrees. Yaw is handled
+          separately as a desired yaw rate $\dot{\psi}^*$.
+
+    \item \textbf{Attitude loop} (500\,Hz): compares the desired angles
+          $(\phi^*, \theta^*, \psi^*)$ to the measured attitude and outputs
+          desired body rates $(p^*, q^*, r^*)$ in degrees per second.
+
+    \item \textbf{Rate loop} (500\,Hz): compares the desired body rates to the
+          measured gyroscope rates and outputs three torque commands
+          $(\delta_{\mathrm{roll}}, \delta_{\mathrm{pitch}}, \delta_{\mathrm{yaw}})$,
+          which are summed with the thrust command to produce individual motor PWM signals.
+\end{enumerate}
+
+The position and velocity loops share the 100\,Hz update rate (POSITION\_RATE); the
+attitude and rate loops run at 500\,Hz (ATTITUDE\_RATE). For every one step of the outer
+loops, five steps of the inner loops are executed.
+
+\subsubsection*{Motor mixing}
+
+The four per-motor PWM values are assembled from the torque commands by the motor mixing
+table, which encodes the X~configuration geometry derived in \cref{eq:tau_x,eq:tau_y,eq:tau_z}:
+\begin{equation}
+    \begin{pmatrix}\text{PWM}_1\\\text{PWM}_2\\\text{PWM}_3\\\text{PWM}_4\end{pmatrix}
+    = T\,\mathbf{1}
+    + \frac{\delta_{\mathrm{roll}}}{2}
+      \begin{pmatrix}-1\\-1\\+1\\+1\end{pmatrix}
+    + \frac{\delta_{\mathrm{pitch}}}{2}
+      \begin{pmatrix}+1\\-1\\-1\\+1\end{pmatrix}
+    + \delta_{\mathrm{yaw}}
+      \begin{pmatrix}+1\\-1\\+1\\-1\end{pmatrix}.
+    \label{eq:motor_mixing}
+\end{equation}
+If the highest PWM value exceeds the 16-bit ceiling (65535), all four channels are
+reduced by the same amount so the highest channel saturates rather than overflows.
+The resulting PWM signals are converted to rotor RPMs through the thrust–RPM curve
+of the CF2.1+ brushless motors; a first-order lag with time constant $\tau_m = 20\,\mathrm{ms}$
+models the motor spin-up dynamics.
+
+\subsubsection*{Role in the hybrid architecture}
+
+The neural network controller introduced in this work \emph{replaces the two outer loops}
+(position and velocity) while keeping the two inner loops (attitude and rate) exactly as in
+the real firmware. At each 100\,Hz step the network receives the full 12-dimensional state
+and outputs the tuple $(T, \phi^*, \theta^*, \dot{\psi}^*)$, which is then handed
+to the 500\,Hz PID chain for the remaining five rate-loop substeps.
+This design is motivated by the limited bandwidth of the communication interface with the
+real Crazyflie: direct motor RPM commands cannot be sent at the required rate, but desired
+attitude setpoints can. The inner firmware loops thus act as a hardware-level actuator
+abstraction, and the learning problem is confined to the outer dynamics.
+
 \subsection{Neural Network Control Policy}
-\subsection{Back-Propagation Through Time and Curriculum Reset}
+\label{sec:policy}
+
+The neural network controller is a multilayer perceptron (MLP) that replaces the
+position and velocity PID loops described in \cref{sec:cascade_pid}.
+At each 100\,Hz step it receives the current state and a desired position and outputs
+the setpoint tuple $(T, \phi^*, \theta^*, \dot{\psi}^*)$ consumed by the inner firmware PID chain.
+
+\subsubsection*{Inputs and outputs}
+
+The network input is the concatenation of two parts:
+\begin{itemize}
+    \item the 12-dimensional state
+          $\mathbf{x} = [x,\dot{x},y,\dot{y},z,\dot{z},\phi,\dot{\phi},\theta,\dot{\theta},\psi,\dot{\psi}]^\top$,
+          normalized element-wise by a fixed scale vector $\mathbf{s}\in\mathbb{R}^{12}$
+          chosen to bring typical ranges to the order of unity;
+    \item the 3-dimensional relative target
+          $\Delta\mathbf{p} = \mathbf{p}^* - [x,y,z]^\top \in \mathbb{R}^3$,
+          where $\mathbf{p}^*$ is the desired position.
+\end{itemize}
+
+The four outputs are bounded through saturating non-linearities to enforce physical validity:
+\begin{align}
+    T       &= \sigma(\hat{T}) \cdot T_{\max},     \label{eq:out_thrust}\\
+    \phi^*  &= \tanh(\hat{\phi})\cdot\phi_{\max},  \label{eq:out_roll}\\
+    \theta^*&= \tanh(\hat{\theta})\cdot\theta_{\max}, \label{eq:out_pitch}\\
+    \dot{\psi}^* &= \tanh(\hat{\psi})\cdot\dot{\psi}_{\max}, \label{eq:out_yaw}
+\end{align}
+where $\sigma(\cdot)$ is the logistic sigmoid, and $(\hat{T}, \hat{\phi}, \hat{\theta}, \hat{\psi})$
+are the raw network outputs.
+The sigmoid ensures the thrust command $T\in[0, T_{\max}]$ is non-negative,
+while $\tanh$ bounds the attitude setpoints symmetrically.
+Limits are set to $T_{\max} = 65535$ (full 16-bit PWM range),
+$\phi_{\max} = \theta_{\max} = 20°$, and $\dot{\psi}_{\max} = 200°/\mathrm{s}$,
+matching the velocity-loop output limits of the real firmware.
+
+\subsubsection*{Architecture}
+
+Both the classic-regulation and the MAML controllers share the same backbone:
+a three-layer fully connected network with $\tanh$ activations in the hidden layers
+and a linear output layer:
+\begin{equation}
+    f_\theta(\mathbf{z}) =
+    W_3\,\tanh\bigl(W_2\,\tanh(W_1 \mathbf{z} + b_1) + b_2\bigr) + b_3,
+    \quad \mathbf{z}\in\mathbb{R}^{15},
+    \label{eq:mlp}
+\end{equation}
+with 64 hidden units per layer.
+
+The last-layer bias is initialized so that the network outputs the hover thrust at startup
+regardless of the input state: since $\sigma(b_3^{(0)}) = T_{\mathrm{hover}}/T_{\max}$,
+a logit of the hover ratio is used, and all other output biases are set to zero.
+This warm-start prevents the drone from crashing in the first training rollouts.
+
+\subsubsection*{Concurrent variant for classic regulation}
+
+To reduce the number of network evaluations per training trajectory, the
+classic-regulation policy uses a \emph{concurrent} formulation following
+Wiedemann et al.~(ICRA 2023): the network is queried \emph{once per chunk} of
+$T$ time steps and outputs all $T$ future setpoints simultaneously.
+The input is augmented to include the $T$ relative targets for each upcoming step
+(all identical for the regulation-to-origin task), yielding an input dimension of
+$12 + 3T$ and an output dimension of $4T$.
+For the MAML policy the chunk size is fixed to $T = 1$, reverting to the
+standard single-step formulation.
+
+\subsection{Training by Differentiation Through Simulation}
+\label{sec:bptt}
+
+\subsubsection*{Analytic policy gradient}
+
+Training the network requires computing gradients of a scalar cost with respect to the
+policy parameters $\theta$. In standard reinforcement learning this gradient is estimated
+by sampling; here it is computed \emph{analytically} by differentiating the cost through
+the entire simulated trajectory, a technique known as \emph{back-propagation through time}
+(BPTT)~\cite{goffin2026}.
+
+Concretely, starting from a batch of $B$ initial states $\{\mathbf{x}_0^{(b)}\}$,
+a trajectory of $N_{\mathrm{step}}$ states is collected by unrolling the closed-loop system:
+\begin{equation}
+    \mathbf{x}_{k+1}^{(b)} = f_{\mathrm{sim}}\!\bigl(\mathbf{x}_k^{(b)},\,
+    \pi_\theta(\mathbf{x}_k^{(b)}, \mathbf{p}^*)\bigr),
+    \label{eq:unroll}
+\end{equation}
+where $f_{\mathrm{sim}}$ comprises the attitude/rate PID chain followed by one
+dynamics substep, and $\pi_\theta$ is the policy network. The training loss is a
+cumulative quadratic cost:
+\begin{equation}
+    \mathcal{L}(\theta) = \frac{1}{B}\sum_{b=1}^{B}
+    \left[
+        \sum_{k=1}^{N} \mathbf{x}_k^{(b)\top} Q\, \mathbf{x}_k^{(b)}
+        + w_T \|\mathbf{p}_{N}^{(b)}\|^2
+    \right],
+    \label{eq:cost}
+\end{equation}
+where $Q$ is a positive-definite weighting matrix (with heavier penalties on positions
+and angles), and $w_T$ is a terminal position weight. Because all operations in
+\cref{eq:unroll} are differentiable PyTorch operations, \texttt{loss.backward()}
+propagates gradients of $\mathcal{L}$ through the entire unrolled computation graph
+back to $\theta$, and parameters are updated with Adam.
+
+Compared to model-free approaches, this analytic gradient is low-variance and
+sample-efficient, but requires a differentiable simulator. Note that the gradient
+must traverse the PID chain: the attitude and rate loops are therefore implemented
+as differentiable PyTorch functions with no \texttt{detach} calls.
+
+\subsubsection*{Curriculum reset}
+
+A practical obstacle in training long trajectories is that the drone may diverge
+early (large initial error drives it far from the origin), producing vanishing or
+exploding gradients from distant time steps. A \emph{curriculum reset} strategy
+is introduced to address this: at each training step, any drone in the batch whose
+3D position error exceeds a threshold $\tau_{\mathrm{div}}$ is reset to the origin
+and its PID integrators are re-initialized.
+
+The threshold grows linearly over the $E$ training epochs:
+\begin{equation}
+    \tau_{\mathrm{div}}(e) = \tau_{\mathrm{start}}
+    + \frac{e}{E - 1}\,(\tau_{\mathrm{end}} - \tau_{\mathrm{start}}),
+    \quad e = 0,\ldots,E-1.
+    \label{eq:curriculum}
+\end{equation}
+Early in training ($\tau_{\mathrm{div}}$ small) the drone is reset frequently,
+keeping trajectories short and gradients well-conditioned. As training progresses,
+$\tau_{\mathrm{div}}$ increases, allowing the drone to wander further before a
+reset, until by the final epoch it can sustain the full nominal trajectory without
+intervention.
+
 \subsection{Model-Agnostic Meta-Learning (MAML)}
+\label{sec:maml}
+
+\subsubsection*{Problem setting}
+
+Meta-learning addresses the problem of learning to learn: instead of training a single
+fixed policy for one task, we train an initialization $\theta$ that can be rapidly
+adapted to any task from a small amount of data~\cite{finn2017maml}.
+Formally, a \emph{task} $\mathcal{T}_i$ is a distribution over initial states and
+a dynamics parameterization (e.g., a different attached mass); the meta-learner is
+given access to a distribution $p(\mathcal{T})$ over tasks at train time and must
+produce a policy that, after a \emph{few gradient steps} on a new task drawn from
+$p(\mathcal{T})$, achieves low cost on that task.
+
+\subsubsection*{Algorithm}
+
+Model-Agnostic Meta-Learning (MAML, Finn et al. 2017) solves this by optimizing
+the parameters $\theta$ of the shared policy network so that the \emph{adapted}
+parameters $\theta'$, obtained by a small number of gradient descent steps on each
+task's support data, perform well on that task's query data.
+At each meta-training epoch, given $M$ tasks $\{\mathcal{T}_i\}_{i=1}^M$:
+
+\begin{enumerate}
+
+    \item \textbf{Inner loop} (task adaptation):
+    for each task $i$, compute adapted parameters $\theta_i'$ by taking
+    $N_{\mathrm{inner}}$ gradient steps with step size $\alpha$ on the
+    support loss $\mathcal{L}_{\mathcal{T}_i}^{\mathrm{sup}}$:
+    \begin{equation}
+        \theta_i' = \theta - \alpha\,\nabla_\theta\,
+        \mathcal{L}_{\mathcal{T}_i}^{\mathrm{sup}}(\theta).
+        \label{eq:inner}
+    \end{equation}
+
+    \item \textbf{Outer loop} (meta-update):
+    update the shared initialization $\theta$ to minimize the sum of query
+    losses evaluated at the adapted parameters $\theta_i'$:
+    \begin{equation}
+        \theta \;\leftarrow\; \theta - \beta\,\nabla_\theta
+        \sum_{i=1}^{M} \mathcal{L}_{\mathcal{T}_i}^{\mathrm{qry}}(\theta_i').
+        \label{eq:outer}
+    \end{equation}
+
+\end{enumerate}
+
+The support and query sets are disjoint batches of initial states.
+In the outer update the gradient $\nabla_\theta \mathcal{L}(\theta_i')$ passes
+\emph{through} the inner update of \cref{eq:inner}, which requires computing
+second-order derivatives; this is the full (2nd-order) MAML implementation
+used here. A first-order approximation (FOMAML) is also supported by detaching
+the inner-loop gradient from the meta-computation graph, at the cost of a biased
+but cheaper meta-gradient.
+
+\subsubsection*{Adaptation at test time}
+
+At deployment, the network is adapted to a new (unseen) task by simply
+repeating \cref{eq:inner} for $N_{\mathrm{adapt}}$ steps on a small support
+batch of trajectories collected on that task, without any further meta-update.
+The adapted parameters $\theta'$ are then used for inference.
+Because the network is small (64 hidden units) and only a few gradient steps are
+needed, adaptation is fast enough to run before each real flight.
 
 % =====================================================
 \section{Simulation Environment}
