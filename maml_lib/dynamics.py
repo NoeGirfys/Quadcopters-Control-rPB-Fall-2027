@@ -75,7 +75,7 @@ def nonlinear_step(state: torch.Tensor, rpm: torch.Tensor,
         cphi * cth,
     ], dim=-1)                                                         # (B, 3)
 
-    a_world = F_total.unsqueeze(-1) * R_z / mass.M_total               # (B, 3)
+    a_world = F_total.unsqueeze(-1) * R_z / mass.M_total.unsqueeze(-1) # (B,3)
     ax = a_world[:, 0]
     ay = a_world[:, 1]
     az = a_world[:, 2] - C.G

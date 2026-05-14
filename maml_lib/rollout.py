@@ -67,10 +67,11 @@ def rollout(policy_fn, x0: torch.Tensor, n_steps: int,
         if tau_div is not None:
             pos_err = state[:, [0, 2, 4]].norm(dim=1)
             diverged = pos_err > tau_div
-            if diverged.any():
-                m = diverged.unsqueeze(1).expand_as(state)
-                state = torch.where(m, torch.zeros_like(state), state)
-                pid_state = reset_pid_diverged(pid_state, diverged, mass.hover_rpm)
+            # Unconditional torch.where (no Python branch on data) so that
+            # this function is compatible with torch.vmap.
+            m = diverged.unsqueeze(1).expand_as(state)
+            state = torch.where(m, torch.zeros_like(state), state)
+            pid_state = reset_pid_diverged(pid_state, diverged, mass.hover_rpm)
 
     if log_actions:
         return X, A, R

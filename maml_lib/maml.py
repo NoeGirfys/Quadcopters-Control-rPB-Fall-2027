@@ -1,15 +1,30 @@
-"""MAML (Finn et al. 2017, https://arxiv.org/abs/1703.03400) for the
-Crazyflie offset-mass setting.
+"""MAML (Finn et al. 2017) and multi-task baseline training.
 
-This module is now specialised to the *Gaussian-motor* task setup:
+Task set
+--------
+Both ``meta_train`` and ``baseline_train`` accept a ``FixedUniformMassSet``
+whose N tasks are sampled *once at startup* and reused every epoch.  This
+makes the gradient estimate stable and lets the two functions train on
+exactly the same data for a fair comparison.
 
-  * a fixed list of ``Task`` objects (typically 3 ``GaussianMotorTask``)
-    is shared across all epochs;
-  * each epoch samples one ``MassParams`` per task, runs the inner-loop
-    adaptation on a fixed ``x0_train`` batch, and computes the meta loss
-    on a fixed ``x0_eval`` batch (disjoint from x0_train);
-  * sampled mass positions are recorded in ``history`` for plotting and
-    are preserved on early Ctrl+C through ``on_epoch_end``.
+GPU parallelism
+---------------
+Inner loop (first adaptation step)
+    All N tasks share the same meta-parameters θ, so their inner rollouts
+    are stacked into one big batch (N*B_train, 12) — a single GPU call.
+    Per-task gradients are then computed with N sequential ``autograd.grad``
+    calls (retain_graph=True), each touching only its own slice of the graph.
+    For n_inner_steps > 1, subsequent steps are sequential (different θ per
+    task after step 1).
+
+Outer loop / baseline
+    Sequential over tasks (different adapted θ per task), but the outer
+    meta_loss is accumulated *before* calling backward(), so PyTorch fuses
+    the backward passes internally.
+
+Baseline
+    All N tasks share the same policy, so train and eval rollouts are fully
+    batched (N*B_train, 12) — one GPU call covers the whole epoch.
 """
 from typing import Callable, List
 
@@ -17,29 +32,20 @@ import numpy as np
 import torch
 try:
     from torch.func import functional_call
-    """
-    functional_call(module, params_dict, args) runs module.forward(*args)
-    but it replaces its parameters by those provided in params_dict.
-    It is necessary for MAML: it enables to make a foward pass with another
-    set of weights, without mutating the module.
-    """
-except ImportError:                                # PyTorch < 2.0
+except ImportError:
     from torch.nn.utils.stateless import functional_call
 
 from .cost import trajectory_cost
 from .rollout import rollout
-from .mass_params import MassParams
-from .tasks import Task
+from .mass_params import MassParams, batch_mass_params
+from .tasks import FixedUniformMassSet
 
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 def _make_fn(policy, theta):
-    """
-    Stateless forward closure capturing a parameter dict.
-    We lock (policy, theta) in a function that has the same signature
-    than policy.forward(state, target_rel). The rollout takes this function
-    without knowing that it uses modified weights. It enables to make the
-    rollout agnostic to the MAML mecanism.
-    """
     def _fn(state, target_rel):
         return functional_call(policy, theta, (state, target_rel))
     return _fn
@@ -51,16 +57,20 @@ def _clip_grads(grads, max_norm: float = 1.0):
     return [g * coef for g in grads]
 
 
+# ---------------------------------------------------------------------------
+# MAML meta-training
+# ---------------------------------------------------------------------------
+
 def meta_train(
     policy: torch.nn.Module,
-    tasks: List[Task],
+    task_set: FixedUniformMassSet,
     x0_train: torch.Tensor,
     x0_eval: torch.Tensor,
-    *, # forces every next argument to be named explicitly
-    dynamics_step: Callable, # nonlinear or linearized
-    n_steps: int, # length of a rollout (NN steps at NN_FREQ)
-    epochs: int, # total number of meta-updates (absolute, not "extra")
-    n_inner_steps: int, # nb inner updates
+    *,
+    dynamics_step: Callable,
+    n_steps: int,
+    epochs: int,
+    n_inner_steps: int,
     lr_outer: float,
     lr_inner: float,
     maml_order: int = 2,
@@ -77,160 +87,150 @@ def meta_train(
     killer=None,
     resume_state: dict = None,
 ):
-    """Meta-train ``policy`` with MAML over a fixed list of tasks.
+    """Meta-train ``policy`` with MAML over a fixed uniform task set.
 
-    Args:
-        tasks         : meta_batch is implicitly ``len(tasks)``; one
-                        MassParams is sampled per task per epoch.
-        x0_train      : (N_train, 12) fixed support batch, reused across
-                        all tasks and epochs (inner loss).
-        x0_eval       : (N_eval,  12) fixed query batch, disjoint from
-                        x0_train (outer loss).
-        on_epoch_end  : optional ``callable(ep, policy, history, **state)``
-                        called once per epoch. ``state`` includes
-                        ``optimizer``, ``np_rng`` and ``torch_gen`` so the
-                        callback can persist a full resumable checkpoint.
-        killer        : optional ``GracefulKiller``; if its ``kill_now``
-                        flag is set after an epoch the loop exits cleanly.
-        resume_state  : optional dict with keys ``history``,
-                        ``optimizer_state``, ``np_rng_state``,
-                        ``torch_gen_state``, ``torch_rng_state``
-                        (+ optional ``torch_cuda_rng_state``). When given,
-                        the training resumes bit-identically from the
-                        last saved epoch instead of starting fresh; the
-                        ``seed`` argument is ignored.
+    The N tasks in ``task_set`` are fixed for the whole run; each epoch is a
+    complete pass over all N tasks (no re-sampling).
+
+    Inner loop GPU speedup
+        Step 1 of the inner loop batches all N tasks into one rollout on
+        (N*B_train, 12) states.  Per-task gradients are extracted with
+        sequential ``autograd.grad`` calls that each touch only their slice.
+        Subsequent inner steps (if n_inner_steps > 1) are sequential because
+        each task uses its own adapted parameters after step 1.
 
     Returns:
         policy, history
-        history["sampled_positions"] is a list of length ``len(tasks)``.
-        Element k is the chronological list of (dx, dy, dz) tuples
-        sampled from ``tasks[k]``.
     """
-    M = len(tasks)
-    if M == 0:
-        raise ValueError("`tasks` must contain at least one Task.")
-
+    N        = len(task_set)
+    B_train  = x0_train.shape[0]
+    B_eval   = x0_eval.shape[0]
     create_graph = (maml_order == 2)
+
     x0_train = x0_train.to(device)
     x0_eval  = x0_eval.to(device)
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
-    # opt = outer optimizer, for the meta step.
-    # The inner loop does not update policy.parameters(),
-    # it updates a dict theta separated.
 
     if resume_state is None:
-        # ---- Fresh start ------------------------------------------
         torch.manual_seed(seed)
-        np_rng    = np.random.default_rng(seed)
         torch_gen = torch.Generator(device=device).manual_seed(seed)
-        history = {
-            "epoch": [], "meta_loss": [],
-            "inner_pre": [], "outer_loss": [],
-            "sampled_positions": [[] for _ in range(M)],
-        }
+        history = {"epoch": [], "meta_loss": [], "inner_pre": [], "outer_loss": []}
         start_epoch = 0
     else:
-        # ---- Resume bit-identically from a previous run -----------
         torch.set_rng_state(resume_state["torch_rng_state"].cpu())
         if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
             torch.cuda.set_rng_state(resume_state["torch_cuda_rng_state"].cpu())
-        np_rng = np.random.default_rng()
-        np_rng.bit_generator.state = resume_state["np_rng_state"]
         torch_gen = torch.Generator(device=device)
         torch_gen.set_state(resume_state["torch_gen_state"].cpu())
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
-        # Defensive: ensure history has the expected keys.
         for k, v in [("epoch", []), ("meta_loss", []),
-                     ("inner_pre", []), ("outer_loss", []),
-                     ("sampled_positions", [[] for _ in range(M)])]:
+                     ("inner_pre", []), ("outer_loss", [])]:
             history.setdefault(k, v)
         start_epoch = len(history["epoch"])
         print(f"[Resume] from epoch {start_epoch}/{epochs}.")
 
-    # inner_pre = loss before the first inner step (oscillates).
-    # outer_loss = loss after adaptation (should decrease).
-    # sampled_positions[k] = chronological list of (dx, dy, dz) for tasks[k].
+    # Pre-build the big x0 / batched mass for the inner step-1 rollout.
+    x0_inner_big = x0_train.repeat(N, 1)                        # (N*B_train, 12)
+    mass_inner_big = batch_mass_params(task_set.masses, B_train, device)
 
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
-        meta_loss = 0.0
-        inner_pre_vals: List[float] = []
-        outer_vals:     List[float] = []
 
-        for t_idx, task in enumerate(tasks):
-            mass = task.sample(np_rng).to(device)
-            history["sampled_positions"][t_idx].append(tuple(mass.r_offset))
+        # ── Step 1 inner loop: one big batched forward pass ──────────────
+        theta = {n: p for n, p in policy.named_parameters()}
 
-            # --- Inner loop: differentiable adaptation -------------------
-            theta = {n: p for n, p in policy.named_parameters()}
-            # theta = new dict pointing towards the current policy params.
-            # theta will be updated in the inner loop without touching policy.
+        X_inner_big = rollout(
+            _make_fn(policy, theta), x0_inner_big, n_steps,
+            mass_inner_big, dynamics_step,
+            tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
+        )   # (N*B_train, n_steps, 12)
 
-            for step in range(n_inner_steps):
-                X_in = rollout(_make_fn(policy, theta), x0_train, n_steps,
-                               mass, dynamics_step,
-                               tau_div=tau_div, obs_noise_std=obs_noise_std,
-                               gen=torch_gen)
-                L_in = trajectory_cost(X_in, terminal_weight,
-                                       pos_weight=pos_weight,
-                                       z_weight=z_weight).mean()
-                if step == 0:
-                    inner_pre_vals.append(L_in.item())
+        costs_0 = (trajectory_cost(
+                       X_inner_big.view(N * B_train, n_steps, 12),
+                       terminal_weight, pos_weight=pos_weight, z_weight=z_weight)
+                   .view(N, B_train).mean(dim=1))   # (N,)
 
-                grads = torch.autograd.grad(
-                    L_in, tuple(theta.values()),
+        inner_pre = costs_0.detach().mean().item()
+
+        # ── Per-task gradient + adaptation ───────────────────────────────
+        adapted_thetas: List[dict] = []
+        for i in range(N):
+            # Keep the big inner graph alive until the last task's grad is
+            # computed.  For 2nd-order MAML it must stay alive even longer
+            # (until meta_loss.backward()), so always retain when create_graph.
+            retain = create_graph or (i < N - 1)
+            grads = torch.autograd.grad(
+                costs_0[i], tuple(theta.values()),
+                create_graph=create_graph, retain_graph=retain,
+            )
+            if inner_grad_clip > 0:
+                grads = _clip_grads(grads, inner_grad_clip)
+            theta_i = {n: p - lr_inner * g
+                       for (n, p), g in zip(theta.items(), grads)}
+
+            # Additional inner steps (sequential — each task has its own θ).
+            for _step in range(1, n_inner_steps):
+                X_in = rollout(
+                    _make_fn(policy, theta_i), x0_train, n_steps,
+                    task_set.masses[i], dynamics_step,
+                    tau_div=tau_div, obs_noise_std=obs_noise_std,
+                    gen=torch_gen,
+                )
+                L_in = trajectory_cost(
+                    X_in, terminal_weight,
+                    pos_weight=pos_weight, z_weight=z_weight).mean()
+                grads_s = torch.autograd.grad(
+                    L_in, tuple(theta_i.values()),
                     create_graph=create_graph)
-                # create_graph=True (MAML 2nd order) keeps the inner grads
-                # attached to the graph so theta - lr*grad stays differentiable
-                # w.r.t. policy.parameters(). False = FOMAML (1st-order approx).
                 if inner_grad_clip > 0:
-                    grads = _clip_grads(grads, max_norm=inner_grad_clip)
-                theta = {n: p - lr_inner * g
-                         for (n, p), g in zip(theta.items(), grads)}
+                    grads_s = _clip_grads(grads_s, inner_grad_clip)
+                theta_i = {n: p - lr_inner * g
+                           for (n, p), g in zip(theta_i.items(), grads_s)}
 
-            # --- Outer loss on the fixed disjoint query batch ------------
-            X_out = rollout(_make_fn(policy, theta), x0_eval, n_steps,
-                            mass, dynamics_step,
-                            tau_div=tau_div, obs_noise_std=obs_noise_std,
-                            gen=torch_gen)
-            L_out = trajectory_cost(X_out, terminal_weight,
-                                    pos_weight=pos_weight,
-                                    z_weight=z_weight).mean()
+            adapted_thetas.append(theta_i)
+
+        # ── Outer loss (sequential per task) ─────────────────────────────
+        meta_loss   = torch.tensor(0.0, device=device)
+        outer_vals: List[float] = []
+        for theta_i, mass_i in zip(adapted_thetas, task_set.masses):
+            X_out = rollout(
+                _make_fn(policy, theta_i), x0_eval, n_steps,
+                mass_i.to(device), dynamics_step,
+                tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
+            )
+            L_out = trajectory_cost(
+                X_out, terminal_weight,
+                pos_weight=pos_weight, z_weight=z_weight).mean()
             outer_vals.append(L_out.item())
             meta_loss = meta_loss + L_out
 
-        meta_loss = meta_loss / M
+        meta_loss = meta_loss / N
         meta_loss.backward()
-        # if create_graph=True, the graph goes back from θ' = θ - α∇L_in until
-        # the original parameters; policy.parameters().grad include the second
-        # derivatives. If False, gradients into policy.parameters() are the
-        # FOMAML first-order approximation.
 
-        # NaN firewall before stepping
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any()
                       for p in policy.parameters())
         if has_nan:
             print(f"[ep {ep+1}] NaN in grads — skipping optimizer step.")
         else:
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
-            opt.step() # meta-update
+            opt.step()
 
         history["epoch"].append(ep + 1)
         history["meta_loss"].append(float(meta_loss.item()))
-        history["inner_pre"].append(float(np.mean(inner_pre_vals)))
+        history["inner_pre"].append(float(inner_pre))
         history["outer_loss"].append(float(np.mean(outer_vals)))
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
             print(f"  [ep {ep+1:4d}/{epochs}] "
                   f"meta={meta_loss.item():.4e}  "
-                  f"inner_pre={np.mean(inner_pre_vals):.4e}  "
+                  f"inner_pre={inner_pre:.4e}  "
                   f"outer={np.mean(outer_vals):.4e}")
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history,
-                         optimizer=opt, np_rng=np_rng, torch_gen=torch_gen)
+                         optimizer=opt, torch_gen=torch_gen)
 
         if killer is not None and killer.kill_now:
             print(f"[Arrêt propre] à l'epoch {ep+1}.")
@@ -239,9 +239,13 @@ def meta_train(
     return policy, history
 
 
+# ---------------------------------------------------------------------------
+# Multi-task baseline training (no adaptation)
+# ---------------------------------------------------------------------------
+
 def baseline_train(
     policy: torch.nn.Module,
-    tasks: List[Task],
+    task_set: FixedUniformMassSet,
     x0_train: torch.Tensor,
     x0_eval: torch.Tensor,
     *,
@@ -259,67 +263,61 @@ def baseline_train(
     seed: int = 42,
     on_epoch_end: Callable = None,
     killer=None,
+    resume_state: dict = None,
 ):
-    """Multi-task baseline training (no MAML adaptation).
+    """Multi-task baseline: train on all N fixed tasks simultaneously.
 
-    Each epoch samples one MassParams per task, runs ``policy`` on the
-    fixed ``x0_train`` batch, and averages the per-task losses into a
-    single objective whose gradient flows directly into
-    ``policy.parameters()``. Mirror of ``meta_train`` minus the inner
-    loop, so a baseline NN is trained on exactly the same task
-    distributions, x0 sets, and number of epochs.
+    All N tasks are batched into a single rollout of (N*B_train, 12) states,
+    giving full GPU utilisation with no extra code complexity.
 
-    history["train_loss"] : averaged per-task training loss (on x0_train)
-    history["eval_loss"]  : same but evaluated on x0_eval (held-out, no grad)
-    history["sampled_positions"][k] : chronological r_offset for tasks[k]
+    history["train_loss"] : loss on x0_train (gradient batch)
+    history["eval_loss"]  : loss on x0_eval  (no grad)
     """
-    torch.manual_seed(seed)
-    np_rng    = np.random.default_rng(seed)
-    torch_gen = torch.Generator(device=device).manual_seed(seed)
-
-    opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
-    M = len(tasks)
-    if M == 0:
-        raise ValueError("`tasks` must contain at least one Task.")
+    N       = len(task_set)
+    B_train = x0_train.shape[0]
+    B_eval  = x0_eval.shape[0]
 
     x0_train = x0_train.to(device)
     x0_eval  = x0_eval.to(device)
 
-    history = {
-        "epoch": [], "train_loss": [], "eval_loss": [],
-        "sampled_positions": [[] for _ in range(M)],
-    }
+    opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
 
-    for ep in range(epochs):
+    if resume_state is None:
+        torch.manual_seed(seed)
+        torch_gen = torch.Generator(device=device).manual_seed(seed)
+        history = {"epoch": [], "train_loss": [], "eval_loss": []}
+        start_epoch = 0
+    else:
+        torch.set_rng_state(resume_state["torch_rng_state"].cpu())
+        if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
+            torch.cuda.set_rng_state(resume_state["torch_cuda_rng_state"].cpu())
+        torch_gen = torch.Generator(device=device)
+        torch_gen.set_state(resume_state["torch_gen_state"].cpu())
+        opt.load_state_dict(resume_state["optimizer_state"])
+        history = resume_state["history"]
+        for k, v in [("epoch", []), ("train_loss", []), ("eval_loss", [])]:
+            history.setdefault(k, v)
+        start_epoch = len(history["epoch"])
+        print(f"[Resume] from epoch {start_epoch}/{epochs}.")
+
+    # Pre-build batched masses (same for every epoch).
+    mass_train_big = batch_mass_params(task_set.masses, B_train, device)
+    mass_eval_big  = batch_mass_params(task_set.masses, B_eval,  device)
+    x0_train_big   = x0_train.repeat(N, 1)   # (N*B_train, 12)
+    x0_eval_big    = x0_eval.repeat(N, 1)    # (N*B_eval,  12)
+
+    for ep in range(start_epoch, epochs):
         opt.zero_grad()
-        train_loss = 0.0
-        train_vals: List[float] = []
-        eval_vals:  List[float] = []
 
-        for t_idx, task in enumerate(tasks):
-            mass = task.sample(np_rng).to(device)
-            history["sampled_positions"][t_idx].append(tuple(mass.r_offset))
-
-            X_tr = rollout(policy, x0_train, n_steps, mass, dynamics_step,
-                           tau_div=tau_div, obs_noise_std=obs_noise_std,
-                           gen=torch_gen)
-            L_tr = trajectory_cost(X_tr, terminal_weight,
-                                   pos_weight=pos_weight,
-                                   z_weight=z_weight).mean()
-            train_loss = train_loss + L_tr
-            train_vals.append(L_tr.item())
-
-            with torch.no_grad():
-                X_ev = rollout(policy, x0_eval, n_steps, mass, dynamics_step,
-                               tau_div=tau_div, obs_noise_std=obs_noise_std,
-                               gen=torch_gen)
-                L_ev = trajectory_cost(X_ev, terminal_weight,
-                                       pos_weight=pos_weight,
-                                       z_weight=z_weight).mean()
-            eval_vals.append(L_ev.item())
-
-        train_loss = train_loss / M
-        train_loss.backward()
+        # All N tasks in one forward pass.
+        X_tr = rollout(policy, x0_train_big, n_steps,
+                       mass_train_big, dynamics_step,
+                       tau_div=tau_div, obs_noise_std=obs_noise_std,
+                       gen=torch_gen)
+        L_tr = trajectory_cost(
+            X_tr, terminal_weight,
+            pos_weight=pos_weight, z_weight=z_weight).mean()
+        L_tr.backward()
 
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any()
                       for p in policy.parameters())
@@ -329,17 +327,26 @@ def baseline_train(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
             opt.step()
 
+        with torch.no_grad():
+            X_ev = rollout(policy, x0_eval_big, n_steps,
+                           mass_eval_big, dynamics_step,
+                           tau_div=tau_div, obs_noise_std=obs_noise_std,
+                           gen=torch_gen)
+            L_ev = trajectory_cost(
+                X_ev, terminal_weight,
+                pos_weight=pos_weight, z_weight=z_weight).mean()
+
         history["epoch"].append(ep + 1)
-        history["train_loss"].append(float(train_loss.item()))
-        history["eval_loss"].append(float(np.mean(eval_vals)))
+        history["train_loss"].append(float(L_tr.item()))
+        history["eval_loss"].append(float(L_ev.item()))
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
             print(f"  [ep {ep+1:4d}/{epochs}] "
-                  f"train={train_loss.item():.4e}  "
-                  f"eval={np.mean(eval_vals):.4e}")
+                  f"train={L_tr.item():.4e}  eval={L_ev.item():.4e}")
 
         if on_epoch_end is not None:
-            on_epoch_end(ep, policy, history)
+            on_epoch_end(ep, policy, history,
+                         optimizer=opt, torch_gen=torch_gen)
 
         if killer is not None and killer.kill_now:
             print(f"[Arrêt propre] à l'epoch {ep+1}.")
@@ -347,6 +354,10 @@ def baseline_train(
 
     return policy, history
 
+
+# ---------------------------------------------------------------------------
+# Few-shot adaptation (test time)
+# ---------------------------------------------------------------------------
 
 def maml_adapt(
     policy: torch.nn.Module,
@@ -367,32 +378,18 @@ def maml_adapt(
     seed: int = 0,
     verbose: bool = True,
 ):
-    """Few-shot adaptation on a single test task (e.g. the held-out motor).
-
-    The defaults for ``obs_noise_std``, ``tau_div``, ``pos_weight`` and
-    ``inner_grad_clip`` should match those used in ``meta_train`` so that
-    adaptation sees the same distribution it was trained on.
-
-    Args:
-        x0 : (N, 12) support batch of initial states; reused across all
-             adaptation steps (standard MAML).
-
-    Returns:
-        theta_adapt : dict[name -> Tensor]  adapted parameters
-        losses      : list[float]            inner-loop losses per step
-    """
+    """Few-shot adaptation on a single test task."""
     theta = {n: p.detach().clone().requires_grad_(True)
              for n, p in policy.named_parameters()}
     gen = torch.Generator(device=device).manual_seed(seed)
     losses = []
     mass = mass.to(device)
-    x0 = x0.to(device)
+    x0   = x0.to(device)
     for s in range(n_steps_adapt):
         X = rollout(_make_fn(policy, theta), x0, n_steps, mass, dynamics_step,
                     tau_div=tau_div, obs_noise_std=obs_noise_std, gen=gen)
         L = trajectory_cost(X, terminal_weight,
-                            pos_weight=pos_weight,
-                            z_weight=z_weight).mean()
+                            pos_weight=pos_weight, z_weight=z_weight).mean()
         grads = torch.autograd.grad(L, tuple(theta.values()), create_graph=False)
         if inner_grad_clip > 0:
             grads = _clip_grads(grads, max_norm=inner_grad_clip)

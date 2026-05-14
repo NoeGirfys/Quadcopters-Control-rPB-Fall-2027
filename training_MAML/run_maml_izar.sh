@@ -29,19 +29,23 @@ echo "Node        : $SLURMD_NODENAME"
 python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available(), '| device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
 
 # --- Lancement de l'entraînement --------------------------------------
-# Ajout de 'srun' devant python
 srun python training_MAML/train_maml.py \
     --dynamics linearized \
-    --maml-order 2 \
+    --maml-order 1 \
     --epochs 500 \
-    --lr-outer 1e-3 \
+    --lr-outer 3e-4 \
     --lr-inner 0.05 \
-    --n-inner-steps 5 \
-    --n-x0-train 256 \
-    --n-x0-eval 128 \
-    --obs-noise-scale 0 \
+    --n-inner-steps 1 \
+    --n-tasks 50 \
+    --xy-min -0.04 \
+    --xy-max  0.04 \
+    --z-min  -0.01 \
+    --z-max   0.01 \
+    --mass 0.010 \
+    --n-x0-train 64 \
+    --n-x0-eval  32 \
+    --obs-noise-scale 1.0 \
     --tau-div 1.0 \
     --t-sim 2.0 \
-    --plot-every 25 \
     --seed 42 \
     --tag izar_v1

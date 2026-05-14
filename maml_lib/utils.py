@@ -22,48 +22,42 @@ def sample_hover_x0(n: int, half_side: float, gen: torch.Generator,
     return X0
 
 
-def plot_training_map(out_path: str, *, sampled_positions, motor_centers,
-                      target_motor: int, training_motor_indices,
-                      sigma: float, x0_train: torch.Tensor,
-                      x0_eval: torch.Tensor, half_side: float):
-    """Save a 2-panel diagnostic plot:
+def plot_fixed_task_map(out_path: str, *,
+                        positions,
+                        x0_train: torch.Tensor,
+                        x0_eval: torch.Tensor,
+                        half_side: float,
+                        xy_min: float, xy_max: float,
+                        z_min: float, z_max: float):
+    """Save a 2-panel diagnostic plot for the fixed uniform task set.
 
-    * Left  : body-frame top view of motor centres (target = star, others
-              = circles), σ rings, and one scatter of sampled mass
-              offsets per training task.
-    * Right : xy projection of the fixed train/eval x0 sets, two colours.
+    * Left  : body-frame xy scatter of the N fixed mass positions,
+              coloured by dz value; box shows the sampling range.
+    * Right : xy projection of the fixed train/eval x0 sets.
     """
     import matplotlib.pyplot as plt
+    import numpy as np
 
-    fig, axs = plt.subplots(1, 2, figsize=(12, 6))
-    cmap = plt.get_cmap("tab10")
+    positions = np.asarray(positions)          # (N, 3)
+    fig, axs = plt.subplots(1, 2, figsize=(13, 6))
 
+    # ── Left: mass positions ──────────────────────────────────────────
     ax = axs[0]
-    for i, (mx, my) in enumerate(motor_centers):
-        is_target = (i == target_motor)
-        ax.scatter([mx], [my], s=300,
-                   marker=("*" if is_target else "o"),
-                   color=("k" if is_target else cmap(i)),
-                   edgecolors="k", zorder=5,
-                   label=f"motor {i}{' (target)' if is_target else ''}")
-        ax.add_patch(plt.Circle((mx, my), sigma, fill=False,
-                                 linestyle="--",
-                                 edgecolor=("k" if is_target else cmap(i)),
-                                 alpha=0.5))
-
-    for k, motor_idx in enumerate(training_motor_indices):
-        samples = sampled_positions[k]
-        if not samples:
-            continue
-        xs = [p[0] for p in samples]
-        ys = [p[1] for p in samples]
-        ax.scatter(xs, ys, s=8, alpha=0.5, color=cmap(motor_idx))
-
+    sc = ax.scatter(positions[:, 0] * 100, positions[:, 1] * 100,
+                    c=positions[:, 2] * 100, cmap="coolwarm",
+                    s=30, alpha=0.7, edgecolors="none")
+    plt.colorbar(sc, ax=ax, label="dz [cm]")
+    rect = plt.Rectangle((xy_min * 100, xy_min * 100),
+                          (xy_max - xy_min) * 100, (xy_max - xy_min) * 100,
+                          linewidth=1.5, edgecolor="k", facecolor="none",
+                          linestyle="--", label="sampling box")
+    ax.add_patch(rect)
     ax.set_aspect("equal"); ax.grid(True)
-    ax.set_title("Body-frame mass offsets (top view)")
-    ax.set_xlabel("dx [m]"); ax.set_ylabel("dy [m]")
-    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Fixed task set (N={len(positions)}) — body-frame xy")
+    ax.set_xlabel("dx [cm]"); ax.set_ylabel("dy [cm]")
+    ax.legend(fontsize=8)
 
+    # ── Right: x0 sets ───────────────────────────────────────────────
     ax = axs[1]
     x0_t = x0_train.detach().cpu().numpy()
     x0_e = x0_eval.detach().cpu().numpy()

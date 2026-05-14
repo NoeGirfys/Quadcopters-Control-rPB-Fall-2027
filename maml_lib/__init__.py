@@ -3,39 +3,39 @@
 Public surface:
 
     from maml_lib import (
-        config,                 # constants
-        MassParams, compute_mass_params,
+        config,
+        MassParams, compute_mass_params, batch_mass_params,
         nonlinear_step, linearized_step, DYNAMICS,
         PolicyMLP,
         rollout, compute_relative_targets, trajectory_cost,
-        Task, GaussianMotorTask,
+        FixedUniformMassSet,
         meta_train, maml_adapt, baseline_train,
-        sample_hover_x0, plot_training_map,
+        sample_hover_x0, plot_fixed_task_map,
         make_x0_batch, generate_cube_points, GracefulKiller,
     )
 """
 from . import config
 
-from .mass_params import MassParams, compute_mass_params
+from .mass_params import MassParams, compute_mass_params, batch_mass_params
 from .dynamics    import nonlinear_step, linearized_step, DYNAMICS
 from .policy      import PolicyMLP
 from .rollout     import rollout, compute_relative_targets
 from .cost        import trajectory_cost
-from .tasks       import Task, GaussianMotorTask
+from .tasks       import FixedUniformMassSet
 from .maml        import meta_train, maml_adapt, baseline_train
 from .utils       import (
-    sample_hover_x0, plot_training_map,
+    sample_hover_x0, plot_fixed_task_map,
     make_x0_batch, generate_cube_points, GracefulKiller,
 )
 
 __all__ = [
     "config",
-    "MassParams", "compute_mass_params",
+    "MassParams", "compute_mass_params", "batch_mass_params",
     "nonlinear_step", "linearized_step", "DYNAMICS",
     "PolicyMLP",
     "rollout", "compute_relative_targets", "trajectory_cost",
-    "Task", "GaussianMotorTask",
+    "FixedUniformMassSet",
     "meta_train", "maml_adapt", "baseline_train",
-    "sample_hover_x0", "plot_training_map",
+    "sample_hover_x0", "plot_fixed_task_map",
     "make_x0_batch", "generate_cube_points", "GracefulKiller",
 ]

@@ -1,4 +1,3 @@
-from .base import Task
-from .gaussian_motor import GaussianMotorTask
+from .uniform_mass import FixedUniformMassSet
 
-__all__ = ["Task", "GaussianMotorTask"]
+__all__ = ["FixedUniformMassSet"]

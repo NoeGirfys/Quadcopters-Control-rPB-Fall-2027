@@ -1,77 +1,68 @@
-"""Train a Crazyflie controller with MAML over Gaussian-motor tasks.
+"""Train a Crazyflie controller with MAML over a fixed uniform mass task set.
 
-The policy has the same role as
-``training_regulation_simu_and_real/train_nn_cf_pid.py``: it replaces the
-firmware position+velocity PIDs and outputs
-``[thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s]`` at NN_FREQ. The
-firmware attitude+rate PIDs run downstream at ATTITUDE_RATE.
+Task distribution
+-----------------
+N tasks are sampled *once at startup* from a uniform box:
+    dx ~ Uniform(xy_min, xy_max)
+    dy ~ Uniform(xy_min, xy_max)
+    dz ~ Uniform(z_min,  z_max)
+and reused at every epoch.  This makes the meta-gradient estimate stable and
+lets the baseline be trained on the exact same tasks for a fair comparison.
 
-Setup
------
-Four task distributions, one centred on each motor's body-frame xy.
-Three are used for training, one is held out as the *target* task for
-later few-shot adaptation. The extra mass is fixed (10 g default) and
-attached at z = 0; only (dx, dy) is sampled from a 2D Gaussian.
-
-Each epoch:
-  * one (dx, dy) is drawn from each of the 3 training distributions
-    -> 3 tasks per meta-update;
-  * adaptation (inner loop) uses a *fixed* hover x0 batch ``x0_train``
-    drawn uniformly in the cube at start-up;
-  * the meta loss is computed on a *fixed* disjoint batch ``x0_eval``,
-    same hover convention.
-
-Both x0 batches and the chronological list of sampled task offsets are
-saved into the checkpoint after every epoch, so a Ctrl+C preserves the
-full training map.
+GPU parallelism
+---------------
+MAML inner loop  : all N tasks are batched into one rollout (N*B_train, 12)
+                   for the first adaptation step; a single GPU forward pass
+                   replaces N sequential calls.
+Baseline         : all N tasks are always batched (N*B_train, 12).
 
 Usage examples:
 
     cd training_MAML
     python train_maml.py
-    python train_maml.py --dynamics linearized --maml-order 1
-    python train_maml.py --epochs 1000 --target-motor 2 --sigma 0.005 \\
-                         --n-x0-train 64 --n-x0-eval 64 --t-sim 2.0 --tag exp1
+    python train_maml.py --n-tasks 50 --xy-min -0.04 --xy-max 0.04 \\
+                         --dynamics linearized --maml-order 1 --epochs 500
+    python train_maml.py --resume maml_..._ep200.pt --epochs 500
 """
 import argparse
 import os
 import sys
 
+import numpy as np
 import torch
 
-# Add project root so maml_lib resolves.
 PARENT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if PARENT_DIR not in sys.path:
     sys.path.append(PARENT_DIR)
 
 from maml_lib import (
     config as C,
-    PolicyMLP, GaussianMotorTask, meta_train,
-    sample_hover_x0, plot_training_map, GracefulKiller,
+    PolicyMLP, FixedUniformMassSet, meta_train,
+    sample_hover_x0, plot_fixed_task_map, GracefulKiller,
     DYNAMICS,
 )
 
 
+# ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
 def _load_resume_defaults(ckpt_path: str) -> dict:
-    """Pull the full hyperparameter set out of a previous MAML checkpoint
-    so the resumed run uses identical settings unless the user overrides
-    something on the CLI.
-    """
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     saved = ckpt.get("args", {})
     actual_epochs = ckpt.get("actual_epochs",
                              len(ckpt.get("history", {}).get("epoch", []))) \
                     or saved.get("epochs", 500)
     out = dict(saved)
-    # Force the "planned epochs" default to be at least what was already
-    # done, otherwise the resumed loop would do zero iterations.
     out["epochs"] = max(int(saved.get("epochs", 500)), int(actual_epochs))
     return out
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args():
-    # ---- Two-pass parsing: peek at --resume so its values can be used
-    # as defaults for every other CLI arg below.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--resume", type=str, default=None)
     pre_args, _ = pre.parse_known_args()
@@ -79,106 +70,71 @@ def parse_args():
     if pre_args.resume is not None:
         d = _load_resume_defaults(pre_args.resume)
         print(f"[Init] Resuming from {pre_args.resume}")
-        print(f"[Init]   inherited hyperparameters from the checkpoint; "
-              f"override any CLI arg to deviate.")
+        print(f"[Init]   inherited hyperparameters from checkpoint; "
+              "override any CLI arg to deviate.")
     else:
         d = {}
 
     p = argparse.ArgumentParser(
-        description="MAML training for CF2 with Gaussian-motor tasks.",
+        description="MAML training for CF2 with fixed uniform mass tasks.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
     p.add_argument("--resume", type=str, default=None,
-                   help="resume training from this .pt checkpoint "
-                        "(bit-identical continuation: optimizer + RNG state "
-                        "restored). All hyperparameters default to the "
-                        "checkpoint's values; pass --epochs N to extend "
-                        "training to N total epochs.")
+                   help="resume training from a .pt checkpoint")
 
-    # Core training
-    p.add_argument("--epochs",        type=int,
-                   default=d.get("epochs", 500))
-    p.add_argument("--lr-outer",      type=float,
-                   default=d.get("lr_outer", 1e-3),
-                   help="meta (outer) learning rate")
-    p.add_argument("--lr-inner",      type=float,
-                   default=d.get("lr_inner", 1e-2),
-                   help="inner-loop (per-task) learning rate")
-    p.add_argument("--n-inner-steps", type=int,
-                   default=d.get("n_inner_steps", 1),
-                   help="number of inner-loop gradient steps per task "
-                        "(MAML paper uses 1)")
-    p.add_argument("--maml-order",    type=int,
-                   default=d.get("maml_order", 2), choices=[1, 2],
-                   help="1 = FOMAML, 2 = full second-order MAML")
-    p.add_argument("--hidden",        type=int,
-                   default=d.get("hidden", 64))
+    # Training
+    p.add_argument("--epochs",          type=int,   default=d.get("epochs",        500))
+    p.add_argument("--lr-outer",        type=float, default=d.get("lr_outer",      3e-4))
+    p.add_argument("--lr-inner",        type=float, default=d.get("lr_inner",      5e-2))
+    p.add_argument("--n-inner-steps",   type=int,   default=d.get("n_inner_steps", 1))
+    p.add_argument("--maml-order",      type=int,   default=d.get("maml_order",    1),
+                   choices=[1, 2])
+    p.add_argument("--hidden",          type=int,   default=d.get("hidden",        64))
 
-    # x0 batches (drawn once at start)
-    p.add_argument("--n-x0-train", type=int,
-                   default=d.get("n_x0_train", 32),
-                   help="number of fixed initial states for the inner loss")
-    p.add_argument("--n-x0-eval",  type=int,
-                   default=d.get("n_x0_eval", 32),
-                   help="number of fixed initial states for the meta loss "
-                        "(disjoint from train)")
-    p.add_argument("--half-side",  type=float,
-                   default=d.get("half_side", 0.3),
-                   help="cube half-side for x0 sampling [m]")
+    # Task set
+    p.add_argument("--n-tasks",  type=int,   default=d.get("n_tasks",  50),
+                   help="number of fixed tasks sampled at startup")
+    p.add_argument("--mass",     type=float, default=d.get("mass",     0.010),
+                   help="extra point mass for every task [kg]")
+    p.add_argument("--xy-min",   type=float, default=d.get("xy_min",  -0.04),
+                   help="lower bound for dx and dy [m]")
+    p.add_argument("--xy-max",   type=float, default=d.get("xy_max",   0.04),
+                   help="upper bound for dx and dy [m]")
+    p.add_argument("--z-min",    type=float, default=d.get("z_min",   -0.01),
+                   help="lower bound for dz [m]")
+    p.add_argument("--z-max",    type=float, default=d.get("z_max",    0.01),
+                   help="upper bound for dz [m]")
+
+    # x0 batches
+    p.add_argument("--n-x0-train", type=int,   default=d.get("n_x0_train", 64))
+    p.add_argument("--n-x0-eval",  type=int,   default=d.get("n_x0_eval",  32))
+    p.add_argument("--half-side",  type=float, default=d.get("half_side",   0.3))
 
     # Rollout
-    p.add_argument("--t-sim",         type=float,
-                   default=d.get("t_sim", 2.0),
-                   help="rollout duration [s]")
-    p.add_argument("--tau-div",       type=float,
-                   default=d.get("tau_div", 2.0),
-                   help="curriculum divergence threshold [m]; "
-                        "set <=0 to disable")
-    p.add_argument("--obs-noise-scale", type=float,
-                   default=d.get("obs_noise_scale", 1.0),
-                   help="0 = off, 1 = default, 2 = double")
-    p.add_argument("--terminal-weight", type=float,
-                   default=d.get("terminal_weight", 50.0))
-    p.add_argument("--pos-weight",      type=float,
-                   default=d.get("pos_weight", 10.0),
-                   help="weight on (x, y, z) in the running cost")
-    p.add_argument("--z-weight",        type=float,
-                   default=d.get("z_weight", 1.0))
-    p.add_argument("--inner-grad-clip", type=float,
-                   default=d.get("inner_grad_clip", 1.0),
-                   help="max-norm clip on inner-loop gradients; "
-                        "set <=0 to disable")
+    p.add_argument("--t-sim",           type=float, default=d.get("t_sim",           2.0))
+    p.add_argument("--tau-div",         type=float, default=d.get("tau_div",         1.0),
+                   help="divergence threshold [m]; <=0 to disable")
+    p.add_argument("--obs-noise-scale", type=float, default=d.get("obs_noise_scale", 1.0))
+    p.add_argument("--terminal-weight", type=float, default=d.get("terminal_weight", 50.0))
+    p.add_argument("--pos-weight",      type=float, default=d.get("pos_weight",      10.0))
+    p.add_argument("--z-weight",        type=float, default=d.get("z_weight",        1.0))
+    p.add_argument("--inner-grad-clip", type=float, default=d.get("inner_grad_clip", 1.0))
 
     # Dynamics
     p.add_argument("--dynamics", choices=list(DYNAMICS.keys()),
                    default=d.get("dynamics", "nonlinear"))
 
-    # Task definition (Gaussian-motor)
-    p.add_argument("--mass",   type=float,
-                   default=d.get("mass", 0.010),
-                   help="fixed extra mass for every task [kg]")
-    p.add_argument("--sigma",  type=float,
-                   default=d.get("sigma", 0.005),
-                   help="std of the 2D Gaussian over (dx, dy) [m]")
-    p.add_argument("--target-motor", type=int,
-                   default=d.get("target_motor", 0), choices=[0, 1, 2, 3],
-                   help="motor index held out from training "
-                        "(0=front-right, 1=rear-right, 2=rear-left, 3=front-left)")
-
-    # Logging
-    p.add_argument("--plot-every", type=int,
-                   default=d.get("plot_every", 25),
-                   help="regenerate the position map every N epochs "
-                        "(set <=0 to only plot at the end)")
-
     # Misc
-    p.add_argument("--seed", type=int,
-                   default=d.get("seed", 42))
-    p.add_argument("--tag",  type=str,
-                   default=d.get("tag", ""))
-    p.add_argument("--verbose-every", type=int,
-                   default=d.get("verbose_every", 1))
+    p.add_argument("--seed",         type=int, default=d.get("seed",         42))
+    p.add_argument("--tag",          type=str, default=d.get("tag",          ""))
+    p.add_argument("--verbose-every",type=int, default=d.get("verbose_every", 1))
+
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -188,182 +144,136 @@ def main():
     print(f"[Config] dynamics={args.dynamics}  maml_order={args.maml_order}")
     print(f"[Config] epochs={args.epochs}  n_inner_steps={args.n_inner_steps}")
     print(f"[Config] lr_outer={args.lr_outer}  lr_inner={args.lr_inner}")
-    print(f"[Config] hover thrust (baseline) ≈ {C.HOVER_THRUST_U16_BASE:.0f}")
-
     n_steps = int(args.t_sim * C.NN_FREQ)
-    print(f"[Config] n_steps_per_rollout={n_steps} ({args.t_sim}s @ {C.NN_FREQ}Hz)")
+    print(f"[Config] n_steps={n_steps} ({args.t_sim}s @ {C.NN_FREQ}Hz)")
 
-    # --- Task setup: 4 motor distributions, hold out args.target_motor -----
-    motor_centers = [(float(C.MOTOR_POS[i, 0]), float(C.MOTOR_POS[i, 1]))
-                     for i in range(4)]
-    training_motor_indices = [i for i in range(4) if i != args.target_motor]
-    training_tasks = [
-        GaussianMotorTask(motor_xy=motor_centers[i],
-                          sigma=args.sigma,
-                          m_extra=args.mass,
-                          motor_idx=i)
-        for i in training_motor_indices
-    ]
-    target_task = GaussianMotorTask(motor_xy=motor_centers[args.target_motor],
-                                    sigma=args.sigma,
-                                    m_extra=args.mass,
-                                    motor_idx=args.target_motor)
-    print(f"[Tasks]  3 training motors {training_motor_indices}, "
-          f"target = motor #{args.target_motor}  "
-          f"σ={args.sigma*100:.2f}cm  m={args.mass*1e3:.0f}g")
-
-    # --- Resume: load the checkpoint up-front (need it for x0, weights, RNG) -
+    # ── Load checkpoint if resuming ────────────────────────────────────
     ckpt = None
     if args.resume is not None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
 
-    # --- Fixed x0 batches --------------------------------------------------
+    # ── Fixed task set ─────────────────────────────────────────────────
+    if ckpt is not None:
+        # Reconstruct from saved positions so the run is bit-identical.
+        task_set = FixedUniformMassSet.from_positions(
+            ckpt["task_positions"], m_extra=args.mass)
+        print(f"[Tasks]  {len(task_set)} fixed tasks restored from checkpoint")
+    else:
+        rng_tasks = np.random.default_rng(args.seed)
+        task_set = FixedUniformMassSet.sample(
+            n_tasks=args.n_tasks,
+            xy_min=args.xy_min, xy_max=args.xy_max,
+            z_min=args.z_min,   z_max=args.z_max,
+            m_extra=args.mass,
+            rng=rng_tasks,
+        )
+        print(f"[Tasks]  {args.n_tasks} tasks sampled  "
+              f"xy=[{args.xy_min*100:.1f},{args.xy_max*100:.1f}]cm  "
+              f"z=[{args.z_min*100:.1f},{args.z_max*100:.1f}]cm  "
+              f"m={args.mass*1e3:.0f}g")
+
+    # ── x0 batches ────────────────────────────────────────────────────
     if ckpt is not None:
         x0_train = ckpt["x0_train"].to(device)
         x0_eval  = ckpt["x0_eval"].to(device)
-        print(f"[x0]    n_train={x0_train.shape[0]}  n_eval={x0_eval.shape[0]}  "
-              f"(restored from checkpoint)")
+        print(f"[x0]    n_train={x0_train.shape[0]}  n_eval={x0_eval.shape[0]}"
+              f"  (restored)")
     else:
-        x0_gen = torch.Generator(device=device).manual_seed(args.seed)
+        x0_gen = torch.Generator(device=device).manual_seed(args.seed + 1)
         n_total = args.n_x0_train + args.n_x0_eval
-        x0_all = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
+        x0_all  = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
         x0_train = x0_all[:args.n_x0_train].contiguous()
         x0_eval  = x0_all[args.n_x0_train:].contiguous()
-        print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}  "
-              f"cube ±{args.half_side}m (hover)")
+        print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}"
+              f"  cube ±{args.half_side}m")
 
-    # --- Policy ------------------------------------------------------------
-    # Initialise the thrust bias for the hover of the *total* task mass
-    # (M_base + args.mass), assumed centred. The offset torque is what MAML
-    # adaptation has to learn to cancel via the roll/pitch outputs.
+    # ── Policy ────────────────────────────────────────────────────────
     M_total = C.M_BASE + args.mass
     hover_thrust_u16 = (M_total * C.G * C.UINT16_MAX) / (4 * C.CF2_THRUST_MAX_PER_MOTOR)
-    print(f"[Policy] hover thrust (M_total={M_total*1e3:.1f}g) "
-          f"≈ {hover_thrust_u16:.0f}  "
-          f"(baseline was {C.HOVER_THRUST_U16_BASE:.0f})")
-    policy = PolicyMLP(hidden=args.hidden,
-                       hover_thrust_u16=hover_thrust_u16).to(device)
+    policy = PolicyMLP(hidden=args.hidden, hover_thrust_u16=hover_thrust_u16).to(device)
     if ckpt is not None:
         policy.load_state_dict(ckpt["state_dict"])
-        print(f"[Policy] restored weights from checkpoint "
-              f"(actual_epochs={ckpt.get('actual_epochs', '?')}).")
+        print(f"[Policy] restored weights  (actual_epochs={ckpt.get('actual_epochs','?')})")
+    print(f"[Policy] hover thrust (M={M_total*1e3:.1f}g) ≈ {hover_thrust_u16:.0f}")
 
-    # --- Sim-to-real obs noise --------------------------------------------
-    obs_noise = ((C.OBS_NOISE_STD * args.obs_noise_scale).to(device)
-                 if args.obs_noise_scale > 0 else None)
-
+    # ── Ancillary ─────────────────────────────────────────────────────
+    obs_noise = (C.OBS_NOISE_STD * args.obs_noise_scale).to(device) \
+                if args.obs_noise_scale > 0 else None
     tau_div = args.tau_div if args.tau_div > 0 else None
 
-    # --- Output paths ------------------------------------------------------
-    # During training we save to a stable "in-progress" name so a Ctrl+C
-    # never leaves a half-written file. After meta_train returns, we rename
-    # the working files to include the *actual* number of completed epochs
-    # (which may be less than args.epochs if the user interrupted).
+    # ── Output paths ──────────────────────────────────────────────────
     out_dir = os.path.dirname(os.path.abspath(__file__))
     tag = f"_{args.tag}" if args.tag else ""
-    base_no_ep = (f"maml_{args.dynamics}_h{args.hidden}_"
-                  f"o{args.maml_order}_tm{args.target_motor}{tag}")
-    working_ckpt = os.path.join(out_dir, base_no_ep + "_inprogress.pt")
-    working_map  = os.path.join(out_dir, base_no_ep + "_inprogress_map.png")
+    base = (f"maml_{args.dynamics}_h{args.hidden}_"
+            f"o{args.maml_order}_n{len(task_set)}{tag}")
+    working_ckpt = os.path.join(out_dir, base + "_inprogress.pt")
 
-    common_save_payload = {
-        "args":               vars(args),
-        "x_scale":            C.X_SCALE,
-        "pos_scale":          C.POS_SCALE,
-        "nn_freq":            C.NN_FREQ,
-        "att_rate":           C.ATTITUDE_RATE,
-        "motor_centers":      motor_centers,
-        "target_motor":       args.target_motor,
-        "training_motor_indices": training_motor_indices,
-        "sigma":              args.sigma,
-        "m_extra":            args.mass,
-        "x0_train":           x0_train.detach().cpu(),
-        "x0_eval":            x0_eval.detach().cpu(),
+    # Payload fields that never change between epochs.
+    common_payload = {
+        "args":          vars(args),
+        "x_scale":       C.X_SCALE,
+        "pos_scale":     C.POS_SCALE,
+        "nn_freq":       C.NN_FREQ,
+        "att_rate":      C.ATTITUDE_RATE,
+        "task_positions": task_set.positions,   # (N, 3) — enough to reconstruct tasks
+        "m_extra":       task_set.m_extra,
+        "x0_train":      x0_train.detach().cpu(),
+        "x0_eval":       x0_eval.detach().cpu(),
     }
 
     def save_checkpoint(policy_module, history, path,
-                        optimizer=None, np_rng=None, torch_gen=None):
-        payload = dict(common_save_payload)
+                        optimizer=None, torch_gen=None):
+        payload = dict(common_payload)
         payload["state_dict"]    = {k: v.detach().cpu()
                                     for k, v in policy_module.state_dict().items()}
         payload["history"]       = history
         payload["actual_epochs"] = len(history.get("epoch", []))
-        # Fields needed for a bit-identical resume.
-        if optimizer is not None:
+        if optimizer  is not None:
             payload["optimizer_state"] = optimizer.state_dict()
-        if np_rng is not None:
-            payload["np_rng_state"]    = np_rng.bit_generator.state
-        if torch_gen is not None:
+        if torch_gen  is not None:
             payload["torch_gen_state"] = torch_gen.get_state().cpu()
-        payload["torch_rng_state"]     = torch.get_rng_state().cpu()
+        payload["torch_rng_state"] = torch.get_rng_state().cpu()
         if torch.cuda.is_available():
             payload["torch_cuda_rng_state"] = torch.cuda.get_rng_state().cpu()
-        # atomic write: temp file then rename, so a Ctrl+C mid-save won't
-        # leave a half-written checkpoint.
         tmp = path + ".tmp"
         torch.save(payload, tmp)
         os.replace(tmp, path)
 
-    def save_plot(history, path):
-        try:
-            plot_training_map(
-                path,
-                sampled_positions=history["sampled_positions"],
-                motor_centers=motor_centers,
-                target_motor=args.target_motor,
-                training_motor_indices=training_motor_indices,
-                sigma=args.sigma,
-                x0_train=x0_train,
-                x0_eval=x0_eval,
-                half_side=args.half_side,
-            )
-        except Exception as e:  # plotting must never kill training
-            print(f"[Plot] failed: {e}")
-
     def on_epoch_end(ep, policy_module, history,
-                     optimizer=None, np_rng=None, torch_gen=None, **_):
-        # always save the checkpoint so Ctrl+C preserves the full map +
-        # everything needed to resume bit-identically.
+                     optimizer=None, torch_gen=None, **_):
         save_checkpoint(policy_module, history, working_ckpt,
-                        optimizer=optimizer, np_rng=np_rng, torch_gen=torch_gen)
-        if args.plot_every > 0 and ((ep + 1) % args.plot_every == 0):
-            save_plot(history, working_map)
+                        optimizer=optimizer, torch_gen=torch_gen)
 
     killer = GracefulKiller()
 
-    # Build resume_state from the checkpoint, if any. Validate that all
-    # required RNG / optimizer fields are present — older checkpoints
-    # (pre-resume support) lack them and can't be resumed bit-identically.
+    # ── Resume state ──────────────────────────────────────────────────
     resume_state = None
+    start_epoch  = 0
     if ckpt is not None:
-        required = ("optimizer_state", "np_rng_state",
-                    "torch_gen_state", "torch_rng_state", "history")
+        required = ("optimizer_state", "torch_gen_state",
+                    "torch_rng_state", "history")
         missing = [k for k in required if k not in ckpt]
         if missing:
             raise RuntimeError(
                 f"Cannot resume from {args.resume}: missing keys {missing}. "
-                "This checkpoint was saved by an older version of "
-                "train_maml.py. Re-train from scratch.")
+                "Re-train from scratch.")
         resume_state = {
-            "optimizer_state":      ckpt["optimizer_state"],
-            "np_rng_state":         ckpt["np_rng_state"],
-            "torch_gen_state":      ckpt["torch_gen_state"],
-            "torch_rng_state":      ckpt["torch_rng_state"],
-            "history":              ckpt["history"],
+            "optimizer_state":  ckpt["optimizer_state"],
+            "torch_gen_state":  ckpt["torch_gen_state"],
+            "torch_rng_state":  ckpt["torch_rng_state"],
+            "history":          ckpt["history"],
         }
         if "torch_cuda_rng_state" in ckpt:
             resume_state["torch_cuda_rng_state"] = ckpt["torch_cuda_rng_state"]
-        done = len(ckpt["history"].get("epoch", []))
-        if done >= args.epochs:
-            print(f"[Resume] checkpoint already has {done} epochs "
+        start_epoch = len(ckpt["history"].get("epoch", []))
+        if start_epoch >= args.epochs:
+            print(f"[Resume] checkpoint already has {start_epoch} epochs "
                   f">= --epochs {args.epochs}; nothing to do. "
-                  f"Pass --epochs > {done} to extend.")
+                  f"Pass --epochs > {start_epoch} to extend.")
 
-    start_epoch = (len(resume_state["history"].get("epoch", []))
-                   if resume_state is not None else 0)
-
+    # ── Training ──────────────────────────────────────────────────────
     policy, history = meta_train(
-        policy, training_tasks, x0_train, x0_eval,
+        policy, task_set, x0_train, x0_eval,
         dynamics_step=DYNAMICS[args.dynamics],
         n_steps=n_steps,
         epochs=args.epochs,
@@ -385,39 +295,36 @@ def main():
         resume_state=resume_state,
     )
 
-    # Final save under the "actual epochs" name (matches len(history)).
-    # on_epoch_end has already written working_ckpt with the full state
-    # (policy + optimizer + RNG + history) at the end of the last epoch,
-    # so we just rename rather than re-save (which would have no access
-    # to the optimizer/RNG objects from this scope and would break
-    # resume-ability of the final file).
+    # ── Save final checkpoint ─────────────────────────────────────────
     actual_epochs = len(history["epoch"])
     newly_trained = actual_epochs - start_epoch
 
     if newly_trained == 0:
-        # Nothing was trained (e.g. --epochs <= already done). Never touch
-        # the existing checkpoint: the fallback save_checkpoint call below
-        # would strip the optimizer/RNG state and break future resumes.
         print("[Info] No new epochs trained; existing checkpoint unchanged.")
         print("Done.")
         return
 
-    final_ckpt = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}.pt")
-    final_map  = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}_map.png")
+    final_ckpt = os.path.join(out_dir, f"{base}_ep{actual_epochs}.pt")
+    final_map  = os.path.join(out_dir, f"{base}_ep{actual_epochs}_map.png")
+
     if os.path.exists(working_ckpt):
         os.replace(working_ckpt, final_ckpt)
     else:
-        # Defensive fallback: no working file (shouldn't happen) — save
-        # what we can (policy + history) without resume state.
         save_checkpoint(policy, history, final_ckpt)
-    # Regenerate the plot under the final name (plot_every may not have
-    # hit the last epoch). This re-renders from history alone.
-    save_plot(history, final_map)
-    if os.path.exists(working_map):
-        try:
-            os.remove(working_map)
-        except OSError:
-            pass
+
+    # Map is fixed (same positions every epoch) — generate once at the end.
+    try:
+        plot_fixed_task_map(
+            final_map,
+            positions=task_set.positions,
+            x0_train=x0_train, x0_eval=x0_eval,
+            half_side=args.half_side,
+            xy_min=args.xy_min, xy_max=args.xy_max,
+            z_min=args.z_min,   z_max=args.z_max,
+        )
+    except Exception as e:
+        print(f"[Plot] failed: {e}")
+
     print(f"[Saved] {final_ckpt}")
     print(f"[Saved] {final_map}")
     print("Done.")

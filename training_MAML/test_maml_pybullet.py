@@ -1,28 +1,23 @@
 """Test a MAML-trained controller in gym-pybullet-drones with offset mass.
 
-Pipeline (matches the training rollout):
-  1. Load the checkpoint and rebuild PolicyMLP (with the hover-thrust bias
-     that matches M_total = M_base + m_extra).
-  2. Build the target task: the held-out motor with the same (m_extra, sigma)
-     as training. By default the mass is attached at the target motor's
-     centre; ``--target-dx/dy/dz`` lets you place it elsewhere.
+Pipeline:
+  1. Load the checkpoint and rebuild PolicyMLP (hover-thrust bias from m_extra).
+  2. Define the test task via ``--target-dx/dy/dz`` and ``--mass`` (defaults
+     to the training value).  Any position in the drone body frame is valid.
   3. Few-shot adaptation: ``maml_adapt`` runs ``--n-inner-steps`` gradient
-     steps (defaults to the checkpoint's value) on ``x0_train`` from the
-     checkpoint, using ``lr_inner`` and the same ``inner_grad_clip`` as in
-     training. Output is a parameter dict ``theta_adapt``.
-  4. PyBullet simulation: ``CtrlAviary`` with ``Physics.DYN_OFFSET``, the
-     offset mass installed via ``env.set_offset_mass``. The NN runs at
-     NN_FREQ Hz and outputs (thrust_u16, roll_deg, pitch_deg, yaw_rate_deg/s);
-     the firmware attitude+rate PIDs run downstream at ATTITUDE_RATE Hz.
+     steps on ``x0_train`` from the checkpoint, using ``lr_inner`` and the
+     same ``inner_grad_clip`` as in training.  Output: parameter dict
+     ``theta_adapt``.
+  4. PyBullet simulation: ``CtrlAviary`` with ``Physics.DYN_OFFSET``.  The NN
+     runs at NN_FREQ Hz and outputs (thrust_u16, roll_deg, pitch_deg,
+     yaw_rate_deg/s); the firmware attitude+rate PIDs run at ATTITUDE_RATE Hz.
 
-Phase B for now: the drone is teleported to ``init_pos`` with zero
-attitude/velocity and the NN takes over immediately — no firmware PID
-takeoff.
+Phase B: the drone starts at ``init_pos`` and the NN takes over immediately.
 
 Usage:
     cd training_MAML
-    python test_maml_pybullet.py --weights maml_linearized_h64_ep500_o2_tm0.pt
-    python test_maml_pybullet.py --weights ... --target-dx 0.02 --target-dy 0.0
+    python test_maml_pybullet.py --weights maml_linearized_h64_o1_n50_ep500.pt \\
+        --target-dx 0.03 --target-dy 0.01 --mass 0.010
 """
 import argparse
 import math
@@ -101,28 +96,16 @@ def obs_to_nn_state(obs: np.ndarray) -> np.ndarray:
 def load_and_adapt(args, device: str):
     """Load checkpoint, rebuild policy, run maml_adapt, return adapted state."""
     ckpt = torch.load(args.weights, map_location=device, weights_only=False)
-    saved_args = ckpt["args"]
-    motor_centers = ckpt["motor_centers"]   # list of (mx, my)
-    target_motor  = int(ckpt["target_motor"])
-    sigma         = float(ckpt["sigma"])
+    saved_args   = ckpt["args"]
     m_extra_train = float(ckpt["m_extra"])
     x0_train      = ckpt["x0_train"].to(device)
 
     # --- Target mass position --------------------------------------
-    motor_xy = motor_centers[target_motor]
-    if args.target_dx is not None:
-        dx = args.target_dx
-    else:
-        dx = motor_xy[0]
-    if args.target_dy is not None:
-        dy = args.target_dy
-    else:
-        dy = motor_xy[1]
+    dx = args.target_dx if args.target_dx is not None else 0.0
+    dy = args.target_dy if args.target_dy is not None else 0.0
     dz = args.target_dz
     m_extra = args.mass if args.mass is not None else m_extra_train
 
-    print(f"[Test] target motor #{target_motor}  centre=({motor_xy[0]*100:+.2f},"
-          f"{motor_xy[1]*100:+.2f})cm  σ_train={sigma*100:.2f}cm")
     print(f"[Test] mass position (dx, dy, dz) = "
           f"({dx*100:+.2f}, {dy*100:+.2f}, {dz*100:+.2f})cm  m={m_extra*1e3:.1f}g")
 
@@ -416,11 +399,11 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--weights', required=True, help='MAML checkpoint (.pt)')
 
-    # target mass override (default = motor centre from checkpoint)
+    # target mass position (required for meaningful adaptation)
     p.add_argument('--target-dx', type=float, default=None,
-                   help='override mass dx [m] (default: target motor centre)')
+                   help='mass offset dx [m] (default: 0.0)')
     p.add_argument('--target-dy', type=float, default=None,
-                   help='override mass dy [m] (default: target motor centre)')
+                   help='mass offset dy [m] (default: 0.0)')
     p.add_argument('--target-dz', type=float, default=0.0,
                    help='mass dz [m]')
     p.add_argument('--mass', type=float, default=None,

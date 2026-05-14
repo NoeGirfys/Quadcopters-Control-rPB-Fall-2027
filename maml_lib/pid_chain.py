@@ -98,7 +98,7 @@ def reset_pid_diverged(pid_state, diverged_mask, hover_rpm):
     m1 = diverged_mask
     zero3 = torch.zeros_like(att_integ)
     zero1 = torch.zeros_like(yaw_sp)
-    h = hover_rpm.to(motor_rpm.device).expand_as(motor_rpm)
+    h = hover_rpm.to(motor_rpm.device).unsqueeze(-1).expand_as(motor_rpm)
     return (
         torch.where(m, zero3, att_integ),
         torch.where(m, zero3, att_prev),
