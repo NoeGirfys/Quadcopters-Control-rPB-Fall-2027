@@ -466,6 +466,125 @@ The quantitative impact of these modelling differences is investigated in the op
 benchmark of Section~\ref{sec:dyn_comparison}.
 
 \subsection{Crazyflie Cascade PID Architecture}\label{sec:cascade_pid}
+
+The control stack embedded in the Crazyflie 2.x firmware~\cite{bitcraze_controllers} is a
+\emph{cascade of four nested PID loops}, illustrated in Figure~\ref{fig:cascade_pid}. The
+cascade structure is the standard solution to the underactuation and time-scale separation of
+the quadcopter: the translational dynamics are slow and indirectly actuated through the
+attitude of the body, while the rotational dynamics are fast and directly actuated by the
+motor thrusts. Each loop is then dedicated to controlling a single physical quantity at the
+bandwidth at which it actually evolves, and provides its inner neighbour with a setpoint.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/Cascaded_PID.png}
+    \caption{Cascade-PID architecture implemented in the Crazyflie firmware. The position
+    and velocity loops run at $100\,\mathrm{Hz}$, the attitude and attitude-rate loops at
+    $500\,\mathrm{Hz}$. Each PID is fed by the state estimator and produces the setpoint
+    for the next inner loop; the rate loop drives the power distribution that converts the
+    desired thrust and body torques into per-motor commands. Reproduced
+    from~\cite{bitcraze_controllers}.}
+    \label{fig:cascade_pid}
+\end{figure}
+
+\subsubsection*{The four loops}
+
+From the outermost to the innermost, the loops carry the following responsibilities.
+
+\begin{enumerate}
+    \item \textbf{Position loop} ($100\,\mathrm{Hz}$). Given the desired position
+    $\mathbf{p}^{\mathrm{sp}} \in \mathbb{R}^3$ and the estimated position
+    $\hat{\mathbf{p}}$, an independent PID on each axis computes a desired velocity in the
+    world frame
+    \begin{equation}
+    \mathbf{v}^{\mathrm{sp}} = \mathrm{PID}_{\mathrm{pos}}\!\left(\mathbf{p}^{\mathrm{sp}}
+    - \hat{\mathbf{p}}\right),
+    \end{equation}
+    with $\mathbf{v}^{\mathrm{sp}}$ clamped to the bounds
+    $|v_x^{\mathrm{sp}}|, |v_y^{\mathrm{sp}}|, |v_z^{\mathrm{sp}}| \le 1\,\mathrm{m/s}$
+    enforced by the firmware.
+    \item \textbf{Velocity loop} ($100\,\mathrm{Hz}$). The estimated velocity
+    $\hat{\mathbf{v}}$ is first rotated into the body frame, and the velocity error is
+    converted by three PIDs into a desired attitude (roll/pitch) and a thrust command:
+    \begin{equation}
+    (\phi^{\mathrm{sp}}, \theta^{\mathrm{sp}}, T) = \mathrm{PID}_{\mathrm{vel}}\!\left(
+    \mathbf{v}^{\mathrm{sp}} - \hat{\mathbf{v}}\right),
+    \end{equation}
+    with $|\phi^{\mathrm{sp}}|, |\theta^{\mathrm{sp}}| \le 20^\circ$ and $T$ expressed as a
+    16-bit PWM-like value centred on a hover baseline. The yaw setpoint $\psi^{\mathrm{sp}}$
+    is independent and either commanded directly or integrated from a yaw-rate command. The
+    fact that the velocity loop produces an \emph{attitude} setpoint rather than a force is
+    a direct consequence of underactuation: lateral motion can only be obtained by tilting
+    the thrust vector.
+    \item \textbf{Attitude loop} ($500\,\mathrm{Hz}$). Three PIDs on the Euler-angle errors
+    produce a desired body-rate vector
+    \begin{equation}
+    \boldsymbol{\omega}_B^{\mathrm{sp}} = \mathrm{PID}_{\mathrm{att}}\!\left(
+    \Phi^{\mathrm{sp}} - \hat{\Phi}\right),
+    \end{equation}
+    where $\Phi^{\mathrm{sp}} = (\phi^{\mathrm{sp}}, \theta^{\mathrm{sp}}, \psi^{\mathrm{sp}})^\top$
+    and $\hat{\Phi}$ is the estimated attitude.
+    \item \textbf{Attitude-rate loop} ($500\,\mathrm{Hz}$). The innermost PID is fed by the
+    raw gyroscope measurements (no estimator in the loop) and produces three signed
+    16-bit control signals
+    \begin{equation}
+    (u_\phi, u_\theta, u_\psi) =
+    \mathrm{PID}_{\mathrm{rate}}\!\left(
+    \boldsymbol{\omega}_B^{\mathrm{sp}} - \boldsymbol{\omega}_B^{\mathrm{meas}}\right),
+    \end{equation}
+    each saturated to the range $[-2^{15}+1,\, 2^{15}-1]$. These outputs play the role of
+    body-frame torque commands -- they are proportional to the desired $\tau_x$, $\tau_y$,
+    $\tau_z$ -- but the firmware keeps them in dimensionless integer units that the power
+    distribution converts directly into per-motor PWM values; the mapping to physical
+    torques in $\mathrm{N\cdot m}$ depends on the motor model and is never made explicit
+    onboard. Using the gyroscope rates directly rather than a filtered estimate is critical
+    for the bandwidth of this loop, which must reject torque disturbances on a millisecond
+    timescale.
+\end{enumerate}
+
+\subsubsection*{Power distribution}
+
+The thrust $T$ produced by the velocity loop and the rate-loop outputs
+$(u_\phi, u_\theta, u_\psi)$ are mapped to per-motor PWM commands $(m_1, m_2, m_3, m_4)$
+by the \emph{power distribution} block. With the Crazyflie motor numbering of
+Figure~\ref{fig:quadcopter} (M1 front-right, M2 back-right, M3 back-left, M4 front-left,
+M1 and M3 clockwise, M2 and M4 counter-clockwise), the firmware uses the linear mixing
+\begin{equation}
+\begin{aligned}
+m_1 &= T - \tfrac{1}{2} u_\phi + \tfrac{1}{2} u_\theta + u_\psi, \\
+m_2 &= T - \tfrac{1}{2} u_\phi - \tfrac{1}{2} u_\theta - u_\psi, \\
+m_3 &= T + \tfrac{1}{2} u_\phi - \tfrac{1}{2} u_\theta + u_\psi, \\
+m_4 &= T + \tfrac{1}{2} u_\phi + \tfrac{1}{2} u_\theta - u_\psi,
+\end{aligned}
+\label{eq:power_distribution}
+\end{equation}
+followed by a global down-shift if any $m_i$ exceeds the $16$-bit range, so that the
+relative attitude commands are preserved at the expense of the absolute thrust level.
+
+\subsubsection*{Time-scale separation and implications for learning}
+
+Running the attitude and attitude-rate loops at $500\,\mathrm{Hz}$ -- five times faster
+than the outer loops -- is what allows them to act as a fast disturbance-rejection layer:
+when a perturbation such as a wind gust or a sudden mass shift tilts the airframe, the
+inner loops can correct the body rates and the attitude on a millisecond timescale, before
+the resulting tilt has had time to integrate into a velocity or a position error that the
+outer loops would need to correct. The whole architecture is therefore well-conditioned to
+reject high-frequency disturbances at the lowest possible level of the cascade.
+
+Two features of this architecture have direct consequences for the design of the
+learning-based controller proposed in Section~\ref{sec:nn_pid_arch}. First, the
+Crazyflie's radio (CRTP) protocol accepts setpoints at \emph{any} level of the cascade --
+position, velocity, attitude, or attitude rate -- but \emph{not} the per-motor PWM values
+nor the rate-loop outputs $(u_\phi, u_\theta, u_\psi)$, which remain confined to the
+onboard microcontroller. This rules out Goffin's approach of directly emitting
+$(F, \tau_x, \tau_y, \tau_z)$ from a neural network: the network has to interface with the
+cascade through one of the allowed setpoint types. Second, the time-scale separation
+between the outer loops ($100\,\mathrm{Hz}$) and the inner loops ($500\,\mathrm{Hz}$)
+makes it natural to replace only the outer two PIDs by a learned controller -- which then
+emits velocity or attitude setpoints at $\sim 100\,\mathrm{Hz}$, well within the CRTP
+bandwidth -- while keeping the inner attitude and rate loops onboard at
+$500\,\mathrm{Hz}$. This architectural choice is detailed in Section~\ref{sec:nn_pid_arch}.
+
 \subsection{Neural Network Control Policy}\label{sec:nn_policy}
 \subsection{Back-Propagation Through Time and Curriculum Reset}\label{sec:bptt}
 \subsection{Model-Agnostic Meta-Learning (MAML)}\label{sec:maml_bg}
@@ -475,7 +594,7 @@ benchmark of Section~\ref{sec:dyn_comparison}.
 \section{Simulation Environment}
 \subsection{gym-pybullet-drones}\label{sec:gym_pybullet}
 \subsection{Dynamics Model Comparison}\label{sec:dyn_comparison}
-\subsection{Crazyflie Firmware Integration}
+\subsection{Crazyflie Firmware Integration}\label{sec:firmware_integration}
 
 % =====================================================
 \newpage
@@ -487,7 +606,7 @@ benchmark of Section~\ref{sec:dyn_comparison}.
 % =====================================================
 \newpage
 \section{Learning Classic Regulation}
-\subsection{NN-PID Hybrid Architecture}
+\subsection{NN-PID Hybrid Architecture}\label{sec:nn_pid_arch}
 \subsection{Training}
 \subsection{Simulation Results}
 \subsection{Real-World Results}
