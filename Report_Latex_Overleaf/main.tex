@@ -227,7 +227,9 @@ with the shorthand $c_\alpha = \cos\alpha$ and $s_\alpha = \sin\alpha$.
     \caption{Quadcopter schematic in the X-configuration adopted in this work. Motors $1$ and
     $3$ rotate counter-clockwise while motors $2$ and $4$ rotate clockwise so that the reaction
     torques cancel in nominal hover. The parameter $l$ denotes the distance between the centre
-    of mass and the axis of a motor.}
+    of mass and the axis of a motor. Adapted from~\cite[Fig.~2.1]{goffin2026} (originally in
+    $+$-configuration) with the motor layout redrawn for the X-configuration used by the
+    Crazyflie.}
     \label{fig:quadcopter}
 \end{figure}
 
@@ -239,13 +241,14 @@ the rotor thrusts differ and are derived below.
 
 \subsubsection*{Translational dynamics}
 
-Let $p = (x, y, z)^\top$ denote the position of the CoM expressed in $\mathcal{W}$. Each rotor
+Let $(x, y, z)^\top$ denote the position of the CoM expressed in $\mathcal{W}$. Each rotor
 $i \in \{1,2,3,4\}$ produces a thrust $F_i = k_t \omega_i^2$ along $z_B$, where $\omega_i$ is
 its angular speed and $k_t$ is the thrust coefficient. Applying Newton's second law in the
 inertial frame yields
 \begin{equation}
-m \ddot{p} = R(\phi,\theta,\psi) \begin{bmatrix} 0 \\ 0 \\ F \end{bmatrix}
-           - \begin{bmatrix} 0 \\ 0 \\ m g \end{bmatrix},
+m \begin{bmatrix} \ddot{x} \\ \ddot{y} \\ \ddot{z} \end{bmatrix}
+   = R(\phi,\theta,\psi) \begin{bmatrix} 0 \\ 0 \\ F \end{bmatrix}
+   - \begin{bmatrix} 0 \\ 0 \\ m g \end{bmatrix},
 \qquad F = \sum_{i=1}^{4} F_i,
 \label{eq:translational}
 \end{equation}
@@ -256,13 +259,14 @@ identical to the one in~\cite{goffin2026} and is independent of the motor layout
 
 A subtle but important point concerns the variable that drives the rotational dynamics.
 Goffin~\cite{goffin2026} writes Euler's rigid-body equation directly in terms of the
-second derivatives of the Euler angles, i.e.\ $\tau_B = J_B \ddot{\Phi} + \dot{\Phi} \times
-(J_B \dot{\Phi})$. This expression is only correct in the small-angle, hover regime; the
-exact form involves the body-frame angular velocity $\omega_B = (p, q, r)^\top$, which is
-\emph{not} equal to $\dot{\Phi}$ in general. For the sake of rigour and because the
-nonlinear simulator used in this work integrates orientation through body rates and a
-quaternion (see Section~\ref{sec:gym_pybullet}), we briefly re-derive the rotational
-equations.
+Euler angle derivatives, i.e.\ $\tau_B = J_B \ddot{\Phi} + \dot{\Phi} \times
+(J_B \dot{\Phi})$, and his code propagates the state $(\phi, \dot\phi, \theta, \dot\theta,
+\psi, \dot\psi)$ accordingly. This expression is only correct in the small-angle, hover
+regime; the exact form involves the body-frame angular velocity $\omega_B = (p, q, r)^\top$,
+which is \emph{not} equal to $\dot{\Phi}$ in general. For the sake of rigour and because the
+nonlinear simulator used in this work integrates orientation through body rates ($\omega_B$) and
+quaternions (see paragraph below and Section~\ref{sec:gym_pybullet}), we briefly re-derive
+the rotational equations.
 
 Let $L$ denote the angular momentum of the rigid body about its CoM. The fundamental
 theorem of angular momentum reads
@@ -350,8 +354,13 @@ I_x \dot{p} &= \tau_{Bx} - (I_z - I_y)\, q r, \label{eq:nl_p}\\
 I_y \dot{q} &= \tau_{By} - (I_x - I_z)\, p r, \label{eq:nl_q}\\
 I_z \dot{r} &= \tau_{Bz} - (I_y - I_x)\, p q, \label{eq:nl_r}
 \end{align}
-completed by the kinematic relation~\eqref{eq:kinematic} that propagates the Euler angles
-from the body rates.
+completed by an orientation kinematic relation that closes the system: either
+$\dot{\Phi} = W(\phi, \theta)^{-1} \omega_B$ from~\eqref{eq:kinematic} when the Euler angles
+are kept in the state vector, or the quaternion propagation law
+$\dot{q} = \tfrac{1}{2}\, q \otimes \begin{bmatrix} 0 \\ \omega_B \end{bmatrix}$ when the
+orientation is represented by a unit quaternion $q$. The latter choice is the one made by
+\texttt{gym-pybullet-drones} in its \texttt{DYN} mode and avoids the singularity of $W$
+at $\theta = \pm\pi/2$.
 
 \subsubsection*{Linearisation about hover}
 
@@ -359,12 +368,13 @@ For control design and for comparison with Goffin's model, the system is lineari
 the hovering equilibrium $\phi \simeq \theta \simeq 0$, $\psi = 0$ (without loss of
 generality), $\omega_B \simeq 0$ and $F_i = m g / 4$. Under the small-angle approximation
 $c_\alpha \simeq 1$, $s_\alpha \simeq \alpha$, the gyroscopic terms in~\eqref{eq:nl_p}--%
-\eqref{eq:nl_r} are quadratic in the angular rates and vanish, and the kinematic
+\eqref{eq:nl_r} are bilinear in the angular rates and therefore second-order in the
+perturbation around $\omega_B = 0$, so they are dropped at first order, and the kinematic
 relation~\eqref{eq:kinematic} reduces to $\omega_B \simeq \dot{\Phi}$. The linearised model
 then reads
 \begin{equation}
-\ddot{x} = g\, \theta, \quad
-\ddot{y} = -g\, \phi, \quad
+\ddot{x} = \frac{F}{m}\, \theta, \quad
+\ddot{y} = -\frac{F}{m}\, \phi, \quad
 \ddot{z} = \frac{F}{m} - g, \quad
 \ddot{\phi} = \frac{\tau_x}{I_x}, \quad
 \ddot{\theta} = \frac{\tau_y}{I_y}, \quad
@@ -399,9 +409,58 @@ relation. Two important remarks must be made on the implementation:
     Euler angles, and degenerates at $\theta = \pm\pi/2$ (gimbal lock).
     \item \texttt{gym-pybullet-drones} (in its \texttt{DYN} mode) propagates the body rates
     $\omega_B$ through~\eqref{eq:euler_components} and integrates the orientation as a unit
-    quaternion to avoid the singularity. Euler angles are recovered only for the state
-    output. This is the physically correct choice and is the one used throughout the
-    remainder of this report.
+    quaternion $q$ to avoid the singularity. The starting point is the standard
+    quaternion kinematics
+    \begin{equation}
+    \dot{q} = \tfrac{1}{2}\, q \otimes \begin{bmatrix} 0 \\ \omega_B \end{bmatrix},
+    \label{eq:quat_kinematics}
+    \end{equation}
+    where $\otimes$ denotes the Hamilton product. Expanding this product to the right by
+    $[0, \omega_B]^\top$ recasts~\eqref{eq:quat_kinematics} as
+    $\dot q = \tfrac{1}{2}\, \Omega(\omega_B)\, q$ with the skew-symmetric matrix
+    \begin{equation}
+    \Omega(\omega_B) = \begin{bmatrix}
+    0  &  r & -q &  p \\
+    -r &  0 &  p &  q \\
+    q  & -p &  0 &  r \\
+    -p & -q & -r &  0
+    \end{bmatrix}.
+    \label{eq:Omega}
+    \end{equation}
+    Because $\Omega^2 = -\|\omega_B\|^2 I_4$, the exact solution for $\omega_B$ constant
+    over a sampling period $T_s$ is given by the Rodrigues-like closed form
+    \begin{equation}
+    q_{k+1} = \left( \cos\vartheta \, I_4 + \frac{\sin\vartheta}{\|\omega_B\|}\, \Omega(\omega_B) \right) q_k,
+    \qquad \vartheta = \tfrac{T_s}{2}\|\omega_B\|,
+    \label{eq:quat_update}
+    \end{equation}
+    which is precisely the formula implemented in \texttt{\_integrateQ} (a factor $2$
+    appears explicitly in the source code to cancel the $\tfrac{1}{2}$ absorbed in the
+    local variable \texttt{lambda\_}$\, = \tfrac{1}{2}\Omega(\omega_B)$). The Euler angles
+    are then recovered solely for the state output via \texttt{getEulerFromQuaternion}.
+    A close inspection of the source code is required to confirm that this is the chosen
+    convention, because the variable holding the angular velocity is misleadingly named
+    \texttt{rpy\_rates}: despite the name, the gyroscopic coupling
+    \texttt{cross(rpy\_rates, J\,@\,rpy\_rates)}, the use
+    of~\eqref{eq:quat_update}, and the fact that the variable is rotated by $R$ before
+    being passed to PyBullet as a world-frame angular velocity, all unambiguously identify
+    it as $\omega_B = (p, q, r)^\top$ and not as $\dot{\Phi}$. The quaternion
+    kinematics~\eqref{eq:quat_kinematics} itself is only consistent with body rates,
+    since the angular velocity that drives $\dot q$ must be expressed in the body frame,
+    not as Euler angle derivatives. Finally, the time integration in
+    \texttt{gym-pybullet-drones} is not a plain forward Euler scheme but the
+    \emph{semi-implicit} (or symplectic) variant: the linear and angular velocities are
+    updated first, and the position and quaternion are then integrated using the
+    \emph{new} velocities, i.e.\
+    \begin{equation*}
+    \mathbf{v}_{k+1} = \mathbf{v}_k + T_s\, \mathbf{a}_k, \qquad
+    \mathbf{x}_{k+1} = \mathbf{x}_k + T_s\, \mathbf{v}_{k+1},
+    \end{equation*}
+    and analogously for $(\omega_B, q)$. This scheme is known to preserve energy on long
+    horizons for conservative rigid-body systems much better than the explicit Euler
+    discretisation~\eqref{eq:euler_discretization}. This is the physically correct choice
+    and is the one used throughout the remainder of this report. TODO WHEN BEGINNING SECTIONS
+    USING CODE: CHECK THAT INDEED WE USED THIS AND CHANGE THE SENTENCE IF NOT
 \end{enumerate}
 The quantitative impact of these modelling differences is investigated in the open-loop
 benchmark of Section~\ref{sec:dyn_comparison}.
