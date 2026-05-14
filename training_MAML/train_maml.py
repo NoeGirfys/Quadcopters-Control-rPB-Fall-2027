@@ -359,6 +359,9 @@ def main():
                   f">= --epochs {args.epochs}; nothing to do. "
                   f"Pass --epochs > {done} to extend.")
 
+    start_epoch = (len(resume_state["history"].get("epoch", []))
+                   if resume_state is not None else 0)
+
     policy, history = meta_train(
         policy, training_tasks, x0_train, x0_eval,
         dynamics_step=DYNAMICS[args.dynamics],
@@ -389,11 +392,21 @@ def main():
     # to the optimizer/RNG objects from this scope and would break
     # resume-ability of the final file).
     actual_epochs = len(history["epoch"])
+    newly_trained = actual_epochs - start_epoch
+
+    if newly_trained == 0:
+        # Nothing was trained (e.g. --epochs <= already done). Never touch
+        # the existing checkpoint: the fallback save_checkpoint call below
+        # would strip the optimizer/RNG state and break future resumes.
+        print("[Info] No new epochs trained; existing checkpoint unchanged.")
+        print("Done.")
+        return
+
     final_ckpt = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}.pt")
     final_map  = os.path.join(out_dir, f"{base_no_ep}_ep{actual_epochs}_map.png")
     if os.path.exists(working_ckpt):
         os.replace(working_ckpt, final_ckpt)
-    elif actual_epochs > 0:
+    else:
         # Defensive fallback: no working file (shouldn't happen) — save
         # what we can (policy + history) without resume state.
         save_checkpoint(policy, history, final_ckpt)
