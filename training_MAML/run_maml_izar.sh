@@ -32,7 +32,6 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.c
 # Ajout de 'srun' devant python
 
 srun python training_MAML/train_maml.py \
-    --resume training_MAML/maml_linearized_h64_o1_tm0_izar_fomaml_ep100.pt \
     --dynamics linearized \
     --maml-order 1 \
     --epochs 500 \
