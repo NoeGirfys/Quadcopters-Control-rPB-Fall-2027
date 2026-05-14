@@ -8,6 +8,7 @@
 \usepackage{setspace}
 \usepackage{microtype}
 \usepackage{amsmath,amssymb,amsthm,mathtools}
+\setcounter{MaxMatrixCols}{20}
 \usepackage{bm}
 \usepackage{physics}
 \usepackage{graphicx}
@@ -184,17 +185,237 @@ on actual hardware. The contributions are as follows.
 % =====================================================
 \newpage
 \section{Background}
-\subsection{Quadcopter Dynamics}
-\subsection{Crazyflie Cascade PID Architecture}
-\subsection{Neural Network Control Policy}
-\subsection{Back-Propagation Through Time and Curriculum Reset}
-\subsection{Model-Agnostic Meta-Learning (MAML)}
+
+This chapter introduces the theoretical material on which the rest of the project relies.
+Section~\ref{sec:dynamics} derives the rigid-body dynamics of the quadcopter and contrasts the
+modelling choices made by Goffin~\cite{goffin2026} with those embedded in
+\texttt{gym-pybullet-drones}~\cite{panerati2021}. Section~\ref{sec:cascade_pid} describes the
+cascade-PID architecture implemented in the Crazyflie firmware, which the simulator must
+replicate in order to be faithful to the real platform. Sections~\ref{sec:nn_policy}
+and~\ref{sec:bptt} review the neural network control policy and the back-propagation through
+time procedure used to train it, including the curriculum reset scheme adopted in this work.
+Finally, Section~\ref{sec:maml_bg} recalls the Model-Agnostic Meta-Learning (MAML)
+algorithm~\cite{finn2017maml} that will later be specialised to the offset mass adaptation
+problem.
+
+\subsection{Quadcopter Dynamics}\label{sec:dynamics}
+
+\subsubsection*{Reference frames}
+
+Two right-handed reference frames are used throughout the report and are illustrated in
+Figure~\ref{fig:quadcopter}. The inertial (world) frame $\mathcal{W} = (x_I, y_I, z_I)$ is
+fixed to the ground, with $z_I$ pointing upwards. The body frame
+$\mathcal{B} = (x_B, y_B, z_B)$ is attached to the centre of mass (CoM) of the quadcopter,
+with $x_B$ pointing forward, $y_B$ to the left and $z_B$ aligned with the thrust direction.
+The orientation of $\mathcal{B}$ with respect to $\mathcal{W}$ is parameterised by the
+ZYX Euler angles $\Phi = (\phi, \theta, \psi)^\top$ (roll, pitch, yaw), and the corresponding
+rotation matrix that maps body coordinates to world coordinates reads
+\begin{equation}
+R(\phi,\theta,\psi) =
+\begin{bmatrix}
+c_\theta c_\psi & s_\phi s_\theta c_\psi - c_\phi s_\psi & c_\phi s_\theta c_\psi + s_\phi s_\psi \\
+c_\theta s_\psi & s_\phi s_\theta s_\psi + c_\phi c_\psi & c_\phi s_\theta s_\psi - s_\phi c_\psi \\
+-s_\theta      & s_\phi c_\theta                          & c_\phi c_\theta
+\end{bmatrix},
+\label{eq:rotation}
+\end{equation}
+with the shorthand $c_\alpha = \cos\alpha$ and $s_\alpha = \sin\alpha$.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.55\textwidth]{images/Quadcopter_Picture.png}
+    \caption{Quadcopter schematic in the X-configuration adopted in this work. Motors $1$ and
+    $3$ rotate counter-clockwise while motors $2$ and $4$ rotate clockwise so that the reaction
+    torques cancel in nominal hover. The parameter $l$ denotes the distance between the centre
+    of mass and the axis of a motor.}
+    \label{fig:quadcopter}
+\end{figure}
+
+Compared to the $+$-configuration used by Goffin~\cite{goffin2026}, in which the motors are
+aligned with the $x_B$ and $y_B$ axes, the X-configuration places the motors at $45^\circ$
+from these axes, which is the standard Bitcraze layout for the Crazyflie. The translational
+dynamics are unaffected by this choice, but the expressions of the body torques in terms of
+the rotor thrusts differ and are derived below.
+
+\subsubsection*{Translational dynamics}
+
+Let $p = (x, y, z)^\top$ denote the position of the CoM expressed in $\mathcal{W}$. Each rotor
+$i \in \{1,2,3,4\}$ produces a thrust $F_i = k_t \omega_i^2$ along $z_B$, where $\omega_i$ is
+its angular speed and $k_t$ is the thrust coefficient. Applying Newton's second law in the
+inertial frame yields
+\begin{equation}
+m \ddot{p} = R(\phi,\theta,\psi) \begin{bmatrix} 0 \\ 0 \\ F \end{bmatrix}
+           - \begin{bmatrix} 0 \\ 0 \\ m g \end{bmatrix},
+\qquad F = \sum_{i=1}^{4} F_i,
+\label{eq:translational}
+\end{equation}
+where $m$ is the total mass and $g$ the gravitational acceleration. This expression is
+identical to the one in~\cite{goffin2026} and is independent of the motor layout.
+
+\subsubsection*{Rotational dynamics: body rates vs Euler angle derivatives}
+
+A subtle but important point concerns the variable that drives the rotational dynamics.
+Goffin~\cite{goffin2026} writes Euler's rigid-body equation directly in terms of the
+second derivatives of the Euler angles, i.e.\ $\tau_B = J_B \ddot{\Phi} + \dot{\Phi} \times
+(J_B \dot{\Phi})$. This expression is only correct in the small-angle, hover regime; the
+exact form involves the body-frame angular velocity $\omega_B = (p, q, r)^\top$, which is
+\emph{not} equal to $\dot{\Phi}$ in general. For the sake of rigour and because the
+nonlinear simulator used in this work integrates orientation through body rates and a
+quaternion (see Section~\ref{sec:gym_pybullet}), we briefly re-derive the rotational
+equations.
+
+Let $L$ denote the angular momentum of the rigid body about its CoM. The fundamental
+theorem of angular momentum reads
+\begin{equation}
+\tau = \left(\tfrac{d}{dt}\right)_{\!W} L,
+\label{eq:fundamental_momentum}
+\end{equation}
+where $\tau$ is the resultant external torque and $\left(\tfrac{d}{dt}\right)_{W}$ denotes
+the time derivative seen by a stationary observer in $\mathcal{W}$. Although $L$ is intrinsic
+to the body, its coordinate representation depends on the frame. Expressing it in
+$\mathcal{B}$ gives $L_B = J_B \omega_B$ with $J_B = \mathrm{diag}(I_x, I_y, I_z)$ owing to
+the symmetry of the quadcopter. Crucially, the inertia tensor expressed in the \emph{world}
+frame depends on the current orientation and is therefore time-varying, so one cannot simply
+differentiate $J \omega$ in $\mathcal{W}$. The standard remedy is to apply the
+transport theorem
+\begin{equation}
+\left(\tfrac{d}{dt}\right)_{\!W} v = \left(\tfrac{d}{dt}\right)_{\!B} v + \omega \times v,
+\end{equation}
+valid for any vector $v$, to the angular momentum $L$:
+\begin{equation}
+\tau_B = \left(\tfrac{d}{dt}\right)_{\!B} L_B + \omega_B \times L_B
+       = J_B \dot{\omega}_B + \omega_B \times (J_B \omega_B),
+\label{eq:euler_body}
+\end{equation}
+where the last equality follows from $\left(\tfrac{d}{dt}\right)_{\!B} J_B = 0$. Componentwise,
+with $\omega_B = (p, q, r)^\top$,
+\begin{equation}
+\begin{bmatrix} \tau_{Bx} \\ \tau_{By} \\ \tau_{Bz} \end{bmatrix}
+=
+\begin{bmatrix} I_x \dot{p} + (I_z - I_y)\, q r \\
+                I_y \dot{q} + (I_x - I_z)\, p r \\
+                I_z \dot{r} + (I_y - I_x)\, p q \end{bmatrix}.
+\label{eq:euler_components}
+\end{equation}
+
+The body rates $(p, q, r)$ and the Euler angle derivatives $(\dot\phi, \dot\theta, \dot\psi)$
+are related by the well-known kinematic transformation~\cite{goffin2026}
+\begin{equation}
+\omega_B = W(\phi, \theta) \dot{\Phi}, \qquad
+W(\phi, \theta) =
+\begin{bmatrix}
+1 & 0          & -s_\theta \\
+0 & c_\phi     & s_\phi c_\theta \\
+0 & -s_\phi    & c_\phi c_\theta
+\end{bmatrix}.
+\label{eq:kinematic}
+\end{equation}
+Note that $W(0,0) = I_3$, so that $\omega_B \simeq \dot{\Phi}$ and
+$\dot{\omega}_B \simeq \ddot{\Phi}$ near hover. This explains why Goffin's formulation
+remains accurate in nominal flight even though it neglects the distinction between body
+rates and Euler angle derivatives, and why the resulting \emph{linearised} model coincides
+with the one obtained from~\eqref{eq:euler_components}. Outside of the hover regime the
+distinction becomes non-negligible; \texttt{gym-pybullet-drones}, used as the simulation
+backend in this project, propagates $\omega_B$ directly and integrates the orientation
+through a quaternion (see Section~\ref{sec:gym_pybullet}). The empirical agreement between
+the two formulations is quantified in the open-loop comparison of
+Section~\ref{sec:dyn_comparison}.
+
+\subsubsection*{Motor mixing in X-configuration}
+
+In the X-configuration of Figure~\ref{fig:quadcopter}, the four motors are placed at
+$(\pm l/\sqrt{2}, \pm l/\sqrt{2}, 0)$ in $\mathcal{B}$ and each produces a thrust $F_i$
+along $z_B$. Computing $r_i \times (F_i \hat z_B)$ for each motor and summing yields
+\begin{align}
+\tau_{Bx} &= \frac{l}{\sqrt{2}} \left( -F_1 - F_2 + F_3 + F_4 \right), \label{eq:taux_X}\\
+\tau_{By} &= \frac{l}{\sqrt{2}} \left( -F_1 + F_2 + F_3 - F_4 \right), \label{eq:tauy_X}\\
+\tau_{Bz} &= \frac{k_d}{k_t} \left( F_1 - F_2 + F_3 - F_4 \right), \label{eq:tauz_X}
+\end{align}
+where $k_d$ is the rotor drag coefficient and the yaw torque~\eqref{eq:tauz_X} accounts
+for the alternating direction of rotation of the rotors. The corresponding expressions
+in~\cite{goffin2026} for the $+$-configuration involve only two motors per axis
+(see equations (2.2)--(2.4) therein); the X-configuration distributes the moment over the
+four rotors, which improves actuator authority and is the convention used by the Crazyflie
+firmware.
+
+\subsubsection*{Nonlinear continuous-time model}
+
+Combining~\eqref{eq:translational}, \eqref{eq:euler_components}
+and~\eqref{eq:taux_X}--\eqref{eq:tauz_X} yields the full nonlinear model
+\begin{align}
+m \ddot{x} &= F \left( c_\phi s_\theta c_\psi + s_\phi s_\psi \right), \label{eq:nl_x}\\
+m \ddot{y} &= F \left( c_\phi s_\theta s_\psi - s_\phi c_\psi \right), \label{eq:nl_y}\\
+m \ddot{z} &= F\, c_\phi c_\theta - m g, \label{eq:nl_z}\\
+I_x \dot{p} &= \tau_{Bx} - (I_z - I_y)\, q r, \label{eq:nl_p}\\
+I_y \dot{q} &= \tau_{By} - (I_x - I_z)\, p r, \label{eq:nl_q}\\
+I_z \dot{r} &= \tau_{Bz} - (I_y - I_x)\, p q, \label{eq:nl_r}
+\end{align}
+completed by the kinematic relation~\eqref{eq:kinematic} that propagates the Euler angles
+from the body rates.
+
+\subsubsection*{Linearisation about hover}
+
+For control design and for comparison with Goffin's model, the system is linearised about
+the hovering equilibrium $\phi \simeq \theta \simeq 0$, $\psi = 0$ (without loss of
+generality), $\omega_B \simeq 0$ and $F_i = m g / 4$. Under the small-angle approximation
+$c_\alpha \simeq 1$, $s_\alpha \simeq \alpha$, the gyroscopic terms in~\eqref{eq:nl_p}--%
+\eqref{eq:nl_r} are quadratic in the angular rates and vanish, and the kinematic
+relation~\eqref{eq:kinematic} reduces to $\omega_B \simeq \dot{\Phi}$. The linearised model
+then reads
+\begin{equation}
+\ddot{x} = g\, \theta, \quad
+\ddot{y} = -g\, \phi, \quad
+\ddot{z} = \frac{F}{m} - g, \quad
+\ddot{\phi} = \frac{\tau_x}{I_x}, \quad
+\ddot{\theta} = \frac{\tau_y}{I_y}, \quad
+\ddot{\psi} = \frac{\tau_z}{I_z},
+\label{eq:linearized}
+\end{equation}
+which matches~\cite[Eqs.~(2.13)--(2.18)]{goffin2026} up to the sign of the $\ddot y$ equation
+that flips because of the left-handed vs.\ right-handed convention on the $y_B$ axis. The
+12-dimensional state vector
+\begin{equation}
+\mathbf{x} = \begin{bmatrix} x & \dot{x} & y & \dot{y} & z & \dot{z} &
+                              \phi & \dot{\phi} & \theta & \dot{\theta} &
+                              \psi & \dot{\psi} \end{bmatrix}^\top
+\end{equation}
+and the control input $\mathbf{u} = (F, \tau_x, \tau_y, \tau_z)^\top$ are kept as
+in~\cite{goffin2026} for consistency.
+
+\subsubsection*{Discretisation and link to the simulator}
+
+For training and simulation the continuous-time dynamics are integrated with a forward
+Euler scheme of step $T_s$:
+\begin{equation}
+\mathbf{x}_{k+1} = \mathbf{x}_k + T_s\, f(\mathbf{x}_k, \mathbf{u}_k),
+\label{eq:euler_discretization}
+\end{equation}
+where $f(\cdot)$ collects~\eqref{eq:nl_x}--\eqref{eq:nl_r} together with the kinematic
+relation. Two important remarks must be made on the implementation:
+\begin{enumerate}
+    \item Goffin's simulator integrates the orientation directly through Euler angles, which
+    is equivalent to assuming $\omega_B \equiv \dot{\Phi}$. This shortcut is valid in
+    near-hover regimes but introduces an error that grows with the magnitude of the
+    Euler angles, and degenerates at $\theta = \pm\pi/2$ (gimbal lock).
+    \item \texttt{gym-pybullet-drones} (in its \texttt{DYN} mode) propagates the body rates
+    $\omega_B$ through~\eqref{eq:euler_components} and integrates the orientation as a unit
+    quaternion to avoid the singularity. Euler angles are recovered only for the state
+    output. This is the physically correct choice and is the one used throughout the
+    remainder of this report.
+\end{enumerate}
+The quantitative impact of these modelling differences is investigated in the open-loop
+benchmark of Section~\ref{sec:dyn_comparison}.
+
+\subsection{Crazyflie Cascade PID Architecture}\label{sec:cascade_pid}
+\subsection{Neural Network Control Policy}\label{sec:nn_policy}
+\subsection{Back-Propagation Through Time and Curriculum Reset}\label{sec:bptt}
+\subsection{Model-Agnostic Meta-Learning (MAML)}\label{sec:maml_bg}
 
 % =====================================================
 \newpage
 \section{Simulation Environment}
-\subsection{gym-pybullet-drones}
-\subsection{Dynamics Model Comparison}
+\subsection{gym-pybullet-drones}\label{sec:gym_pybullet}
+\subsection{Dynamics Model Comparison}\label{sec:dyn_comparison}
 \subsection{Crazyflie Firmware Integration}
 
 % =====================================================
