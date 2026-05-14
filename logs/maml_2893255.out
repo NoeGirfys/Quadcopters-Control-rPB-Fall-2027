@@ -1,0 +1,17 @@
+Job ID      : 2893255
+Node        : i34
+PyTorch: 2.5.1+cu121 | CUDA: True | device: Tesla V100-PCIE-32GB
+[Device] cuda
+[Config] dynamics=linearized  maml_order=2
+[Config] epochs=2  n_inner_steps=5
+[Config] lr_outer=0.001  lr_inner=0.05
+[Config] hover thrust (baseline) ≈ 36126
+[Config] n_steps_per_rollout=200 (2.0s @ 100Hz)
+[Tasks]  3 training motors [1, 2, 3], target = motor #0  σ=0.50cm  m=10g
+[x0]    n_train=256  n_eval=128  cube ±0.3m (hover)
+[Policy] hover thrust (M_total=37.0g) ≈ 49506  (baseline was 36126)
+  [ep    1/2] meta=6.4010e+02  inner_pre=6.8630e+02  outer=6.4010e+02
+  [ep    2/2] meta=6.3904e+02  inner_pre=7.3452e+02  outer=6.3904e+02
+[Saved] /home/rigaud/Semester_Project_Drone_MAML/training_MAML/maml_linearized_h64_o2_tm0_izar_v1_ep2.pt
+[Saved] /home/rigaud/Semester_Project_Drone_MAML/training_MAML/maml_linearized_h64_o2_tm0_izar_v1_ep2_map.png
+Done.

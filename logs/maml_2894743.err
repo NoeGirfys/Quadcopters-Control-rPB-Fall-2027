@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 414, in <module>
+    main()
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 343, in main
+    raise RuntimeError(
+RuntimeError: Cannot resume from training_MAML/maml_linearized_h64_o1_tm0_izar_fomaml_ep100.pt: missing keys ['optimizer_state', 'np_rng_state', 'torch_gen_state']. This checkpoint was saved by an older version of train_maml.py. Re-train from scratch.
+srun: error: i53: task 0: Exited with exit code 1
+srun: Terminating StepId=2894743.0

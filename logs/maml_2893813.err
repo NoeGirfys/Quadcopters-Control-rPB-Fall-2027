@@ -1,0 +1,19 @@
+usage: train_maml.py [-h] [--resume RESUME] [--epochs EPOCHS]
+                     [--lr-outer LR_OUTER] [--lr-inner LR_INNER]
+                     [--n-inner-steps N_INNER_STEPS] [--maml-order {1,2}]
+                     [--hidden HIDDEN] [--n-x0-train N_X0_TRAIN]
+                     [--n-x0-eval N_X0_EVAL] [--half-side HALF_SIDE]
+                     [--t-sim T_SIM] [--tau-div TAU_DIV]
+                     [--obs-noise-scale OBS_NOISE_SCALE]
+                     [--terminal-weight TERMINAL_WEIGHT]
+                     [--pos-weight POS_WEIGHT] [--z-weight Z_WEIGHT]
+                     [--inner-grad-clip INNER_GRAD_CLIP]
+                     [--dynamics {nonlinear,linearized}] [--mass MASS]
+                     [--sigma SIGMA] [--target-motor {0,1,2,3}]
+                     [--plot-every PLOT_EVERY] [--seed SEED] [--tag TAG]
+                     [--verbose-every VERBOSE_EVERY]
+train_maml.py: error: unrecognized arguments:  
+srun: error: i07: task 0: Exited with exit code 2
+srun: Terminating StepId=2893813.0
+/var/spool/slurmd/job2893813/slurm_script: line 37: --epochs: command not found
+/var/spool/slurmd/job2893813/slurm_script: line 39: --lr-inner: command not found

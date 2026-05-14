@@ -1,0 +1,3 @@
+Job ID      : 2893813
+Node        : i07
+PyTorch: 2.5.1+cu121 | CUDA: True | device: Tesla V100-PCIE-32GB

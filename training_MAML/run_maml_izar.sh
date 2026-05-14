@@ -5,10 +5,10 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour le dataloader / numpy / PyBullet
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=08:00:00          # Temps max autorisé
+#SBATCH --time=01:00:00          # Temps max autorisé
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
-#SBATCH --signal=B:TERM:600      # envoie SIGTERM 600s avant la fin du job
+#SBATCH --signal=B:TERM@600      # envoie SIGTERM 600s avant la fin du job
 
 # --- Créer le dossier de logs s'il n'existe pas encore ----------------
 mkdir -p logs
@@ -30,18 +30,20 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.c
 
 # --- Lancement de l'entraînement --------------------------------------
 # Ajout de 'srun' devant python
+
 srun python training_MAML/train_maml.py \
+    --resume training_MAML/maml_linearized_h64_o1_tm0_izar_fomaml_ep100.pt \
     --dynamics linearized \
-    --maml-order 2 \
+    --maml-order 1 \
     --epochs 500 \
-    --lr-outer 1e-3 \
+    --lr-outer 3e-4 \
     --lr-inner 0.05 \
     --n-inner-steps 5 \
     --n-x0-train 256 \
     --n-x0-eval 128 \
-    --obs-noise-scale 0 \
+    --obs-noise-scale 1 \
     --tau-div 1.0 \
     --t-sim 2.0 \
     --plot-every 25 \
     --seed 42 \
-    --tag izar_v1
+    --tag izar_fomaml
