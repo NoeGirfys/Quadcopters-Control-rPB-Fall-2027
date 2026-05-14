@@ -30,6 +30,51 @@ from typing import Callable, List
 
 import numpy as np
 import torch
+
+
+def _restore_torch_gen(device: str, state, seed: int) -> torch.Generator:
+    """Rebuild a torch.Generator on ``device`` from a saved state.
+
+    Saved states are CPU ByteTensors. ``Generator.set_state`` is strict about
+    device/size, so if the saved state was produced for a different device
+    (e.g. checkpoint trained on CPU, resume on CUDA, or vice-versa), the call
+    fails. In that case fall back to re-seeding deterministically so training
+    can still resume without crashing.
+    """
+    gen = torch.Generator(device=device)
+    try:
+        if state is not None:
+            gen.set_state(state.cpu().to(torch.uint8))
+        else:
+            gen.manual_seed(seed)
+    except (RuntimeError, TypeError) as e:
+        print(f"[Resume] could not restore torch.Generator state "
+              f"({e.__class__.__name__}: {e}); reseeding with {seed}.")
+        gen.manual_seed(seed)
+    return gen
+
+
+def _restore_global_rng(resume_state: dict, seed: int) -> None:
+    """Restore torch CPU / CUDA RNG, falling back to manual_seed on mismatch."""
+    cpu_state = resume_state.get("torch_rng_state", None)
+    if cpu_state is not None:
+        try:
+            torch.set_rng_state(cpu_state.cpu().to(torch.uint8))
+        except (RuntimeError, TypeError) as e:
+            print(f"[Resume] could not restore torch CPU RNG state "
+                  f"({e.__class__.__name__}: {e}); reseeding with {seed}.")
+            torch.manual_seed(seed)
+    else:
+        torch.manual_seed(seed)
+
+    if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
+        try:
+            torch.cuda.set_rng_state(
+                resume_state["torch_cuda_rng_state"].cpu().to(torch.uint8))
+        except (RuntimeError, TypeError) as e:
+            print(f"[Resume] could not restore torch CUDA RNG state "
+                  f"({e.__class__.__name__}: {e}); reseeding with {seed}.")
+            torch.cuda.manual_seed_all(seed)
 try:
     from torch.func import functional_call
 except ImportError:
@@ -118,11 +163,9 @@ def meta_train(
         history = {"epoch": [], "meta_loss": [], "inner_pre": [], "outer_loss": []}
         start_epoch = 0
     else:
-        torch.set_rng_state(resume_state["torch_rng_state"].cpu())
-        if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
-            torch.cuda.set_rng_state(resume_state["torch_cuda_rng_state"].cpu())
-        torch_gen = torch.Generator(device=device)
-        torch_gen.set_state(resume_state["torch_gen_state"].cpu())
+        _restore_global_rng(resume_state, seed)
+        torch_gen = _restore_torch_gen(
+            device, resume_state.get("torch_gen_state", None), seed)
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
         for k, v in [("epoch", []), ("meta_loss", []),
@@ -288,11 +331,9 @@ def baseline_train(
         history = {"epoch": [], "train_loss": [], "eval_loss": []}
         start_epoch = 0
     else:
-        torch.set_rng_state(resume_state["torch_rng_state"].cpu())
-        if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
-            torch.cuda.set_rng_state(resume_state["torch_cuda_rng_state"].cpu())
-        torch_gen = torch.Generator(device=device)
-        torch_gen.set_state(resume_state["torch_gen_state"].cpu())
+        _restore_global_rng(resume_state, seed)
+        torch_gen = _restore_torch_gen(
+            device, resume_state.get("torch_gen_state", None), seed)
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
         for k, v in [("epoch", []), ("train_loss", []), ("eval_loss", [])]:

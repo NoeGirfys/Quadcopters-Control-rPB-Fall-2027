@@ -32,9 +32,7 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.c
 srun python training_MAML/train_maml.py \
     --dynamics linearized \
     --maml-order 1 \
-    --maml-order 1 \
     --epochs 500 \
-    --lr-outer 3e-4 \
     --lr-outer 3e-4 \
     --lr-inner 0.05 \
     --n-inner-steps 1 \
@@ -44,10 +42,10 @@ srun python training_MAML/train_maml.py \
     --z-min  -0.01 \
     --z-max   0.01 \
     --mass 0.010 \
-    --n-x0-train 64 \
-    --n-x0-eval  32 \
+    --n-x0-train 128 \
+    --n-x0-eval  64 \
     --obs-noise-scale 1.0 \
     --tau-div 1.0 \
     --t-sim 2.0 \
     --seed 42 \
-    --tag izar_v1
+    --tag izar_uniform_tasks
