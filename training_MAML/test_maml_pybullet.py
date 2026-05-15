@@ -18,6 +18,11 @@ Usage:
     cd training_MAML
     python test_maml_pybullet.py --weights maml_linearized_h64_o1_n50_ep500.pt \\
         --target-dx 0.03 --target-dy 0.01 --mass 0.010
+
+    # Testing a baseline checkpoint: it stores no adaptation hyperparameters,
+    # so borrow n_inner_steps / lr_inner / inner_grad_clip from a MAML run.
+    python test_maml_pybullet.py --weights baseline_linearized_h64_n50_ep500.pt \\
+        --maml-ckpt maml_linearized_h64_o1_n50_ep500.pt --target-dx 0.03
 """
 import argparse
 import math
@@ -119,13 +124,33 @@ def load_and_adapt(args, device: str):
     policy.load_state_dict(ckpt["state_dict"])
 
     # --- Few-shot adaptation ---------------------------------------
+    # MAML checkpoints store the adaptation hyperparameters (n_inner_steps,
+    # lr_inner, inner_grad_clip); baseline checkpoints do not. When --weights
+    # is a baseline checkpoint, --maml-ckpt points at a MAML run to source
+    # those settings, so the baseline is adapted exactly like MAML at test.
+    if args.maml_ckpt is not None:
+        adapt_src = torch.load(args.maml_ckpt, map_location="cpu",
+                               weights_only=False).get("args", {})
+        print(f"[Adapt] adaptation hyperparameters sourced from {args.maml_ckpt}")
+    else:
+        adapt_src = saved_args
+
+    if "n_inner_steps" not in adapt_src and args.n_inner_steps is None:
+        raise SystemExit(
+            "[Error] the --weights checkpoint has no 'n_inner_steps' (likely a "
+            "baseline checkpoint). Pass --maml-ckpt <maml.pt> or --n-inner-steps.")
+    if "lr_inner" not in adapt_src and args.lr_inner is None:
+        raise SystemExit(
+            "[Error] the --weights checkpoint has no 'lr_inner' (likely a "
+            "baseline checkpoint). Pass --maml-ckpt <maml.pt> or --lr-inner.")
+
     n_inner = (args.n_inner_steps
                if args.n_inner_steps is not None
-               else int(saved_args["n_inner_steps"]))
+               else int(adapt_src["n_inner_steps"]))
     lr_inner = (args.lr_inner
                 if args.lr_inner is not None
-                else float(saved_args["lr_inner"]))
-    inner_clip = float(saved_args.get("inner_grad_clip", 1.0))
+                else float(adapt_src["lr_inner"]))
+    inner_clip = float(adapt_src.get("inner_grad_clip", 1.0))
     pos_w  = float(saved_args.get("pos_weight", 10.0))
     z_w    = float(saved_args.get("z_weight", 1.0))
     term_w = float(saved_args.get("terminal_weight", 50.0))
@@ -412,6 +437,11 @@ def parse_args():
     # adaptation overrides (default = checkpoint values)
     p.add_argument('--n-inner-steps', type=int, default=None)
     p.add_argument('--lr-inner', type=float, default=None)
+    p.add_argument('--maml-ckpt', type=str, default=None,
+                   help='MAML checkpoint to source the adaptation '
+                        'hyperparameters (n_inner_steps, lr_inner, '
+                        'inner_grad_clip) from. Use when --weights is a '
+                        'baseline checkpoint, which stores none of them.')
 
     # sim setup
     p.add_argument('--target-pos', nargs=3, type=float, default=[0.0, 0.0, 1.0],
