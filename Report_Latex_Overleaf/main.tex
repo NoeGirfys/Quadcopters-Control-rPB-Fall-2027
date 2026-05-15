@@ -586,6 +586,98 @@ bandwidth -- while keeping the inner attitude and rate loops onboard at
 $500\,\mathrm{Hz}$. This architectural choice is detailed in Section~\ref{sec:nn_pid_arch}.
 
 \subsection{Neural Network Control Policy}\label{sec:nn_policy}
+
+Following Goffin~\cite{goffin2026}, the controller synthesised in this project is a
+feedforward neural network --- a multilayer perceptron (MLP) --- used as a deterministic
+state-feedback policy. Writing $\pi_\theta$ for the network with trainable parameters
+$\theta$, the policy maps an observation $\mathbf{o}_k$ of the drone state at discrete
+time $k$ to an action $\mathbf{a}_k$,
+\begin{equation}
+\mathbf{a}_k = \pi_\theta(\mathbf{o}_k).
+\label{eq:policy}
+\end{equation}
+The network is queried at the $100\,\mathrm{Hz}$ rate of the outer cascade loops
+(Section~\ref{sec:cascade_pid}). Its internal architecture --- the number and width of
+the hidden layers and the output activations --- is described together with the training
+procedure in Section~\ref{sec:nn_pid_arch}. The present section only fixes \emph{what the
+network observes} and \emph{what it commands}, as these two choices are where this work
+departs most clearly from~\cite{goffin2026}.
+
+\subsubsection*{Observation}
+
+The observation passed to the policy is the $12$-dimensional rigid-body state introduced
+in Section~\ref{sec:dynamics},
+\begin{equation}
+\mathbf{o}_k = \big(\,
+\underbrace{x,\;y,\;z}_{\text{position}},\;\;
+\underbrace{v_x,\;v_y,\;v_z}_{\text{velocity}},\;\;
+\underbrace{\phi,\;\theta,\;\psi}_{\text{attitude}},\;\;
+\underbrace{p,\;q,\;r}_{\text{body rates}}
+\,\big),
+\label{eq:observation}
+\end{equation}
+augmented with the regulation error $\mathbf{p}^{\mathrm{sp}} - \hat{\mathbf{p}}$ between
+the desired and estimated positions, which is what allows a single trained policy to be
+retargeted to an arbitrary setpoint (Section~\ref{sec:nn_pid_arch}).
+
+\begin{rmk}
+The angular part of the observation~\eqref{eq:observation} consists of the body rates
+$(p, q, r)$, \emph{not} the Euler-angle derivatives $(\dot\phi, \dot\theta, \dot\psi)$.
+This is a deliberate and consistent choice across every regime in which the policy is
+used. In simulation --- both during training and during closed-loop evaluation --- the
+dynamics propagate $(p, q, r)$ as the genuine body-frame angular velocity through the
+rotational equations~\eqref{eq:euler_components}; when the policy is run inside
+\texttt{gym-pybullet-drones}, the world-frame angular velocity returned by the simulator
+is rotated into the body frame by $R^\top$ before being passed to the network. On the
+real Crazyflie, the corresponding three entries are filled directly from the raw
+gyroscope, which natively measures body rates. The policy is therefore always presented
+with the same physical quantity. As shown in Section~\ref{sec:dynamics}, near hover
+$\omega_B \simeq \dot{\Phi}$, so this distinction has no practical effect in the operating
+regime of a regulation task; it is nonetheless essential that training and deployment
+\emph{agree} on it, since any mismatch here would translate directly into a sim-to-real
+discrepancy. The Euler angles $(\phi, \theta, \psi)$ themselves enter the observation
+unchanged; the only convention adjustment concerns the pitch axis, as the Crazyflie
+firmware reports a positive pitch for a nose-up attitude whereas the simulator adopts the
+opposite sign --- the pitch angle $\theta$ and pitch rate $q$ are therefore negated when
+the observation is assembled from real telemetry.
+\end{rmk}
+
+\subsubsection*{Action}
+
+The most significant departure from~\cite{goffin2026} lies in the action. Goffin's network
+emitted the full control wrench $(F, \tau_x, \tau_y, \tau_z)$ directly, which is the
+natural input of an idealised dynamics model. As established in
+Section~\ref{sec:cascade_pid}, this is not feasible on the Crazyflie: the CRTP radio
+protocol exposes no per-motor or rate-loop command, and the attitude-rate loop must in any
+case run at a bandwidth far higher than a network can be queried over radio. The policy
+therefore outputs a \emph{setpoint for the inner cascade} rather than a force. Concretely,
+the action is
+\begin{equation}
+\mathbf{a}_k = \big(\, T,\;\; \phi^{\mathrm{sp}},\;\; \theta^{\mathrm{sp}},\;\;
+r^{\mathrm{sp}} \,\big),
+\label{eq:action}
+\end{equation}
+that is, precisely the quantities produced by the velocity loop of the firmware cascade
+(Section~\ref{sec:cascade_pid}): a thrust command $T$ as a $16$-bit PWM-like value, a
+desired roll angle $\phi^{\mathrm{sp}}$, a desired pitch angle $\theta^{\mathrm{sp}}$, and
+a desired yaw rate $r^{\mathrm{sp}}$. The thrust is forwarded to the power distribution,
+the roll and pitch setpoints feed the attitude loop, and the yaw rate is integrated into a
+yaw-angle setpoint that also feeds the attitude loop. In effect, the network replaces the
+position and velocity loops of the cascade, while the attitude and attitude-rate loops are
+left untouched and continue to run onboard at $500\,\mathrm{Hz}$. Each component of the
+action is bounded by construction through the output activations --- a sigmoid for the
+thrust and hyperbolic tangents for the three angular setpoints --- so that the commands
+always lie within the firmware-enforced saturation limits stated in
+Section~\ref{sec:cascade_pid} (in particular $|\phi^{\mathrm{sp}}|,
+|\theta^{\mathrm{sp}}| \le 20^\circ$).
+
+This hybrid neural-network/PID interface is shared by both controllers studied in this
+report --- the classic regulation policy of Section~\ref{sec:nn_pid_arch} and the
+meta-learned policy of Section~\ref{sec:maml_bg} --- and is identical in simulation and on
+hardware. The detailed network architecture realising the
+mapping~\eqref{eq:policy}--\eqref{eq:action} is presented in
+Section~\ref{sec:nn_pid_arch}.
+
 \subsection{Back-Propagation Through Time and Curriculum Reset}\label{sec:bptt}
 \subsection{Model-Agnostic Meta-Learning (MAML)}\label{sec:maml_bg}
 
