@@ -38,7 +38,7 @@ if PARENT_DIR not in sys.path:
 from maml_lib import (
     config as C,
     PolicyMLP, FixedUniformMassSet, meta_train,
-    sample_hover_x0, plot_fixed_task_map, GracefulKiller,
+    sample_hover_x0, GracefulKiller,
     DYNAMICS,
 )
 
@@ -318,28 +318,15 @@ def main():
         return
 
     final_ckpt = os.path.join(out_dir, f"{base}_ep{actual_epochs}.pt")
-    final_map  = os.path.join(out_dir, f"{base}_ep{actual_epochs}_map.png")
 
     if os.path.exists(working_ckpt):
         os.replace(working_ckpt, final_ckpt)
     else:
         save_checkpoint(policy, history, final_ckpt)
 
-    # Map is fixed (same positions every epoch) — generate once at the end.
-    try:
-        plot_fixed_task_map(
-            final_map,
-            positions=task_set.positions,
-            x0_train=x0_train, x0_eval=x0_eval,
-            half_side=args.half_side,
-            xy_min=args.xy_min, xy_max=args.xy_max,
-            z_min=args.z_min,   z_max=args.z_max,
-        )
-    except Exception as e:
-        print(f"[Plot] failed: {e}")
-
     print(f"[Saved] {final_ckpt}")
-    print(f"[Saved] {final_map}")
+    print(f"[Plots] run  python plot_ckpt.py --ckpt {final_ckpt}  "
+          "to generate the task map and loss curve.")
     print("Done.")
 
 

@@ -28,7 +28,6 @@ Baseline
 """
 from typing import Callable, List
 
-import numpy as np
 import torch
 
 
@@ -160,7 +159,7 @@ def meta_train(
     if resume_state is None:
         torch.manual_seed(seed)
         torch_gen = torch.Generator(device=device).manual_seed(seed)
-        history = {"epoch": [], "meta_loss": [], "inner_pre": [], "outer_loss": []}
+        history = {"epoch": [], "meta_loss": [], "inner_pre": []}
         start_epoch = 0
     else:
         _restore_global_rng(resume_state, seed)
@@ -168,8 +167,7 @@ def meta_train(
             device, resume_state.get("torch_gen_state", None), seed)
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
-        for k, v in [("epoch", []), ("meta_loss", []),
-                     ("inner_pre", []), ("outer_loss", [])]:
+        for k, v in [("epoch", []), ("meta_loss", []), ("inner_pre", [])]:
             history.setdefault(k, v)
         start_epoch = len(history["epoch"])
         print(f"[Resume] from epoch {start_epoch}/{epochs}.")
@@ -239,8 +237,7 @@ def meta_train(
             adapted_thetas.append(theta_i)
 
         # ── Outer loss (sequential per task) ─────────────────────────────
-        meta_loss   = torch.tensor(0.0, device=device)
-        outer_vals: List[float] = []
+        meta_loss = torch.tensor(0.0, device=device)
         for theta_i, mass_i in zip(adapted_thetas, masses_dev):
             X_out = rollout(
                 _make_fn(policy, theta_i), x0_eval, n_steps,
@@ -250,7 +247,6 @@ def meta_train(
             L_out = trajectory_cost(
                 X_out, terminal_weight,
                 pos_weight=pos_weight, z_weight=z_weight).mean()
-            outer_vals.append(L_out.item())
             meta_loss = meta_loss + L_out
 
         meta_loss = meta_loss / N
@@ -267,13 +263,11 @@ def meta_train(
         history["epoch"].append(ep + 1)
         history["meta_loss"].append(float(meta_loss.item()))
         history["inner_pre"].append(float(inner_pre))
-        history["outer_loss"].append(float(np.mean(outer_vals)))
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
             print(f"  [ep {ep+1:4d}/{epochs}] "
                   f"meta={meta_loss.item():.4e}  "
-                  f"inner_pre={inner_pre:.4e}  "
-                  f"outer={np.mean(outer_vals):.4e}")
+                  f"inner_pre={inner_pre:.4e}")
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history,
