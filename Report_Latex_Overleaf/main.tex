@@ -542,6 +542,18 @@ From the outermost to the innermost, the loops carry the following responsibilit
     timescale.
 \end{enumerate}
 
+\subsubsection*{Multi-rate scheduling}
+
+Because the four loops are clocked at two different rates, an outer loop refreshes the
+setpoint of its inner neighbour less often than that neighbour consumes it. The position
+and velocity loops produce a new attitude-and-thrust setpoint once every $10\,\mathrm{ms}$,
+whereas the attitude and attitude-rate loops execute every $2\,\mathrm{ms}$. Between two
+refreshes the inner cascade simply reuses the most recent outer-loop setpoint unchanged ---
+a zero-order hold --- so that each $100\,\mathrm{Hz}$ command is applied for five
+consecutive $500\,\mathrm{Hz}$ iterations. The learned controller of
+Section~\ref{sec:nn_pid_arch}, which substitutes for the two outer loops, inherits exactly
+this scheduling: a single network query is held for five attitude-rate updates.
+
 \subsubsection*{Power distribution}
 
 The thrust $T$ produced by the velocity loop and the rate-loop outputs
@@ -679,6 +691,123 @@ mapping~\eqref{eq:policy}--\eqref{eq:action} is presented in
 Section~\ref{sec:nn_pid_arch}.
 
 \subsection{Back-Propagation Through Time and Curriculum Reset}\label{sec:bptt}
+
+The neural network controller of Section~\ref{sec:nn_policy} is trained by directly
+minimising a cost accumulated along a simulated flight. Every component of the closed loop
+--- the policy, the inner attitude and attitude-rate PID loops of
+Section~\ref{sec:cascade_pid}, and the rigid-body dynamics --- is implemented as a
+differentiable operation, so the entire roll-out forms a single differentiable
+computational graph and the gradient of the cost with respect to the network parameters
+can be obtained exactly by automatic differentiation. This section introduces the two
+ingredients of the training procedure that are independent of the particular cost function
+used: the back-propagation-through-time mechanism and the curriculum reset. The stage cost
+$\ell(\cdot)$ is kept abstract here; its concrete form is specified later, together with
+the rest of the training set-up, in Section~\ref{sec:nn_training}.
+
+\subsubsection*{Back-propagation through time}
+
+Consider a roll-out of horizon $N$. Starting from an initial state $\mathbf{x}_0$, at each
+step $k$ the policy produces an action $\mathbf{a}_k = \pi_\theta(\mathbf{o}_k)$, and the
+inner PID loops together with the dynamics map $(\mathbf{x}_k, \mathbf{a}_k)$ to the next
+state $\mathbf{x}_{k+1}$. A cumulative cost
+\begin{equation}
+J(\theta) = \sum_{k=1}^{N} \ell(\mathbf{x}_k)
+\label{eq:cumulative_cost}
+\end{equation}
+is accumulated over the trajectory, where $\ell(\cdot)$ is a per-step stage cost. Since
+$\mathbf{x}_{k+1}$ depends on $\mathbf{x}_k$, which itself depends on the earlier action
+$\mathbf{a}_{k-1} = \pi_\theta(\mathbf{o}_{k-1})$, the parameters $\theta$ influence the
+cost through \emph{every} step of the roll-out. Unrolling this recurrence and applying the
+chain rule backwards from $J$ to $\theta$ is exactly \emph{back-propagation through time}
+(BPTT): the same algorithm used to train recurrent neural networks, applied here to the
+unrolled simulator rather than to a recurrent cell. Goffin~\cite{goffin2026} already trains
+his controller in this way, differentiating the cumulative cost through the unrolled
+horizon, but does not name the mechanism; it is made explicit here.
+Because the dynamics model is itself differentiable, the resulting gradient is an
+\emph{analytic policy gradient}~\cite{wiedemann2023apg}: in contrast with the
+score-function estimators used in model-free reinforcement learning, it is exact (up to
+floating-point precision) and has low variance, which is what makes training from a small
+number of trajectories practical. The unrolled training loop used in this work is shown in
+Figure~\ref{fig:bptt}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\textwidth]{images/BPTT.png}
+    \caption{Unrolled training loop and back-propagation through time. At each step the
+    neural network maps the current state and the relative position target
+    $\mathbf{p}^{\mathrm{sp}} - \hat{\mathbf{p}}$ to a desired attitude and thrust; the
+    firmware attitude and attitude-rate PID loops (Section~\ref{sec:cascade_pid}, running
+    at $500\,\mathrm{Hz}$) convert this setpoint into motor commands that drive the
+    differentiable dynamics to the next state. The states visited along the roll-out feed a
+    cumulative loss, and the gradient is back-propagated through the entire unrolled chain
+    --- network, PID loops and dynamics --- to update the network weights. Only the network
+    (red) is trainable; the PID gains and the dynamics are fixed.}
+    \label{fig:bptt}
+\end{figure}
+
+\subsubsection*{Concurrent versus autoregressive prediction}
+
+The analytic-policy-gradient framework of Wiedemann et al.~\cite{wiedemann2023apg},
+followed here, additionally proposes a \emph{concurrent} prediction scheme in which the
+network is queried once at the start of a chunk of $T$ steps and outputs the whole sequence
+of $T$ future actions at once, the chunk then being executed open-loop before the next
+query. The two extremes are $T = 1$, where the policy is re-evaluated on fresh state
+feedback at every step --- the classical \emph{autoregressive} scheme --- and large $T$,
+which amortises the query cost but sacrifices within-chunk feedback. Both settings were
+implemented and compared in this work. The best regulation performance was consistently
+obtained with $T = 1$, presumably because position regulation on a light and fast
+quadcopter benefits more from tight state feedback than from open-loop look-ahead. The
+concurrent variant was therefore abandoned, and all controllers reported in this work use
+the autoregressive setting.
+
+\subsubsection*{Curriculum reset}
+
+Unrolling a long horizon with a poorly trained policy is problematic: early in training the
+controller lets the drone diverge, the state magnitudes grow, and the gradient
+back-propagated through the divergent trajectory explodes or becomes numerically invalid.
+The \emph{curriculum reset}, adopted from~\cite{wiedemann2023apg}, addresses this. During
+the roll-out, after every step, any trajectory whose position error exceeds a threshold
+$\tau_{\mathrm{div}}$ is reset: its state, and the internal state of the inner PID loops,
+are set back to the regulation target and --- crucially --- \emph{detached} from the
+computational graph, so that no gradient flows through the divergence. The detachment
+serves two purposes. First, it truncates BPTT for the trajectories that have left the
+useful region, keeping the gradient finite, while the well-behaved trajectories remain
+fully differentiable. Second, and more subtly, it removes a perverse incentive: were the
+reset part of the differentiable graph, the gradient would expose it as a shortcut to a low
+cost, since diverging fast enough triggers a reset that snaps the drone straight onto the
+regulation target. The policy would then be rewarded for diverging on purpose rather than
+for regulating; detaching the reset is what prevents this.
+
+The threshold itself follows a curriculum: it increases linearly with the training epoch
+$e$ from a tight initial value $\tau_{\mathrm{start}}$ to a loose final value
+$\tau_{\mathrm{end}}$,
+\begin{equation}
+\tau_{\mathrm{div}}(e) = \tau_{\mathrm{start}}
++ \left(\tau_{\mathrm{end}} - \tau_{\mathrm{start}}\right) \frac{e}{E - 1},
+\qquad e \in \{0, \dots, E-1\},
+\label{eq:tau_curriculum}
+\end{equation}
+where $E$ is the total number of epochs. Early in training the policy is poor, so a tight threshold resets diverging
+drones quickly and confines the roll-out to a neighbourhood of the target where the
+half-trained policy can still produce a meaningful gradient. As the policy improves, the
+threshold is relaxed, progressively exposing the controller to longer excursions and to the
+recovery-from-far regime. The scheme thus realises an easy-to-hard curriculum; it is
+illustrated in Figure~\ref{fig:curric_reset}.
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{images/Curric_Reset.png}
+    \caption{Curriculum reset, reproduced from~\cite{wiedemann2023apg}. In the original
+    figure the controller tracks a reference trajectory, which is why several successive
+    targets (orange) appear; in the present work the task is regulation to a \emph{single}
+    fixed target --- the point the drone must reach. The roll-out $s$ (blue) is left
+    untouched and fully differentiable as long as it stays within the divergence band of
+    half-width $\tau_{\mathrm{div}}$; whenever it strays beyond the band, the state is reset
+    back to the target (red) and the back-propagation graph is truncated at that point. The
+    band is widened over the course of training according to~\eqref{eq:tau_curriculum}.}
+    \label{fig:curric_reset}
+\end{figure}
+
 \subsection{Model-Agnostic Meta-Learning (MAML)}\label{sec:maml_bg}
 
 % =====================================================
@@ -699,7 +828,7 @@ Section~\ref{sec:nn_pid_arch}.
 \newpage
 \section{Learning Classic Regulation}
 \subsection{NN-PID Hybrid Architecture}\label{sec:nn_pid_arch}
-\subsection{Training}
+\subsection{Training}\label{sec:nn_training}
 \subsection{Simulation Results}
 \subsection{Real-World Results}
 
