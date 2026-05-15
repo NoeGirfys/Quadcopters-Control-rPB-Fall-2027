@@ -13,6 +13,13 @@ def sample_hover_x0(n: int, half_side: float, gen: torch.Generator,
     Position (x, y, z) is uniform in the cube [-half_side, +half_side]^3.
     Velocity, attitude and rates are zero (hover). Sampling uses ``gen``
     so the result is reproducible from a single seed.
+
+    Reproducibility caveat: ``gen`` is device-bound. A CPU and a CUDA
+    ``torch.Generator`` seeded identically produce *different* sequences,
+    so a standalone run on CPU will not reproduce the x0 set of a GPU run
+    (the mass tasks themselves use NumPy and stay reproducible). To compare
+    a baseline against a MAML run trained on another device, load the x0
+    set from its checkpoint (``--from-maml-ckpt``) instead of re-sampling.
     """
     pos = (torch.rand(n, 3, generator=gen, device=device) * 2.0 - 1.0) * half_side
     X0 = torch.zeros(n, 12, dtype=torch.float32, device=device)

@@ -178,6 +178,10 @@ def meta_train(
     x0_inner_big = x0_train.repeat(N, 1)                        # (N*B_train, 12)
     mass_inner_big = batch_mass_params(task_set.masses, B_train, device)
 
+    # Per-task MassParams moved to ``device`` once (reused every epoch by the
+    # extra inner steps and the outer loop).
+    masses_dev = [m.to(device) for m in task_set.masses]
+
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
 
@@ -217,7 +221,7 @@ def meta_train(
             for _step in range(1, n_inner_steps):
                 X_in = rollout(
                     _make_fn(policy, theta_i), x0_train, n_steps,
-                    task_set.masses[i], dynamics_step,
+                    masses_dev[i], dynamics_step,
                     tau_div=tau_div, obs_noise_std=obs_noise_std,
                     gen=torch_gen,
                 )
@@ -237,10 +241,10 @@ def meta_train(
         # ── Outer loss (sequential per task) ─────────────────────────────
         meta_loss   = torch.tensor(0.0, device=device)
         outer_vals: List[float] = []
-        for theta_i, mass_i in zip(adapted_thetas, task_set.masses):
+        for theta_i, mass_i in zip(adapted_thetas, masses_dev):
             X_out = rollout(
                 _make_fn(policy, theta_i), x0_eval, n_steps,
-                mass_i.to(device), dynamics_step,
+                mass_i, dynamics_step,
                 tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
             )
             L_out = trajectory_cost(

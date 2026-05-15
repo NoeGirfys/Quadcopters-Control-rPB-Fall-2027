@@ -154,6 +154,13 @@ def main():
 
     # ── Fixed task set ─────────────────────────────────────────────────
     if ckpt is not None:
+        ckpt_m_extra = float(ckpt["m_extra"])
+        if abs(args.mass - ckpt_m_extra) > 1e-9:
+            print(f"[WARNING] --mass {args.mass} differs from the checkpoint's "
+                  f"m_extra {ckpt_m_extra}. Resuming keeps the saved task "
+                  f"positions and optimizer state but changes the extra mass, "
+                  f"which is inconsistent with the run so far. Use --mass "
+                  f"{ckpt_m_extra} to resume faithfully.")
         # Reconstruct from saved positions so the run is bit-identical.
         task_set = FixedUniformMassSet.from_positions(
             ckpt["task_positions"], m_extra=args.mass)
@@ -188,6 +195,12 @@ def main():
               f"  cube ±{args.half_side}m")
 
     # ── Policy ────────────────────────────────────────────────────────
+    # Seed the global torch RNG *before* constructing the network so the
+    # weight initialisation is reproducible across runs and identical to the
+    # baseline (which seeds the same way). On resume this is harmless: the
+    # init weights are immediately overwritten by load_state_dict, and
+    # meta_train restores the saved RNG state anyway.
+    torch.manual_seed(args.seed)
     M_total = C.M_BASE + args.mass
     hover_thrust_u16 = (M_total * C.G * C.UINT16_MAX) / (4 * C.CF2_THRUST_MAX_PER_MOTOR)
     policy = PolicyMLP(hidden=args.hidden, hover_thrust_u16=hover_thrust_u16).to(device)
