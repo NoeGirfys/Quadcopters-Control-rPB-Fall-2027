@@ -5,10 +5,9 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour le dataloader / numpy / PyBullet
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=01:00:00          # Temps max autorisé
+#SBATCH --time=08:00:00          # Temps max autorisé
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
-#SBATCH --signal=B:TERM@600      # envoie SIGTERM 600s avant la fin du job
 
 # --- Créer le dossier de logs s'il n'existe pas encore ----------------
 mkdir -p logs
