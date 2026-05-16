@@ -1,11 +1,16 @@
-"""Equivalence test for the batched MAML outer loop (optimisation A).
+"""Equivalence test for the batched MAML meta-loop (optimisations A + B).
 
-Checks that the new single batched outer rollout
-(``maml._make_batched_fn``) produces the same meta-loss and the same
-gradients w.r.t. the meta-parameters as the old per-task sequential
-loop it replaces.
+Compares, on a small CPU setup:
 
-Run (CPU, a few seconds):
+  * OLD path - N sequential ``autograd.grad`` inner gradients followed by
+    N sequential outer rollouts.
+  * NEW path - one vmapped VJP for all inner gradients (B) followed by a
+    single batched outer rollout (A).
+
+Both the meta-loss and its gradient w.r.t. the meta-parameters must match.
+Also checks that chunked and full batched inner grads agree.
+
+Run (a few seconds):
 
     cd training_MAML
     python test_batched_outer.py
@@ -23,92 +28,122 @@ from maml_lib import PolicyMLP, DYNAMICS, sample_hover_x0
 from maml_lib.rollout import rollout
 from maml_lib.cost import trajectory_cost
 from maml_lib.mass_params import compute_mass_params, batch_mass_params
-from maml_lib.maml import _make_fn, _make_batched_fn
+from maml_lib.maml import (
+    _make_fn, _make_batched_fn,
+    _clip_grads, _clip_grads_batched, _batched_inner_grads,
+)
 
 TERMINAL_W, POS_W, Z_W = 50.0, 10.0, 1.0
+LR_INNER, CLIP = 0.05, 1.0
+N, B_TRAIN, B_EVAL, N_STEPS = 4, 8, 8, 30
+TOL = 1e-4
 
 
-def _meta_old(policy, adapted, masses_dev, x0_eval, n_steps, dyn, tau_div):
-    """Old path: N sequential rollouts, summed then averaged."""
-    N = len(adapted)
-    meta = torch.zeros((), dtype=x0_eval.dtype)
-    for i in range(N):
-        X = rollout(_make_fn(policy, adapted[i]), x0_eval, n_steps,
-                    masses_dev[i], dyn, tau_div=tau_div,
-                    obs_noise_std=None, gen=None)
-        meta = meta + trajectory_cost(X, TERMINAL_W,
-                                      pos_weight=POS_W, z_weight=Z_W).mean()
-    return meta / N
+def _cost(X):
+    return trajectory_cost(X, TERMINAL_W, pos_weight=POS_W, z_weight=Z_W)
 
 
-def _meta_new(policy, adapted, mass_big, x0_big, n_steps, dyn, tau_div,
-              N, B_eval):
-    """New path: one batched rollout over all N tasks."""
-    stacked = {name: torch.stack([adapted[i][name] for i in range(N)], dim=0)
-               for name in adapted[0]}
-    X = rollout(_make_batched_fn(policy, stacked, N, B_eval),
-                x0_big, n_steps, mass_big, dyn, tau_div=tau_div,
-                obs_noise_std=None, gen=None)
-    return trajectory_cost(X, TERMINAL_W,
-                           pos_weight=POS_W, z_weight=Z_W).mean()
+def _rel_err(a, b):
+    return ((a - b).abs().max() / (b.abs().max() + 1e-12)).item()
 
 
-def run_case(tau_div):
+def _build(tau_div):
+    """Fixed small problem; returns everything both paths need."""
     torch.manual_seed(0)
-    device = "cpu"
-    N, B_eval, n_steps = 4, 8, 30
     dyn = DYNAMICS["linearized"]
-
     policy = PolicyMLP(hidden=64)
 
     masses = [compute_mass_params(0.010, (0.01 * i, -0.01 * i, 0.005))
               for i in range(N)]
-    mass_big = batch_mass_params(masses, B_eval, device)
-    masses_dev = [m.to(device) for m in masses]
+    gen = torch.Generator(device="cpu").manual_seed(1)
+    x0_tr = sample_hover_x0(B_TRAIN, 0.3, gen, device="cpu")
+    x0_ev = sample_hover_x0(B_EVAL, 0.3, gen, device="cpu")
 
-    gen = torch.Generator(device=device).manual_seed(1)
-    x0_eval = sample_hover_x0(B_eval, 0.3, gen, device=device)
-    x0_big = x0_eval.repeat(N, 1)
+    ctx = dict(
+        policy=policy, dyn=dyn, tau_div=tau_div,
+        masses_dev=masses,
+        mass_in_big=batch_mass_params(masses, B_TRAIN, "cpu"),
+        mass_out_big=batch_mass_params(masses, B_EVAL, "cpu"),
+        x0_ev=x0_ev,
+        x0_in_big=x0_tr.repeat(N, 1),
+        x0_out_big=x0_ev.repeat(N, 1),
+    )
+    return ctx
 
-    # Meta-parameters as leaf tensors; per-task constant perturbations stand
-    # in for the inner-loop adaptation (theta_i = base - lr * pert_i).
+
+def _inner_costs(ctx, theta):
+    """Fresh inner rollout -> per-task costs (N,) with a fresh graph."""
+    X = rollout(_make_fn(ctx["policy"], theta), ctx["x0_in_big"], N_STEPS,
+                ctx["mass_in_big"], ctx["dyn"], tau_div=ctx["tau_div"],
+                obs_noise_std=None, gen=None)
+    return _cost(X).view(N, B_TRAIN).mean(dim=1)
+
+
+def _meta_old(ctx, base):
+    costs = _inner_costs(ctx, base)
+    adapted = []
+    for i in range(N):
+        g = torch.autograd.grad(costs[i], tuple(base.values()),
+                                retain_graph=True, create_graph=False)
+        g = _clip_grads(g, CLIP)
+        adapted.append({n: p - LR_INNER * gg
+                        for (n, p), gg in zip(base.items(), g)})
+    meta = torch.zeros((), dtype=torch.float32)
+    for i in range(N):
+        X = rollout(_make_fn(ctx["policy"], adapted[i]), ctx["x0_ev"], N_STEPS,
+                    ctx["masses_dev"][i], ctx["dyn"], tau_div=ctx["tau_div"],
+                    obs_noise_std=None, gen=None)
+        meta = meta + _cost(X).mean()
+    return meta / N
+
+
+def _meta_new(ctx, base):
+    costs = _inner_costs(ctx, base)
+    batched = _batched_inner_grads(costs, tuple(base.values()), N,
+                                   create_graph=False, chunk=None)
+    batched = _clip_grads_batched(batched, CLIP)
+    stacked = {name: p.unsqueeze(0) - LR_INNER * g
+               for (name, p), g in zip(base.items(), batched)}
+    X = rollout(_make_batched_fn(ctx["policy"], stacked, N, B_EVAL),
+                ctx["x0_out_big"], N_STEPS, ctx["mass_out_big"], ctx["dyn"],
+                tau_div=ctx["tau_div"], obs_noise_std=None, gen=None)
+    return _cost(X).mean()
+
+
+def run_case(tau_div):
+    ctx = _build(tau_div)
+    policy = ctx["policy"]
     base = {n: p.detach().clone().requires_grad_(True)
             for n, p in policy.named_parameters()}
-    perts = [{n: 0.01 * torch.randn_like(p) for n, p in base.items()}
-             for _ in range(N)]
 
-    def make_adapted():
-        return [{n: base[n] - 0.05 * perts[i][n] for n in base}
-                for i in range(N)]
-
-    # ── Old path ──
-    meta_old = _meta_old(policy, make_adapted(), masses_dev,
-                         x0_eval, n_steps, dyn, tau_div)
+    meta_old = _meta_old(ctx, base)
     meta_old.backward()
     g_old = {n: base[n].grad.detach().clone() for n in base}
     for n in base:
         base[n].grad = None
 
-    # ── New path ──
-    meta_new = _meta_new(policy, make_adapted(), mass_big, x0_big,
-                         n_steps, dyn, tau_div, N, B_eval)
+    meta_new = _meta_new(ctx, base)
     meta_new.backward()
     g_new = {n: base[n].grad.detach().clone() for n in base}
 
-    loss_err = (meta_new - meta_old).abs().item() / (meta_old.abs().item() + 1e-12)
-    grad_err = max(
-        ((g_new[n] - g_old[n]).abs().max()
-         / (g_old[n].abs().max() + 1e-12)).item()
-        for n in base)
+    loss_err = _rel_err(meta_new, meta_old)
+    grad_err = max(_rel_err(g_new[n], g_old[n]) for n in base)
+
+    # Chunked vs full batched inner grads (fresh graphs each).
+    full = _batched_inner_grads(_inner_costs(ctx, base), tuple(base.values()),
+                                N, create_graph=False, chunk=None)
+    chk  = _batched_inner_grads(_inner_costs(ctx, base), tuple(base.values()),
+                                N, create_graph=False, chunk=3)
+    chunk_err = max(_rel_err(c, f) for c, f in zip(chk, full))
 
     tag = f"tau_div={tau_div}"
     print(f"[{tag}]  meta_old={meta_old.item():.6e}  "
           f"meta_new={meta_new.item():.6e}  rel_err={loss_err:.2e}")
     print(f"[{tag}]  max relative gradient error = {grad_err:.2e}")
+    print(f"[{tag}]  chunked vs full inner-grad error = {chunk_err:.2e}")
 
-    tol = 1e-4
-    ok = loss_err < tol and grad_err < tol
-    print(f"[{tag}]  {'PASS' if ok else 'FAIL'} (tol={tol:.0e})\n")
+    ok = loss_err < TOL and grad_err < TOL and chunk_err < TOL
+    print(f"[{tag}]  {'PASS' if ok else 'FAIL'} (tol={TOL:.0e})\n")
     return ok
 
 

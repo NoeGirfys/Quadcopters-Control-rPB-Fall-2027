@@ -130,6 +130,9 @@ def parse_args():
     p.add_argument("--verbose-every",type=int, default=d.get("verbose_every", 1))
     p.add_argument("--profile", action="store_true",
                    help="print a per-epoch timing breakdown of the meta-loop")
+    p.add_argument("--grad-chunk", type=int, default=d.get("grad_chunk", 0),
+                   help="task-chunk size for the batched inner-grad VJP; "
+                        "0 = all tasks at once (lower it on CUDA OOM)")
 
     return p.parse_args()
 
@@ -309,6 +312,7 @@ def main():
         killer=killer,
         resume_state=resume_state,
         profile=args.profile,
+        grad_chunk=(args.grad_chunk if args.grad_chunk > 0 else None),
     )
 
     # ── Save final checkpoint ─────────────────────────────────────────

@@ -124,6 +124,53 @@ def _clip_grads(grads, max_norm: float = 1.0):
     return [g * coef for g in grads]
 
 
+def _clip_grads_batched(batched_grads, max_norm: float = 1.0):
+    """Per-task grad-norm clipping for batched grads.
+
+    Each tensor in ``batched_grads`` has a leading task dim
+    ``(n_tasks, *param_shape)``. Equivalent to applying ``_clip_grads``
+    independently to every task.
+    """
+    sq = sum((g.detach() ** 2).flatten(1).sum(dim=1) for g in batched_grads)
+    total = torch.sqrt(sq)                                       # (n_tasks,)
+    coef  = torch.clamp(max_norm / (total + 1e-6), max=1.0)       # (n_tasks,)
+    out = []
+    for g in batched_grads:
+        c = coef.view(coef.shape[0], *([1] * (g.dim() - 1)))
+        out.append(g * c)
+    return out
+
+
+def _batched_inner_grads(costs, inputs, n_tasks, create_graph, chunk):
+    """Per-task gradients ∂costs[i]/∂inputs for all i, in one vmapped VJP.
+
+    The N sequential ``autograd.grad(costs[i], inputs)`` calls compute the
+    Jacobian of ``costs`` (shape ``(n_tasks,)``) w.r.t. ``inputs``. Feeding
+    the identity matrix as batched ``grad_outputs`` (``is_grads_batched``)
+    yields all N rows in a single backward. ``chunk`` optionally splits the
+    identity rows to bound peak memory (the batched backward holds gradient
+    buffers with a leading dim of ``chunk``).
+
+    Returns a tuple aligned with ``inputs``; element j has shape
+    ``(n_tasks, *inputs[j].shape)``.
+    """
+    eye = torch.eye(n_tasks, device=costs.device, dtype=costs.dtype)
+    if chunk is None or chunk >= n_tasks:
+        return torch.autograd.grad(
+            costs, inputs, grad_outputs=eye, is_grads_batched=True,
+            retain_graph=create_graph, create_graph=create_graph)
+    pieces = []
+    for start in range(0, n_tasks, chunk):
+        last = start + chunk >= n_tasks
+        g = torch.autograd.grad(
+            costs, inputs, grad_outputs=eye[start:start + chunk],
+            is_grads_batched=True, create_graph=create_graph,
+            retain_graph=create_graph or not last)
+        pieces.append(g)
+    return tuple(torch.cat([p[j] for p in pieces], dim=0)
+                 for j in range(len(inputs)))
+
+
 # ---------------------------------------------------------------------------
 # MAML meta-training
 # ---------------------------------------------------------------------------
@@ -154,6 +201,7 @@ def meta_train(
     killer=None,
     resume_state: dict = None,
     profile: bool = False,
+    grad_chunk: int = None,
 ):
     """Meta-train ``policy`` with MAML over a fixed uniform task set.
 
@@ -238,53 +286,71 @@ def meta_train(
         t_inner = _now()
 
         # ── Per-task gradient + adaptation ───────────────────────────────
-        adapted_thetas: List[dict] = []
-        for i in range(N):
-            # Keep the big inner graph alive until the last task's grad is
-            # computed.  For 2nd-order MAML it must stay alive even longer
-            # (until meta_loss.backward()), so always retain when create_graph.
-            retain = create_graph or (i < N - 1)
-            grads = torch.autograd.grad(
-                costs_0[i], tuple(theta.values()),
-                create_graph=create_graph, retain_graph=retain,
-            )
+        theta_items  = list(theta.items())
+        theta_values = tuple(p for _, p in theta_items)
+
+        if n_inner_steps == 1:
+            # Fast path: a single vmapped VJP yields every task's inner
+            # gradient at once, and the one-step adaptation is assembled
+            # directly as stacked (N, *param) tensors — no Python loop.
+            batched = _batched_inner_grads(
+                costs_0, theta_values, N, create_graph, grad_chunk)
             if inner_grad_clip > 0:
-                grads = _clip_grads(grads, inner_grad_clip)
-            theta_i = {n: p - lr_inner * g
-                       for (n, p), g in zip(theta.items(), grads)}
-
-            # Additional inner steps (sequential — each task has its own θ).
-            for _step in range(1, n_inner_steps):
-                X_in = rollout(
-                    _make_fn(policy, theta_i), x0_train, n_steps,
-                    masses_dev[i], dynamics_step,
-                    tau_div=tau_div, obs_noise_std=obs_noise_std,
-                    gen=torch_gen,
+                batched = _clip_grads_batched(batched, inner_grad_clip)
+            stacked_theta = {
+                name: p.unsqueeze(0) - lr_inner * g
+                for (name, p), g in zip(theta_items, batched)
+            }
+        else:
+            # Sequential path: extra inner steps give each task its own θ,
+            # so the adaptation cannot be expressed as one batched VJP.
+            adapted_thetas: List[dict] = []
+            for i in range(N):
+                # Keep the big inner graph alive until the last task's grad
+                # is computed. For 2nd-order MAML it must stay alive until
+                # meta_loss.backward(), so always retain when create_graph.
+                retain = create_graph or (i < N - 1)
+                grads = torch.autograd.grad(
+                    costs_0[i], theta_values,
+                    create_graph=create_graph, retain_graph=retain,
                 )
-                L_in = trajectory_cost(
-                    X_in, terminal_weight,
-                    pos_weight=pos_weight, z_weight=z_weight).mean()
-                grads_s = torch.autograd.grad(
-                    L_in, tuple(theta_i.values()),
-                    create_graph=create_graph)
                 if inner_grad_clip > 0:
-                    grads_s = _clip_grads(grads_s, inner_grad_clip)
+                    grads = _clip_grads(grads, inner_grad_clip)
                 theta_i = {n: p - lr_inner * g
-                           for (n, p), g in zip(theta_i.items(), grads_s)}
+                           for (n, p), g in zip(theta_items, grads)}
 
-            adapted_thetas.append(theta_i)
+                for _step in range(1, n_inner_steps):
+                    X_in = rollout(
+                        _make_fn(policy, theta_i), x0_train, n_steps,
+                        masses_dev[i], dynamics_step,
+                        tau_div=tau_div, obs_noise_std=obs_noise_std,
+                        gen=torch_gen,
+                    )
+                    L_in = trajectory_cost(
+                        X_in, terminal_weight,
+                        pos_weight=pos_weight, z_weight=z_weight).mean()
+                    grads_s = torch.autograd.grad(
+                        L_in, tuple(theta_i.values()),
+                        create_graph=create_graph)
+                    if inner_grad_clip > 0:
+                        grads_s = _clip_grads(grads_s, inner_grad_clip)
+                    theta_i = {n: p - lr_inner * g
+                               for (n, p), g in zip(theta_i.items(), grads_s)}
+
+                adapted_thetas.append(theta_i)
+            stacked_theta = {
+                name: torch.stack([t[name] for t in adapted_thetas], dim=0)
+                for name in adapted_thetas[0]
+            }
         t_grad = _now()
 
         # ── Outer loss (all N tasks batched into one rollout) ────────────
-        # Stack the N adapted parameter sets along a new leading dim; the
-        # batched policy fn then applies task i's weights to row-block i of
-        # an (N*B_eval) rollout — one GPU call instead of N sequential ones.
-        # mean() over the (N*B_eval) costs equals (1/N) Σ_i mean_B(cost_i),
-        # i.e. the exact same meta-loss as the per-task sum it replaces.
-        stacked_theta = {
-            name: torch.stack([t[name] for t in adapted_thetas], dim=0)
-            for name in adapted_thetas[0]
-        }
+        # ``stacked_theta`` maps each parameter name to an (N, *param)
+        # tensor; the batched policy fn applies task i's weights to
+        # row-block i of an (N*B_eval) rollout — one GPU call instead of
+        # N sequential ones. mean() over the (N*B_eval) costs equals
+        # (1/N) Σ_i mean_B(cost_i), the exact same meta-loss as a per-task
+        # sum.
         X_out = rollout(
             _make_batched_fn(policy, stacked_theta, N, B_eval),
             x0_outer_big, n_steps, mass_outer_big, dynamics_step,
