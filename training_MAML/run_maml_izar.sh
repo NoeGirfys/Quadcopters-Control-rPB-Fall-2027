@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=04:00:00          # ~23s/epoch -> 445 epochs restantes en ~3h, marge incluse
+#SBATCH --time=03:00:00          # ~23s/epoch -> 445 epochs restantes en ~3h, marge incluse
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
 
