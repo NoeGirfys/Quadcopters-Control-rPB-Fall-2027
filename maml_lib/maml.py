@@ -26,6 +26,7 @@ Baseline
     All N tasks share the same policy, so train and eval rollouts are fully
     batched (N*B_train, 12) — one GPU call covers the whole epoch.
 """
+import time
 from typing import Callable, List
 
 import torch
@@ -130,6 +131,7 @@ def meta_train(
     on_epoch_end: Callable = None,
     killer=None,
     resume_state: dict = None,
+    profile: bool = False,
 ):
     """Meta-train ``policy`` with MAML over a fixed uniform task set.
 
@@ -180,8 +182,17 @@ def meta_train(
     # extra inner steps and the outer loop).
     masses_dev = [m.to(device) for m in task_set.masses]
 
+    _use_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
+
+    def _now() -> float:
+        """Wall-clock time, syncing CUDA so GPU work is actually finished."""
+        if _use_cuda:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
+        t0 = _now()
 
         # ── Step 1 inner loop: one big batched forward pass ──────────────
         theta = {n: p for n, p in policy.named_parameters()}
@@ -198,6 +209,7 @@ def meta_train(
                    .view(N, B_train).mean(dim=1))   # (N,)
 
         inner_pre = costs_0.detach().mean().item()
+        t_inner = _now()
 
         # ── Per-task gradient + adaptation ───────────────────────────────
         adapted_thetas: List[dict] = []
@@ -235,6 +247,7 @@ def meta_train(
                            for (n, p), g in zip(theta_i.items(), grads_s)}
 
             adapted_thetas.append(theta_i)
+        t_grad = _now()
 
         # ── Outer loss (sequential per task) ─────────────────────────────
         meta_loss = torch.tensor(0.0, device=device)
@@ -250,7 +263,9 @@ def meta_train(
             meta_loss = meta_loss + L_out
 
         meta_loss = meta_loss / N
+        t_outer = _now()
         meta_loss.backward()
+        t_back = _now()
 
         has_nan = any(p.grad is not None and torch.isnan(p.grad).any()
                       for p in policy.parameters())
@@ -268,6 +283,18 @@ def meta_train(
             print(f"  [ep {ep+1:4d}/{epochs}] "
                   f"meta={meta_loss.item():.4e}  "
                   f"inner_pre={inner_pre:.4e}")
+
+        if profile:
+            d_inner = t_inner - t0
+            d_grad  = t_grad  - t_inner
+            d_outer = t_outer - t_grad
+            d_back  = t_back  - t_outer
+            d_total = t_back  - t0
+            print(f"  [profile ep {ep+1}] total={d_total:.2f}s | "
+                  f"inner_rollout={d_inner:.2f}s ({100*d_inner/d_total:.0f}%)  "
+                  f"grad_loop={d_grad:.2f}s ({100*d_grad/d_total:.0f}%)  "
+                  f"outer_loop={d_outer:.2f}s ({100*d_outer/d_total:.0f}%)  "
+                  f"meta_backward={d_back:.2f}s ({100*d_back/d_total:.0f}%)")
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history,

@@ -128,6 +128,8 @@ def parse_args():
     p.add_argument("--seed",         type=int, default=d.get("seed",         42))
     p.add_argument("--tag",          type=str, default=d.get("tag",          ""))
     p.add_argument("--verbose-every",type=int, default=d.get("verbose_every", 1))
+    p.add_argument("--profile", action="store_true",
+                   help="print a per-epoch timing breakdown of the meta-loop")
 
     return p.parse_args()
 
@@ -306,6 +308,7 @@ def main():
         on_epoch_end=on_epoch_end,
         killer=killer,
         resume_state=resume_state,
+        profile=args.profile,
     )
 
     # ── Save final checkpoint ─────────────────────────────────────────
