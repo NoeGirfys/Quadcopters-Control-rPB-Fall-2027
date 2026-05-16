@@ -29,5 +29,5 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.c
 
 # --- Lancement de l'entraînement --------------------------------------
 srun python -u training_MAML/train_maml.py \
-    --resume training_MAML/maml_linearized_h64_o1_n50_izar_uniform_tasks_inprogress.pt \
+    --resume training_MAML/maml_linearized_h64_o1_n50_izar_uniform_tasks_ep95.pt \
     --profile

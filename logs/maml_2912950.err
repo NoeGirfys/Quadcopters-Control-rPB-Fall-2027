@@ -1,0 +1,18 @@
+Traceback (most recent call last):
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 341, in <module>
+    main()
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 145, in main
+    args = parse_args()
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 71, in parse_args
+    d = _load_resume_defaults(pre_args.resume)
+  File "/home/rigaud/Semester_Project_Drone_MAML/training_MAML/train_maml.py", line 51, in _load_resume_defaults
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+  File "/home/rigaud/Semester_Project_Drone_MAML/venv_MAML_SCITAS/lib/python3.10/site-packages/torch/serialization.py", line 1319, in load
+    with _open_file_like(f, "rb") as opened_file:
+  File "/home/rigaud/Semester_Project_Drone_MAML/venv_MAML_SCITAS/lib/python3.10/site-packages/torch/serialization.py", line 659, in _open_file_like
+    return _open_file(name_or_buffer, mode)
+  File "/home/rigaud/Semester_Project_Drone_MAML/venv_MAML_SCITAS/lib/python3.10/site-packages/torch/serialization.py", line 640, in __init__
+    super().__init__(open(name, mode))
+FileNotFoundError: [Errno 2] No such file or directory: 'training_MAML/maml_linearized_h64_o1_n50_izar_uniform_tasks_inprogress.pt'
+srun: error: i07: task 0: Exited with exit code 1
+srun: Terminating StepId=2912950.0
