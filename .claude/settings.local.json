@@ -18,7 +18,8 @@
       "Bash(\"C:/Users/niels/anaconda3/envs/venv_cf_313/python.exe\" training_MAML/train_maml.py --task-mode motors --epochs 3 --meta-batch 4 --k-inner 4 --k-outer 4 --t-sim 0.5 --hidden 16 --dynamics linearized --eval-every 2 --n-eval 4 --tag smoke)",
       "WebFetch(domain:scitas-doc.epfl.ch)",
       "Bash(ls 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\maml_lib')",
-      "Bash(ls 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\training_MAML\\\\maml_lib')"
+      "Bash(ls 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\training_MAML\\\\maml_lib')",
+      "Bash([ -f \"$p/Scripts/python.exe\" ])"
     ]
   }
 }

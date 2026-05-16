@@ -76,9 +76,10 @@ def _restore_global_rng(resume_state: dict, seed: int) -> None:
                   f"({e.__class__.__name__}: {e}); reseeding with {seed}.")
             torch.cuda.manual_seed_all(seed)
 try:
-    from torch.func import functional_call
+    from torch.func import functional_call, vmap
 except ImportError:
     from torch.nn.utils.stateless import functional_call
+    from functorch import vmap
 
 from .cost import trajectory_cost
 from .rollout import rollout
@@ -93,6 +94,27 @@ from .tasks import FixedUniformMassSet
 def _make_fn(policy, theta):
     def _fn(state, target_rel):
         return functional_call(policy, theta, (state, target_rel))
+    return _fn
+
+
+def _make_batched_fn(policy, stacked_theta, n_tasks, batch):
+    """Policy callable that applies a *different* theta to each task block.
+
+    ``stacked_theta`` maps every parameter name to a tensor whose leading
+    dim of size ``n_tasks`` indexes the per-task adapted weights. The
+    returned fn expects flat ``(n_tasks*batch, .)`` inputs whose row-block
+    ``i`` (rows ``i*batch : (i+1)*batch``) is run with ``stacked_theta[i]``.
+    This replaces N sequential outer rollouts with a single batched call.
+    """
+    def _one(theta_i, state_i, target_i):
+        return functional_call(policy, theta_i, (state_i, target_i))
+    _vcall = vmap(_one, in_dims=(0, 0, 0))
+
+    def _fn(state, target_rel):
+        s  = state.view(n_tasks, batch, state.shape[-1])
+        tr = target_rel.view(n_tasks, batch, target_rel.shape[-1])
+        a  = _vcall(stacked_theta, s, tr)               # (n_tasks, batch, 4)
+        return a.reshape(n_tasks * batch, a.shape[-1])
     return _fn
 
 
@@ -178,6 +200,10 @@ def meta_train(
     x0_inner_big = x0_train.repeat(N, 1)                        # (N*B_train, 12)
     mass_inner_big = batch_mass_params(task_set.masses, B_train, device)
 
+    # Same for the batched outer rollout (all N tasks in one call).
+    x0_outer_big   = x0_eval.repeat(N, 1)                       # (N*B_eval, 12)
+    mass_outer_big = batch_mass_params(task_set.masses, B_eval, device)
+
     # Per-task MassParams moved to ``device`` once (reused every epoch by the
     # extra inner steps and the outer loop).
     masses_dev = [m.to(device) for m in task_set.masses]
@@ -249,20 +275,24 @@ def meta_train(
             adapted_thetas.append(theta_i)
         t_grad = _now()
 
-        # ── Outer loss (sequential per task) ─────────────────────────────
-        meta_loss = torch.tensor(0.0, device=device)
-        for theta_i, mass_i in zip(adapted_thetas, masses_dev):
-            X_out = rollout(
-                _make_fn(policy, theta_i), x0_eval, n_steps,
-                mass_i, dynamics_step,
-                tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
-            )
-            L_out = trajectory_cost(
-                X_out, terminal_weight,
-                pos_weight=pos_weight, z_weight=z_weight).mean()
-            meta_loss = meta_loss + L_out
-
-        meta_loss = meta_loss / N
+        # ── Outer loss (all N tasks batched into one rollout) ────────────
+        # Stack the N adapted parameter sets along a new leading dim; the
+        # batched policy fn then applies task i's weights to row-block i of
+        # an (N*B_eval) rollout — one GPU call instead of N sequential ones.
+        # mean() over the (N*B_eval) costs equals (1/N) Σ_i mean_B(cost_i),
+        # i.e. the exact same meta-loss as the per-task sum it replaces.
+        stacked_theta = {
+            name: torch.stack([t[name] for t in adapted_thetas], dim=0)
+            for name in adapted_thetas[0]
+        }
+        X_out = rollout(
+            _make_batched_fn(policy, stacked_theta, N, B_eval),
+            x0_outer_big, n_steps, mass_outer_big, dynamics_step,
+            tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
+        )                                          # (N*B_eval, n_steps, 12)
+        meta_loss = trajectory_cost(
+            X_out, terminal_weight,
+            pos_weight=pos_weight, z_weight=z_weight).mean()
         t_outer = _now()
         meta_loss.backward()
         t_back = _now()
