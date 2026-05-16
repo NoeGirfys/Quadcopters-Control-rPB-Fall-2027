@@ -1,0 +1,3 @@
+srun: Job step aborted: Waiting up to 32 seconds for job step to finish.
+slurmstepd: error: *** JOB 2902845 ON i44 CANCELLED AT 2026-05-16T12:45:29 DUE TO TIME LIMIT ***
+slurmstepd: error: *** STEP 2902845.0 ON i44 CANCELLED AT 2026-05-16T12:45:29 DUE TO TIME LIMIT ***
