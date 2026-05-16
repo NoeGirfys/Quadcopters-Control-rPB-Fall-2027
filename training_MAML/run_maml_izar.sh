@@ -1,12 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=maml_cf
 #SBATCH --partition=gpu          # file d'attente GPU sur Izar
-#SBATCH --qos=debug              # QOS debug : 1h max, haute priorité, gratuit (pour PROFILAGE)
-                                 #   -> pour la prod, repasser en --qos=normal (3 jours max sur Izar)
+#SBATCH --qos=normal             # QOS normal (jusqu'à 3 jours sur Izar)
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=01:00:00          # Temps max (debug = 1h plafond)
+#SBATCH --time=04:00:00          # ~23s/epoch -> 445 epochs restantes en ~3h, marge incluse
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
 
