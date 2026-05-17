@@ -35,11 +35,13 @@ def plot_fixed_task_map(out_path: str, *,
                         x0_eval: torch.Tensor,
                         half_side: float,
                         xy_min: float, xy_max: float,
-                        z_min: float, z_max: float):
+                        z_min: float, z_max: float,
+                        m_extras=None):
     """Save a 2-panel diagnostic plot for the fixed uniform task set.
 
     * Left  : body-frame xy scatter of the N fixed mass positions,
-              coloured by dz value; box shows the sampling range.
+              coloured by dz; marker size encodes the per-task extra mass
+              when ``m_extras`` (N,) is given. Box shows the xy range.
     * Right : xy projection of the fixed train/eval x0 sets.
     """
     import matplotlib.pyplot as plt
@@ -50,15 +52,35 @@ def plot_fixed_task_map(out_path: str, *,
 
     # ── Left: mass positions ──────────────────────────────────────────
     ax = axs[0]
+    # Marker size encodes the per-task extra mass (constant when m_extras
+    # is None, e.g. an old checkpoint).
+    s_lo, s_hi = 25.0, 220.0
+    if m_extras is not None:
+        m_g = np.asarray(m_extras, dtype=np.float64).reshape(-1) * 1e3   # grams
+        span = float(m_g.max() - m_g.min())
+        sizes = (np.full(len(m_g), 60.0) if span < 1e-6
+                 else s_lo + (s_hi - s_lo) * (m_g - m_g.min()) / span)
+    else:
+        m_g, sizes = None, 30.0
+
     sc = ax.scatter(positions[:, 0] * 100, positions[:, 1] * 100,
                     c=positions[:, 2] * 100, cmap="coolwarm",
-                    s=30, alpha=0.7, edgecolors="none")
+                    s=sizes, alpha=0.75, edgecolors="k", linewidths=0.4)
     plt.colorbar(sc, ax=ax, label="dz [cm]")
     rect = plt.Rectangle((xy_min * 100, xy_min * 100),
                           (xy_max - xy_min) * 100, (xy_max - xy_min) * 100,
                           linewidth=1.5, edgecolor="k", facecolor="none",
                           linestyle="--", label="sampling box")
     ax.add_patch(rect)
+
+    # Size legend for the extra mass (3 proxy markers: min / mid / max).
+    if m_g is not None and float(m_g.max() - m_g.min()) > 1e-6:
+        lo, hi = float(m_g.min()), float(m_g.max())
+        for mv in (lo, 0.5 * (lo + hi), hi):
+            sv = s_lo + (s_hi - s_lo) * (mv - lo) / (hi - lo)
+            ax.scatter([], [], s=sv, c="lightgray", edgecolors="k",
+                       linewidths=0.4, label=f"m = {mv:.1f} g")
+
     ax.set_aspect("equal"); ax.grid(True)
     ax.set_title(f"Fixed task set (N={len(positions)}) — body-frame xy")
     ax.set_xlabel("dx [cm]"); ax.set_ylabel("dy [cm]")

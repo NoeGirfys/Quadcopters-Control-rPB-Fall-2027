@@ -71,7 +71,8 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "pos_weight":      float(saved.get("pos_weight", 10.0)),
         "z_weight":        float(saved.get("z_weight", 1.0)),
         "dynamics":        str(saved.get("dynamics", "nonlinear")),
-        "mass":            float(saved.get("mass", 0.010)),
+        "mass_min":        float(saved.get("mass_min", saved.get("mass", 0.010))),
+        "mass_max":        float(saved.get("mass_max", saved.get("mass", 0.010))),
         "n_tasks":         int(saved.get("n_tasks", 50)),
         "xy_min":          float(saved.get("xy_min", -0.04)),
         "xy_max":          float(saved.get("xy_max",  0.04)),
@@ -80,6 +81,18 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "seed":            int(saved.get("seed", 42)),
         "verbose_every":   int(saved.get("verbose_every", 1)),
     }
+
+
+def _ckpt_m_extras(ckpt) -> np.ndarray:
+    """Per-task extra masses from a checkpoint.
+
+    New checkpoints store an (N,) ``m_extras`` array; old ones store only a
+    scalar ``m_extra`` — broadcast it for backward compatibility.
+    """
+    n = len(ckpt["task_positions"])
+    if "m_extras" in ckpt:
+        return np.asarray(ckpt["m_extras"], dtype=np.float32)
+    return np.full(n, float(ckpt["m_extra"]), dtype=np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -119,8 +132,10 @@ def parse_args():
 
     # Task set
     p.add_argument("--n-tasks",  type=int,   default=d.get("n_tasks",  50))
-    p.add_argument("--mass",     type=float, default=d.get("mass",     0.010),
-                   help="extra point mass for every task [kg]")
+    p.add_argument("--mass-min", type=float, default=d.get("mass_min", 0.010),
+                   help="lower bound for the per-task extra mass [kg]")
+    p.add_argument("--mass-max", type=float, default=d.get("mass_max", 0.010),
+                   help="upper bound for the per-task extra mass [kg]")
     p.add_argument("--xy-min",   type=float, default=d.get("xy_min",  -0.04))
     p.add_argument("--xy-max",   type=float, default=d.get("xy_max",   0.04))
     p.add_argument("--z-min",    type=float, default=d.get("z_min",   -0.01))
@@ -173,21 +188,16 @@ def main():
 
     # ── Fixed task set ─────────────────────────────────────────────────
     if ckpt is not None:
-        ckpt_m_extra = float(ckpt["m_extra"])
-        if abs(args.mass - ckpt_m_extra) > 1e-9:
-            print(f"[WARNING] --mass {args.mass} differs from the checkpoint's "
-                  f"m_extra {ckpt_m_extra}. Resuming keeps the saved task "
-                  f"positions and optimizer state but changes the extra mass, "
-                  f"which is inconsistent with the run so far. Use --mass "
-                  f"{ckpt_m_extra} to resume faithfully.")
-        task_set = FixedUniformMassSet.from_positions(
-            ckpt["task_positions"], m_extra=args.mass)
+        # Reconstruct the exact task set (positions + per-task masses).
+        task_set = FixedUniformMassSet.from_arrays(
+            ckpt["task_positions"], _ckpt_m_extras(ckpt))
         print(f"[Tasks]  {len(task_set)} tasks restored from checkpoint")
     elif args.from_maml_ckpt is not None:
         maml_ckpt = torch.load(args.from_maml_ckpt, map_location="cpu",
                                weights_only=False)
-        task_set = FixedUniformMassSet.from_positions(
-            maml_ckpt["task_positions"], m_extra=maml_ckpt["m_extra"])
+        # Mirror the MAML run's task set exactly (positions AND masses).
+        task_set = FixedUniformMassSet.from_arrays(
+            maml_ckpt["task_positions"], _ckpt_m_extras(maml_ckpt))
         print(f"[Tasks]  {len(task_set)} tasks loaded from MAML checkpoint")
     else:
         rng_tasks = np.random.default_rng(args.seed)
@@ -195,13 +205,13 @@ def main():
             n_tasks=args.n_tasks,
             xy_min=args.xy_min, xy_max=args.xy_max,
             z_min=args.z_min,   z_max=args.z_max,
-            m_extra=args.mass,
+            mass_min=args.mass_min, mass_max=args.mass_max,
             rng=rng_tasks,
         )
         print(f"[Tasks]  {args.n_tasks} tasks sampled  "
               f"xy=[{args.xy_min*100:.1f},{args.xy_max*100:.1f}]cm  "
               f"z=[{args.z_min*100:.1f},{args.z_max*100:.1f}]cm  "
-              f"m={args.mass*1e3:.0f}g")
+              f"m=[{args.mass_min*1e3:.1f},{args.mass_max*1e3:.1f}]g")
 
     # ── x0 batches ────────────────────────────────────────────────────
     if ckpt is not None:
@@ -230,13 +240,13 @@ def main():
     # init weights are immediately overwritten by load_state_dict, and
     # baseline_train restores the saved RNG state anyway.
     torch.manual_seed(args.seed)
-    M_total = C.M_BASE + args.mass
+    M_total = C.M_BASE + task_set.m_extra          # mean extra mass over the task set
     hover_thrust_u16 = (M_total * C.G * C.UINT16_MAX) / (4 * C.CF2_THRUST_MAX_PER_MOTOR)
     policy = PolicyMLP(hidden=args.hidden, hover_thrust_u16=hover_thrust_u16).to(device)
     if ckpt is not None:
         policy.load_state_dict(ckpt["state_dict"])
         print(f"[Policy] restored weights  (actual_epochs={ckpt.get('actual_epochs','?')})")
-    print(f"[Policy] hover thrust (M={M_total*1e3:.1f}g) ≈ {hover_thrust_u16:.0f}")
+    print(f"[Policy] hover thrust (mean M={M_total*1e3:.1f}g) ≈ {hover_thrust_u16:.0f}")
 
     # ── Ancillary ─────────────────────────────────────────────────────
     obs_noise = (C.OBS_NOISE_STD * args.obs_noise_scale).to(device) \
@@ -257,7 +267,8 @@ def main():
         "nn_freq":        C.NN_FREQ,
         "att_rate":       C.ATTITUDE_RATE,
         "task_positions": task_set.positions,
-        "m_extra":        task_set.m_extra,
+        "m_extras":       task_set.m_extras,     # (N,) per-task extra mass
+        "m_extra":        task_set.m_extra,      # mean — kept for old readers
         "x0_train":       x0_train.detach().cpu(),
         "x0_eval":        x0_eval.detach().cpu(),
     }

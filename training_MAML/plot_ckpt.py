@@ -108,6 +108,7 @@ def main():
             xy_max=float(saved_args["xy_max"]),
             z_min=float(saved_args["z_min"]),
             z_max=float(saved_args["z_max"]),
+            m_extras=ckpt.get("m_extras"),   # None for old checkpoints
         )
         print(f"[Saved] {map_path}")
     except Exception as e:
