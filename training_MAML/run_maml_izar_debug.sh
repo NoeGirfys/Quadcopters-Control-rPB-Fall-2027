@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=00:20:00          # assez pour mesurer le temps/epoch
+#SBATCH --time=00:10:00          # assez pour mesurer le temps/epoch
 #SBATCH --output=logs/maml_dbg_%j.out
 #SBATCH --error=logs/maml_dbg_%j.err
 
