@@ -398,6 +398,7 @@ def meta_train(
                 obs_noise_std=obs_noise_std, tau_div=tau_div,
                 inner_grad_clip=inner_grad_clip,
                 device=device, seed=seed)
+        t_target = _now()
 
         history["epoch"].append(ep + 1)
         history["meta_loss"].append(float(meta_loss.item()))
@@ -413,21 +414,26 @@ def meta_train(
                 line += f"  target=[{_format_targets(target_losses)}]"
             print(line)
 
+        if on_epoch_end is not None:
+            on_epoch_end(ep, policy, history,
+                         optimizer=opt, torch_gen=torch_gen)
+        t_ckpt = _now()
+
         if profile:
-            d_inner = t_inner - t0
-            d_grad  = t_grad  - t_inner
-            d_outer = t_outer - t_grad
-            d_back  = t_back  - t_outer
-            d_total = t_back  - t0
+            d_inner  = t_inner  - t0
+            d_grad   = t_grad   - t_inner
+            d_outer  = t_outer  - t_grad
+            d_back   = t_back   - t_outer
+            d_target = t_target - t_back
+            d_ckpt   = t_ckpt   - t_target
+            d_total  = t_ckpt   - t0
             print(f"  [profile ep {ep+1}] total={d_total:.2f}s | "
                   f"inner_rollout={d_inner:.2f}s ({100*d_inner/d_total:.0f}%)  "
                   f"grad_loop={d_grad:.2f}s ({100*d_grad/d_total:.0f}%)  "
                   f"outer_loop={d_outer:.2f}s ({100*d_outer/d_total:.0f}%)  "
-                  f"meta_backward={d_back:.2f}s ({100*d_back/d_total:.0f}%)")
-
-        if on_epoch_end is not None:
-            on_epoch_end(ep, policy, history,
-                         optimizer=opt, torch_gen=torch_gen)
+                  f"meta_backward={d_back:.2f}s ({100*d_back/d_total:.0f}%)  "
+                  f"target_eval={d_target:.2f}s ({100*d_target/d_total:.0f}%)  "
+                  f"ckpt_save={d_ckpt:.2f}s ({100*d_ckpt/d_total:.0f}%)")
 
         if killer is not None and killer.kill_now:
             print(f"[Arrêt propre] à l'epoch {ep+1}.")
