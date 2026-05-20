@@ -1,0 +1,9 @@
+# Target (held-out) task for the composite MAML run.
+#
+# Same schema as tasks_default.yaml. This default picks distributions
+# the training set never uses — gaussian 4 (motor M4, front-left) and
+# octant 8 (-,-,-) — so the target loss is a genuine OOD test.
+tasks:
+  - name: target_G4_O8
+    mass_gaussians: [4]
+    octants:        [8]

@@ -101,9 +101,22 @@ def obs_to_nn_state(obs: np.ndarray) -> np.ndarray:
 def load_and_adapt(args, device: str):
     """Load checkpoint, rebuild policy, run maml_adapt, return adapted state."""
     ckpt = torch.load(args.weights, map_location=device, weights_only=False)
-    saved_args   = ckpt["args"]
-    m_extra_train = float(ckpt["m_extra"])
-    x0_train      = ckpt["x0_train"].to(device)
+    saved_args = ckpt["args"]
+
+    # New composite-task-set format (preferred); fall back to legacy ckpts.
+    if "task_set" in ckpt:
+        ts = ckpt["task_set"]
+        m_extras_all = np.concatenate([
+            np.asarray(ts["m_extras_train"]).reshape(-1),
+            np.asarray(ts["m_extras_eval"]).reshape(-1),
+        ])
+        m_extra_train = float(m_extras_all.mean())
+        # Flatten all per-task training x0 into a single adaptation set.
+        x0_train = torch.as_tensor(ts["x0_train"], dtype=torch.float32
+                                   ).reshape(-1, 12).to(device)
+    else:
+        m_extra_train = float(ckpt["m_extra"])
+        x0_train      = ckpt["x0_train"].to(device)
 
     # --- Target mass position --------------------------------------
     dx = args.target_dx if args.target_dx is not None else 0.0

@@ -1,3 +1,3 @@
-from .uniform_mass import FixedUniformMassSet
+from .composite import CompositeTaskSet, OCTANT_SIGNS
 
-__all__ = ["FixedUniformMassSet"]
+__all__ = ["CompositeTaskSet", "OCTANT_SIGNS"]

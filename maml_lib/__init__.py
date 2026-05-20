@@ -4,11 +4,12 @@ Public surface:
 
     from maml_lib import (
         config,
-        MassParams, compute_mass_params, batch_mass_params,
+        MassParams, compute_mass_params, compute_mass_params_batched,
+        cat_mass_params, batch_mass_params,
         nonlinear_step, linearized_step, DYNAMICS,
         PolicyMLP,
         rollout, compute_relative_targets, trajectory_cost,
-        FixedUniformMassSet,
+        CompositeTaskSet, OCTANT_SIGNS,
         meta_train, maml_adapt, baseline_train,
         sample_hover_x0, plot_fixed_task_map,
         make_x0_batch, generate_cube_points, GracefulKiller,
@@ -16,12 +17,15 @@ Public surface:
 """
 from . import config
 
-from .mass_params import MassParams, compute_mass_params, batch_mass_params
+from .mass_params import (
+    MassParams, compute_mass_params, compute_mass_params_batched,
+    cat_mass_params, batch_mass_params,
+)
 from .dynamics    import nonlinear_step, linearized_step, DYNAMICS
 from .policy      import PolicyMLP
 from .rollout     import rollout, compute_relative_targets
 from .cost        import trajectory_cost
-from .tasks       import FixedUniformMassSet
+from .tasks       import CompositeTaskSet, OCTANT_SIGNS
 from .maml        import meta_train, maml_adapt, baseline_train
 from .utils       import (
     sample_hover_x0, plot_fixed_task_map,
@@ -30,11 +34,12 @@ from .utils       import (
 
 __all__ = [
     "config",
-    "MassParams", "compute_mass_params", "batch_mass_params",
+    "MassParams", "compute_mass_params", "compute_mass_params_batched",
+    "cat_mass_params", "batch_mass_params",
     "nonlinear_step", "linearized_step", "DYNAMICS",
     "PolicyMLP",
     "rollout", "compute_relative_targets", "trajectory_cost",
-    "FixedUniformMassSet",
+    "CompositeTaskSet", "OCTANT_SIGNS",
     "meta_train", "maml_adapt", "baseline_train",
     "sample_hover_x0", "plot_fixed_task_map",
     "make_x0_batch", "generate_cube_points", "GracefulKiller",

@@ -1,46 +1,48 @@
 """MAML (Finn et al. 2017) and multi-task baseline training.
 
-Task set
---------
-Both ``meta_train`` and ``baseline_train`` accept a ``FixedUniformMassSet``
-whose N tasks are sampled *once at startup* and reused every epoch.  This
-makes the gradient estimate stable and lets the two functions train on
-exactly the same data for a fair comparison.
+Both ``meta_train`` and ``baseline_train`` consume a
+:class:`maml_lib.tasks.CompositeTaskSet` whose tasks (and per-task support
+and query points) are sampled *once at startup* and reused every epoch.
 
-GPU parallelism
----------------
-Inner loop (first adaptation step)
-    All N tasks share the same meta-parameters θ, so their inner rollouts
-    are stacked into one big batch (N*B_train, 12) — a single GPU call.
-    Per-task gradients are then computed with N sequential ``autograd.grad``
-    calls (retain_graph=True), each touching only its own slice of the graph.
-    For n_inner_steps > 1, subsequent steps are sequential (different θ per
-    task after step 1).
+A held-out :class:`CompositeTaskSet` can be passed as ``target_set`` to
+log a generalisation metric every epoch *without ever feeding it to the
+optimiser*:
 
-Outer loop / baseline
-    Sequential over tasks (different adapted θ per task), but the outer
-    meta_loss is accumulated *before* calling backward(), so PyTorch fuses
-    the backward passes internally.
+  * MAML : few-shot adaptation on the target's support set, then loss
+           on its query set (recorded in ``history["target_loss"]``).
+  * Base : raw-policy loss on the target's query set.
 
-Baseline
-    All N tasks share the same policy, so train and eval rollouts are fully
-    batched (N*B_train, 12) — one GPU call covers the whole epoch.
+GPU optimisations preserved across the refactor
+-----------------------------------------------
+The inner-loop machinery (vmapped grouped policy forward via
+``_make_batched_fn``, batched per-task gradient via ``is_grads_batched``
+through ``_batched_inner_grads``) is identical: it works on (N*M, ·)
+batches regardless of whether the per-row masses are repeated (legacy)
+or per-point (new). ``cat_mass_params`` simply concatenates per-task
+batched masses along their batch dim instead of the old per-task tiling.
 """
 import time
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 
+try:
+    from torch.func import functional_call, vmap
+except ImportError:
+    from torch.nn.utils.stateless import functional_call
+    from functorch import vmap
+
+from .cost import trajectory_cost
+from .rollout import rollout
+from .mass_params import MassParams, cat_mass_params
+from .tasks import CompositeTaskSet
+
+
+# ---------------------------------------------------------------------------
+# RNG restoration helpers (resume)
+# ---------------------------------------------------------------------------
 
 def _restore_torch_gen(device: str, state, seed: int) -> torch.Generator:
-    """Rebuild a torch.Generator on ``device`` from a saved state.
-
-    Saved states are CPU ByteTensors. ``Generator.set_state`` is strict about
-    device/size, so if the saved state was produced for a different device
-    (e.g. checkpoint trained on CPU, resume on CUDA, or vice-versa), the call
-    fails. In that case fall back to re-seeding deterministically so training
-    can still resume without crashing.
-    """
     gen = torch.Generator(device=device)
     try:
         if state is not None:
@@ -55,7 +57,6 @@ def _restore_torch_gen(device: str, state, seed: int) -> torch.Generator:
 
 
 def _restore_global_rng(resume_state: dict, seed: int) -> None:
-    """Restore torch CPU / CUDA RNG, falling back to manual_seed on mismatch."""
     cpu_state = resume_state.get("torch_rng_state", None)
     if cpu_state is not None:
         try:
@@ -66,7 +67,6 @@ def _restore_global_rng(resume_state: dict, seed: int) -> None:
             torch.manual_seed(seed)
     else:
         torch.manual_seed(seed)
-
     if torch.cuda.is_available() and "torch_cuda_rng_state" in resume_state:
         try:
             torch.cuda.set_rng_state(
@@ -75,20 +75,10 @@ def _restore_global_rng(resume_state: dict, seed: int) -> None:
             print(f"[Resume] could not restore torch CUDA RNG state "
                   f"({e.__class__.__name__}: {e}); reseeding with {seed}.")
             torch.cuda.manual_seed_all(seed)
-try:
-    from torch.func import functional_call, vmap
-except ImportError:
-    from torch.nn.utils.stateless import functional_call
-    from functorch import vmap
-
-from .cost import trajectory_cost
-from .rollout import rollout
-from .mass_params import MassParams, batch_mass_params
-from .tasks import FixedUniformMassSet
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# Policy callables (functional + vmapped grouped)
 # ---------------------------------------------------------------------------
 
 def _make_fn(policy, theta):
@@ -101,10 +91,9 @@ def _make_batched_fn(policy, stacked_theta, n_tasks, batch):
     """Policy callable that applies a *different* theta to each task block.
 
     ``stacked_theta`` maps every parameter name to a tensor whose leading
-    dim of size ``n_tasks`` indexes the per-task adapted weights. The
-    returned fn expects flat ``(n_tasks*batch, .)`` inputs whose row-block
-    ``i`` (rows ``i*batch : (i+1)*batch``) is run with ``stacked_theta[i]``.
-    This replaces N sequential outer rollouts with a single batched call.
+    dim of size ``n_tasks`` indexes the per-task adapted weights. Inputs
+    are flat ``(n_tasks*batch, .)``; row-block ``i`` (rows
+    ``i*batch : (i+1)*batch``) is run with ``stacked_theta[i]``.
     """
     def _one(theta_i, state_i, target_i):
         return functional_call(policy, theta_i, (state_i, target_i))
@@ -118,6 +107,10 @@ def _make_batched_fn(policy, stacked_theta, n_tasks, batch):
     return _fn
 
 
+# ---------------------------------------------------------------------------
+# Gradient utilities
+# ---------------------------------------------------------------------------
+
 def _clip_grads(grads, max_norm: float = 1.0):
     total = torch.sqrt(sum((g.detach() ** 2).sum() for g in grads))
     coef  = torch.clamp(max_norm / (total + 1e-6), max=1.0)
@@ -125,15 +118,10 @@ def _clip_grads(grads, max_norm: float = 1.0):
 
 
 def _clip_grads_batched(batched_grads, max_norm: float = 1.0):
-    """Per-task grad-norm clipping for batched grads.
-
-    Each tensor in ``batched_grads`` has a leading task dim
-    ``(n_tasks, *param_shape)``. Equivalent to applying ``_clip_grads``
-    independently to every task.
-    """
+    """Per-task grad-norm clipping for batched grads ``(n_tasks, *param)``."""
     sq = sum((g.detach() ** 2).flatten(1).sum(dim=1) for g in batched_grads)
-    total = torch.sqrt(sq)                                       # (n_tasks,)
-    coef  = torch.clamp(max_norm / (total + 1e-6), max=1.0)       # (n_tasks,)
+    total = torch.sqrt(sq)
+    coef  = torch.clamp(max_norm / (total + 1e-6), max=1.0)
     out = []
     for g in batched_grads:
         c = coef.view(coef.shape[0], *([1] * (g.dim() - 1)))
@@ -142,18 +130,7 @@ def _clip_grads_batched(batched_grads, max_norm: float = 1.0):
 
 
 def _batched_inner_grads(costs, inputs, n_tasks, create_graph, chunk):
-    """Per-task gradients ∂costs[i]/∂inputs for all i, in one vmapped VJP.
-
-    The N sequential ``autograd.grad(costs[i], inputs)`` calls compute the
-    Jacobian of ``costs`` (shape ``(n_tasks,)``) w.r.t. ``inputs``. Feeding
-    the identity matrix as batched ``grad_outputs`` (``is_grads_batched``)
-    yields all N rows in a single backward. ``chunk`` optionally splits the
-    identity rows to bound peak memory (the batched backward holds gradient
-    buffers with a leading dim of ``chunk``).
-
-    Returns a tuple aligned with ``inputs``; element j has shape
-    ``(n_tasks, *inputs[j].shape)``.
-    """
+    """Per-task gradients ∂costs[i]/∂inputs for all i, in one vmapped VJP."""
     eye = torch.eye(n_tasks, device=costs.device, dtype=costs.dtype)
     if chunk is None or chunk >= n_tasks:
         return torch.autograd.grad(
@@ -172,15 +149,75 @@ def _batched_inner_grads(costs, inputs, n_tasks, create_graph, chunk):
 
 
 # ---------------------------------------------------------------------------
+# Target evaluation (held-out, never feeds the optimiser)
+# ---------------------------------------------------------------------------
+
+def _eval_target_maml(policy, target_set, *,
+                      dynamics_step, n_steps, n_inner_steps, lr_inner,
+                      terminal_weight, pos_weight, z_weight,
+                      obs_noise_std, tau_div, inner_grad_clip,
+                      device, seed):
+    """Per-target-task: few-shot adapt on support, query loss on eval."""
+    losses = []
+    for t in range(target_set.N):
+        adapted_theta, _ = maml_adapt(
+            policy,
+            mass=target_set.masses_train[t],
+            x0=target_set.x0_train[t],
+            dynamics_step=dynamics_step,
+            n_steps=n_steps, n_steps_adapt=n_inner_steps,
+            lr_inner=lr_inner,
+            terminal_weight=terminal_weight,
+            pos_weight=pos_weight, z_weight=z_weight,
+            obs_noise_std=obs_noise_std, tau_div=tau_div,
+            inner_grad_clip=inner_grad_clip,
+            device=device, seed=seed * 31 + t,
+            verbose=False,
+        )
+        with torch.no_grad():
+            X = rollout(
+                _make_fn(policy, adapted_theta),
+                target_set.x0_eval[t].to(device), n_steps,
+                target_set.masses_eval[t].to(device), dynamics_step,
+                tau_div=tau_div, obs_noise_std=None, gen=None)
+            L = trajectory_cost(X, terminal_weight,
+                                pos_weight=pos_weight, z_weight=z_weight).mean()
+        losses.append(float(L.item()))
+    return losses
+
+
+def _eval_target_baseline(policy, target_set, *,
+                          dynamics_step, n_steps,
+                          terminal_weight, pos_weight, z_weight,
+                          tau_div, device):
+    """Per-target-task: raw-policy loss on the query set (no adaptation)."""
+    losses = []
+    for t in range(target_set.N):
+        with torch.no_grad():
+            X = rollout(
+                policy,
+                target_set.x0_eval[t].to(device), n_steps,
+                target_set.masses_eval[t].to(device), dynamics_step,
+                tau_div=tau_div, obs_noise_std=None, gen=None)
+            L = trajectory_cost(X, terminal_weight,
+                                pos_weight=pos_weight, z_weight=z_weight).mean()
+        losses.append(float(L.item()))
+    return losses
+
+
+def _format_targets(losses: List[float]) -> str:
+    return ",".join(f"{l:.3e}" for l in losses)
+
+
+# ---------------------------------------------------------------------------
 # MAML meta-training
 # ---------------------------------------------------------------------------
 
 def meta_train(
     policy: torch.nn.Module,
-    task_set: FixedUniformMassSet,
-    x0_train: torch.Tensor,
-    x0_eval: torch.Tensor,
+    task_set: CompositeTaskSet,
     *,
+    target_set: Optional[CompositeTaskSet] = None,
     dynamics_step: Callable,
     n_steps: int,
     epochs: int,
@@ -203,35 +240,24 @@ def meta_train(
     profile: bool = False,
     grad_chunk: int = None,
 ):
-    """Meta-train ``policy`` with MAML over a fixed uniform task set.
+    """Meta-train ``policy`` with MAML over a CompositeTaskSet.
 
-    The N tasks in ``task_set`` are fixed for the whole run; each epoch is a
-    complete pass over all N tasks (no re-sampling).
-
-    Inner loop GPU speedup
-        Step 1 of the inner loop batches all N tasks into one rollout on
-        (N*B_train, 12) states.  Per-task gradients are extracted with
-        sequential ``autograd.grad`` calls that each touch only their slice.
-        Subsequent inner steps (if n_inner_steps > 1) are sequential because
-        each task uses its own adapted parameters after step 1.
-
-    Returns:
-        policy, history
+    ``target_set`` (optional) is held strictly out of the optimiser: its
+    loss after few-shot adaptation is computed every epoch with
+    ``torch.no_grad`` on the outer rollout, and logged to
+    ``history["target_loss"]``.
     """
-    N        = len(task_set)
-    B_train  = x0_train.shape[0]
-    B_eval   = x0_eval.shape[0]
+    N = task_set.N
+    B_train = task_set.M_train
+    B_eval  = task_set.M_eval
     create_graph = (maml_order == 2)
-
-    x0_train = x0_train.to(device)
-    x0_eval  = x0_eval.to(device)
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
 
     if resume_state is None:
         torch.manual_seed(seed)
         torch_gen = torch.Generator(device=device).manual_seed(seed)
-        history = {"epoch": [], "meta_loss": [], "inner_pre": []}
+        history = {"epoch": [], "meta_loss": [], "inner_pre": [], "target_loss": []}
         start_epoch = 0
     else:
         _restore_global_rng(resume_state, seed)
@@ -239,27 +265,28 @@ def meta_train(
             device, resume_state.get("torch_gen_state", None), seed)
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
-        for k, v in [("epoch", []), ("meta_loss", []), ("inner_pre", [])]:
+        for k, v in [("epoch", []), ("meta_loss", []), ("inner_pre", []),
+                     ("target_loss", [])]:
             history.setdefault(k, v)
         start_epoch = len(history["epoch"])
         print(f"[Resume] from epoch {start_epoch}/{epochs}.")
 
-    # Pre-build the big x0 / batched mass for the inner step-1 rollout.
-    x0_inner_big = x0_train.repeat(N, 1)                        # (N*B_train, 12)
-    mass_inner_big = batch_mass_params(task_set.masses, B_train, device)
+    # ── Per-task device-resident tensors ────────────────────────────────
+    masses_train_dev = [m.to(device) for m in task_set.masses_train]
+    masses_eval_dev  = [m.to(device) for m in task_set.masses_eval]
+    x0_train_dev = task_set.x0_train.to(device)         # (N, M_train, 12)
+    x0_eval_dev  = task_set.x0_eval.to(device)          # (N, M_eval,  12)
 
-    # Same for the batched outer rollout (all N tasks in one call).
-    x0_outer_big   = x0_eval.repeat(N, 1)                       # (N*B_eval, 12)
-    mass_outer_big = batch_mass_params(task_set.masses, B_eval, device)
+    # Pre-built big tensors for the batched inner/outer rollouts.
+    x0_inner_big  = x0_train_dev.reshape(N * B_train, 12)
+    mass_inner_big = cat_mass_params(masses_train_dev, device)
 
-    # Per-task MassParams moved to ``device`` once (reused every epoch by the
-    # extra inner steps and the outer loop).
-    masses_dev = [m.to(device) for m in task_set.masses]
+    x0_outer_big  = x0_eval_dev.reshape(N * B_eval, 12)
+    mass_outer_big = cat_mass_params(masses_eval_dev, device)
 
     _use_cuda = torch.cuda.is_available() and str(device).startswith("cuda")
 
     def _now() -> float:
-        """Wall-clock time, syncing CUDA so GPU work is actually finished."""
         if _use_cuda:
             torch.cuda.synchronize()
         return time.perf_counter()
@@ -268,31 +295,28 @@ def meta_train(
         opt.zero_grad()
         t0 = _now()
 
-        # ── Step 1 inner loop: one big batched forward pass ──────────────
+        # ── Step 1 inner loop: one big batched forward pass ─────────────
         theta = {n: p for n, p in policy.named_parameters()}
 
         X_inner_big = rollout(
             _make_fn(policy, theta), x0_inner_big, n_steps,
             mass_inner_big, dynamics_step,
             tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
-        )   # (N*B_train, n_steps, 12)
+        )                                                # (N*B_train, n_steps, 12)
 
         costs_0 = (trajectory_cost(
                        X_inner_big.view(N * B_train, n_steps, 12),
                        terminal_weight, pos_weight=pos_weight, z_weight=z_weight)
-                   .view(N, B_train).mean(dim=1))   # (N,)
+                   .view(N, B_train).mean(dim=1))         # (N,)
 
         inner_pre = costs_0.detach().mean().item()
         t_inner = _now()
 
-        # ── Per-task gradient + adaptation ───────────────────────────────
+        # ── Per-task gradient + adaptation ──────────────────────────────
         theta_items  = list(theta.items())
         theta_values = tuple(p for _, p in theta_items)
 
         if n_inner_steps == 1:
-            # Fast path: a single vmapped VJP yields every task's inner
-            # gradient at once, and the one-step adaptation is assembled
-            # directly as stacked (N, *param) tensors — no Python loop.
             batched = _batched_inner_grads(
                 costs_0, theta_values, N, create_graph, grad_chunk)
             if inner_grad_clip > 0:
@@ -302,13 +326,8 @@ def meta_train(
                 for (name, p), g in zip(theta_items, batched)
             }
         else:
-            # Sequential path: extra inner steps give each task its own θ,
-            # so the adaptation cannot be expressed as one batched VJP.
             adapted_thetas: List[dict] = []
             for i in range(N):
-                # Keep the big inner graph alive until the last task's grad
-                # is computed. For 2nd-order MAML it must stay alive until
-                # meta_loss.backward(), so always retain when create_graph.
                 retain = create_graph or (i < N - 1)
                 grads = torch.autograd.grad(
                     costs_0[i], theta_values,
@@ -321,8 +340,9 @@ def meta_train(
 
                 for _step in range(1, n_inner_steps):
                     X_in = rollout(
-                        _make_fn(policy, theta_i), x0_train, n_steps,
-                        masses_dev[i], dynamics_step,
+                        _make_fn(policy, theta_i),
+                        x0_train_dev[i], n_steps,
+                        masses_train_dev[i], dynamics_step,
                         tau_div=tau_div, obs_noise_std=obs_noise_std,
                         gen=torch_gen,
                     )
@@ -344,18 +364,12 @@ def meta_train(
             }
         t_grad = _now()
 
-        # ── Outer loss (all N tasks batched into one rollout) ────────────
-        # ``stacked_theta`` maps each parameter name to an (N, *param)
-        # tensor; the batched policy fn applies task i's weights to
-        # row-block i of an (N*B_eval) rollout — one GPU call instead of
-        # N sequential ones. mean() over the (N*B_eval) costs equals
-        # (1/N) Σ_i mean_B(cost_i), the exact same meta-loss as a per-task
-        # sum.
+        # ── Outer loss (all N tasks batched into one rollout) ───────────
         X_out = rollout(
             _make_batched_fn(policy, stacked_theta, N, B_eval),
             x0_outer_big, n_steps, mass_outer_big, dynamics_step,
             tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
-        )                                          # (N*B_eval, n_steps, 12)
+        )                                                # (N*B_eval, n_steps, 12)
         meta_loss = trajectory_cost(
             X_out, terminal_weight,
             pos_weight=pos_weight, z_weight=z_weight).mean()
@@ -371,14 +385,33 @@ def meta_train(
             torch.nn.utils.clip_grad_norm_(policy.parameters(), 5.0)
             opt.step()
 
+        # ── Target eval (held out from the optimiser) ───────────────────
+        target_losses = None
+        if target_set is not None:
+            target_losses = _eval_target_maml(
+                policy, target_set,
+                dynamics_step=dynamics_step,
+                n_steps=n_steps, n_inner_steps=n_inner_steps,
+                lr_inner=lr_inner,
+                terminal_weight=terminal_weight,
+                pos_weight=pos_weight, z_weight=z_weight,
+                obs_noise_std=obs_noise_std, tau_div=tau_div,
+                inner_grad_clip=inner_grad_clip,
+                device=device, seed=seed)
+
         history["epoch"].append(ep + 1)
         history["meta_loss"].append(float(meta_loss.item()))
         history["inner_pre"].append(float(inner_pre))
+        if target_losses is not None:
+            history["target_loss"].append(target_losses)
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
-            print(f"  [ep {ep+1:4d}/{epochs}] "
-                  f"meta={meta_loss.item():.4e}  "
-                  f"inner_pre={inner_pre:.4e}")
+            line = (f"  [ep {ep+1:4d}/{epochs}] "
+                    f"meta={meta_loss.item():.4e}  "
+                    f"inner_pre={inner_pre:.4e}")
+            if target_losses is not None:
+                line += f"  target=[{_format_targets(target_losses)}]"
+            print(line)
 
         if profile:
             d_inner = t_inner - t0
@@ -409,10 +442,9 @@ def meta_train(
 
 def baseline_train(
     policy: torch.nn.Module,
-    task_set: FixedUniformMassSet,
-    x0_train: torch.Tensor,
-    x0_eval: torch.Tensor,
+    task_set: CompositeTaskSet,
     *,
+    target_set: Optional[CompositeTaskSet] = None,
     dynamics_step: Callable,
     n_steps: int,
     epochs: int,
@@ -429,27 +461,23 @@ def baseline_train(
     killer=None,
     resume_state: dict = None,
 ):
-    """Multi-task baseline: train on all N fixed tasks simultaneously.
+    """Multi-task baseline: train on all N tasks simultaneously.
 
-    All N tasks are batched into a single rollout of (N*B_train, 12) states,
-    giving full GPU utilisation with no extra code complexity.
-
-    history["train_loss"] : loss on x0_train (gradient batch)
-    history["eval_loss"]  : loss on x0_eval  (no grad)
+    Logs ``train_loss``, ``eval_loss`` (on the CompositeTaskSet's query
+    points) and, if ``target_set`` is given, ``target_loss`` — all
+    measured on the same query points the MAML run uses, so the two
+    histories are directly comparable.
     """
-    N       = len(task_set)
-    B_train = x0_train.shape[0]
-    B_eval  = x0_eval.shape[0]
-
-    x0_train = x0_train.to(device)
-    x0_eval  = x0_eval.to(device)
+    N = task_set.N
+    B_train = task_set.M_train
+    B_eval  = task_set.M_eval
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr_outer)
 
     if resume_state is None:
         torch.manual_seed(seed)
         torch_gen = torch.Generator(device=device).manual_seed(seed)
-        history = {"epoch": [], "train_loss": [], "eval_loss": []}
+        history = {"epoch": [], "train_loss": [], "eval_loss": [], "target_loss": []}
         start_epoch = 0
     else:
         _restore_global_rng(resume_state, seed)
@@ -457,21 +485,23 @@ def baseline_train(
             device, resume_state.get("torch_gen_state", None), seed)
         opt.load_state_dict(resume_state["optimizer_state"])
         history = resume_state["history"]
-        for k, v in [("epoch", []), ("train_loss", []), ("eval_loss", [])]:
+        for k, v in [("epoch", []), ("train_loss", []),
+                     ("eval_loss", []), ("target_loss", [])]:
             history.setdefault(k, v)
         start_epoch = len(history["epoch"])
         print(f"[Resume] from epoch {start_epoch}/{epochs}.")
 
-    # Pre-build batched masses (same for every epoch).
-    mass_train_big = batch_mass_params(task_set.masses, B_train, device)
-    mass_eval_big  = batch_mass_params(task_set.masses, B_eval,  device)
-    x0_train_big   = x0_train.repeat(N, 1)   # (N*B_train, 12)
-    x0_eval_big    = x0_eval.repeat(N, 1)    # (N*B_eval,  12)
+    # Pre-built big tensors.
+    masses_train_dev = [m.to(device) for m in task_set.masses_train]
+    masses_eval_dev  = [m.to(device) for m in task_set.masses_eval]
+    mass_train_big = cat_mass_params(masses_train_dev, device)
+    mass_eval_big  = cat_mass_params(masses_eval_dev,  device)
+    x0_train_big = task_set.x0_train.reshape(N * B_train, 12).to(device)
+    x0_eval_big  = task_set.x0_eval.reshape(N * B_eval, 12).to(device)
 
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
 
-        # All N tasks in one forward pass.
         X_tr = rollout(policy, x0_train_big, n_steps,
                        mass_train_big, dynamics_step,
                        tau_div=tau_div, obs_noise_std=obs_noise_std,
@@ -498,13 +528,27 @@ def baseline_train(
                 X_ev, terminal_weight,
                 pos_weight=pos_weight, z_weight=z_weight).mean()
 
+        target_losses = None
+        if target_set is not None:
+            target_losses = _eval_target_baseline(
+                policy, target_set,
+                dynamics_step=dynamics_step, n_steps=n_steps,
+                terminal_weight=terminal_weight,
+                pos_weight=pos_weight, z_weight=z_weight,
+                tau_div=tau_div, device=device)
+
         history["epoch"].append(ep + 1)
         history["train_loss"].append(float(L_tr.item()))
         history["eval_loss"].append(float(L_ev.item()))
+        if target_losses is not None:
+            history["target_loss"].append(target_losses)
 
         if verbose_every and ((ep + 1) % verbose_every == 0):
-            print(f"  [ep {ep+1:4d}/{epochs}] "
-                  f"train={L_tr.item():.4e}  eval={L_ev.item():.4e}")
+            line = (f"  [ep {ep+1:4d}/{epochs}] "
+                    f"train={L_tr.item():.4e}  eval={L_ev.item():.4e}")
+            if target_losses is not None:
+                line += f"  target=[{_format_targets(target_losses)}]"
+            print(line)
 
         if on_epoch_end is not None:
             on_epoch_end(ep, policy, history,
@@ -518,7 +562,7 @@ def baseline_train(
 
 
 # ---------------------------------------------------------------------------
-# Few-shot adaptation (test time)
+# Few-shot adaptation (test time, also reused by the target eval helper)
 # ---------------------------------------------------------------------------
 
 def maml_adapt(
@@ -540,7 +584,12 @@ def maml_adapt(
     seed: int = 0,
     verbose: bool = True,
 ):
-    """Few-shot adaptation on a single test task."""
+    """Few-shot adaptation on a single task (batched mass + x0).
+
+    ``mass`` may be a single-task or batched ``MassParams``; ``x0`` should
+    have the matching leading batch dim. The adapted theta is a detached
+    leaf — it does **not** touch the policy's meta-parameters.
+    """
     theta = {n: p.detach().clone().requires_grad_(True)
              for n, p in policy.named_parameters()}
     gen = torch.Generator(device=device).manual_seed(seed)

@@ -20,10 +20,11 @@ echo "Job ID      : $SLURM_JOB_ID"
 echo "Node        : $SLURMD_NODENAME"
 
 # ====================================================================
-#  Checkpoints (472 epochs, mêmes tâches / x0)
+#  Checkpoints (mêmes tâches / x0 via --from-maml-ckpt côté baseline)
+#  >>> Mets à jour ces chemins après les runs MAML / baseline.
 # ====================================================================
-MAML_CKPT=training_MAML/maml_linearized_h64_o1_n50_izar_uniform_tasks_ep472.pt
-BASE_CKPT=training_MAML/baseline_linearized_h64_n50_izar_uniform_tasks_ep472.pt
+MAML_CKPT=training_MAML/maml_nonlinear_h64_o1_n7_izar_composite_ep500.pt
+BASE_CKPT=training_MAML/baseline_nonlinear_h64_n7_izar_composite_ep500.pt
 
 # ====================================================================
 #  Conditions de test communes — À ÉDITER selon le scénario voulu.

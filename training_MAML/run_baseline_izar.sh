@@ -9,26 +9,24 @@
 #SBATCH --output=logs/baseline_%j.out
 #SBATCH --error=logs/baseline_%j.err
 
-# --- Créer le dossier de logs s'il n'existe pas encore ----------------
 mkdir -p logs
 
-# --- Environnement ----------------------------------------------------
 module purge
 module load gcc python
-
 source venv_MAML_SCITAS/bin/activate
-
 cd $SLURM_SUBMIT_DIR
 
-# --- Vérification GPU -------------------------------------------------
 echo "Job ID      : $SLURM_JOB_ID"
 echo "Node        : $SLURMD_NODENAME"
 python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.cuda.is_available(), '| device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
 
 # --- Entraînement de la baseline --------------------------------------
-# --from-maml-ckpt : charge les MÊMES tâches (positions de masses), les
-# MÊMES starting points x0 et tous les hyperparamètres depuis le run MAML
-# -> comparaison strictement équitable, indépendante du device CPU/GPU.
+# --from-maml-ckpt : charge les MÊMES task_set ET target_set (positions,
+# masses, x0 — tous identiques au bit près) ainsi que tous les
+# hyperparamètres depuis le run MAML correspondant. Comparaison
+# strictement équitable, indépendante du device CPU/GPU.
+#
+# >>> Mets à jour le chemin du checkpoint après chaque run MAML.
 srun python -u training_MAML/train_baseline.py \
-    --from-maml-ckpt training_MAML/maml_linearized_h64_o1_n50_izar_uniform_tasks_ep472.pt \
-    --tag izar_uniform_tasks
+    --from-maml-ckpt training_MAML/maml_nonlinear_h64_o1_n7_izar_composite_ep500.pt \
+    --tag izar_composite

@@ -5,6 +5,8 @@ import sys
 
 import torch
 
+from . import config as C
+
 
 def sample_hover_x0(n: int, half_side: float, gen: torch.Generator,
                     device: str = "cpu") -> torch.Tensor:
@@ -13,13 +15,6 @@ def sample_hover_x0(n: int, half_side: float, gen: torch.Generator,
     Position (x, y, z) is uniform in the cube [-half_side, +half_side]^3.
     Velocity, attitude and rates are zero (hover). Sampling uses ``gen``
     so the result is reproducible from a single seed.
-
-    Reproducibility caveat: ``gen`` is device-bound. A CPU and a CUDA
-    ``torch.Generator`` seeded identically produce *different* sequences,
-    so a standalone run on CPU will not reproduce the x0 set of a GPU run
-    (the mass tasks themselves use NumPy and stay reproducible). To compare
-    a baseline against a MAML run trained on another device, load the x0
-    set from its checkpoint (``--from-maml-ckpt``) instead of re-sampling.
     """
     pos = (torch.rand(n, 3, generator=gen, device=device) * 2.0 - 1.0) * half_side
     X0 = torch.zeros(n, 12, dtype=torch.float32, device=device)
@@ -29,75 +24,121 @@ def sample_hover_x0(n: int, half_side: float, gen: torch.Generator,
     return X0
 
 
-def plot_fixed_task_map(out_path: str, *,
-                        positions,
-                        x0_train: torch.Tensor,
-                        x0_eval: torch.Tensor,
-                        half_side: float,
-                        xy_min: float, xy_max: float,
-                        z_min: float, z_max: float,
-                        m_extras=None):
-    """Save a 2-panel diagnostic plot for the fixed uniform task set.
+def plot_fixed_task_map(out_path: str, *, task_set, target_set=None):
+    """2-panel diagnostic plot for a :class:`CompositeTaskSet`.
 
-    * Left  : body-frame xy scatter of the N fixed mass positions,
-              coloured by dz; marker size encodes the per-task extra mass
-              when ``m_extras`` (N,) is given. Box shows the xy range.
-    * Right : xy projection of the fixed train/eval x0 sets.
+    * Left  : body-frame xy scatter of every sampled mass-attachment point,
+              one colour per task. Motor positions are marked, and 1σ/3σ
+              circles around each motor show the per-task Gaussian. Marker
+              size encodes the extra-mass magnitude.
+    * Right : xy projection of every sampled drone start point. Circle =
+              z > 0 (octants 1-4), down-triangle = z < 0 (octants 5-8).
+              Sign-plane lines and the cube ±half_side outline are drawn.
+
+    The optional ``target_set`` is overlaid in red.
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
-    positions = np.asarray(positions)          # (N, 3)
-    fig, axs = plt.subplots(1, 2, figsize=(13, 6))
+    N = task_set.N
+    cmap = plt.get_cmap("tab20") if N <= 20 else plt.get_cmap("viridis")
 
-    # ── Left: mass positions ──────────────────────────────────────────
+    fig, axs = plt.subplots(1, 2, figsize=(14, 6))
+
+    # ── Left: mass-attachment positions ───────────────────────────────
     ax = axs[0]
-    # Marker size encodes the per-task extra mass (constant when m_extras
-    # is None, e.g. an old checkpoint).
-    s_lo, s_hi = 25.0, 220.0
-    if m_extras is not None:
-        m_g = np.asarray(m_extras, dtype=np.float64).reshape(-1) * 1e3   # grams
-        span = float(m_g.max() - m_g.min())
-        sizes = (np.full(len(m_g), 60.0) if span < 1e-6
-                 else s_lo + (s_hi - s_lo) * (m_g - m_g.min()) / span)
-    else:
-        m_g, sizes = None, 30.0
 
-    sc = ax.scatter(positions[:, 0] * 100, positions[:, 1] * 100,
-                    c=positions[:, 2] * 100, cmap="coolwarm",
-                    s=sizes, alpha=0.75, edgecolors="k", linewidths=0.4)
-    plt.colorbar(sc, ax=ax, label="dz [cm]")
-    rect = plt.Rectangle((xy_min * 100, xy_min * 100),
-                          (xy_max - xy_min) * 100, (xy_max - xy_min) * 100,
-                          linewidth=1.5, edgecolor="k", facecolor="none",
-                          linestyle="--", label="sampling box")
+    motor_pos = np.asarray(C.MOTOR_POS, dtype=np.float32)            # (4, 3)
+    for k in range(4):
+        ax.plot(motor_pos[k, 0] * 100, motor_pos[k, 1] * 100,
+                marker='+', color='k', markersize=14, mew=2)
+        for r in (1, 3):
+            circ = plt.Circle(
+                (motor_pos[k, 0] * 100, motor_pos[k, 1] * 100),
+                r * task_set.mass_pos_sigma * 100,
+                fill=False, linestyle=':', color='gray',
+                linewidth=0.6, alpha=0.6)
+            ax.add_patch(circ)
+        ax.text(motor_pos[k, 0] * 100 + 0.3, motor_pos[k, 1] * 100 + 0.3,
+                f"M{k+1}", fontsize=8, color='k')
+
+    s_lo, s_hi = 8.0, 60.0
+    mspan = max(task_set.mass_max - task_set.mass_min, 1e-9)
+
+    def _mass_to_size(m):
+        return s_lo + (s_hi - s_lo) * (m - task_set.mass_min) / mspan
+
+    for i in range(N):
+        mp = np.concatenate(
+            [task_set.mass_positions_train[i],
+             task_set.mass_positions_eval[i]], axis=0)
+        me = np.concatenate(
+            [task_set.m_extras_train[i],
+             task_set.m_extras_eval[i]], axis=0)
+        ax.scatter(mp[:, 0] * 100, mp[:, 1] * 100,
+                   s=_mass_to_size(me), color=cmap(i % cmap.N),
+                   alpha=0.55, edgecolors='none', label=task_set.names[i])
+
+    if target_set is not None:
+        for i in range(target_set.N):
+            mp = np.concatenate(
+                [target_set.mass_positions_train[i],
+                 target_set.mass_positions_eval[i]], axis=0)
+            ax.scatter(mp[:, 0] * 100, mp[:, 1] * 100,
+                       marker='x', color='red', s=35, linewidths=1.4,
+                       alpha=0.85,
+                       label=f"target: {target_set.names[i]}")
+
+    ax.set_aspect("equal"); ax.grid(True, alpha=0.3)
+    ax.set_title(
+        f"Mass-attachment positions — body frame "
+        f"(N={N}, σ={task_set.mass_pos_sigma*100:.1f} cm, "
+        f"m∈[{task_set.mass_min*1e3:.1f},{task_set.mass_max*1e3:.1f}] g)")
+    ax.set_xlabel("dx [cm]"); ax.set_ylabel("dy [cm]")
+    ax.legend(fontsize=7, loc='best', ncol=2)
+
+    # ── Right: drone start positions (xy projection) ──────────────────
+    ax = axs[1]
+    half = task_set.half_side
+    ax.axhline(0, color='k', linewidth=0.8, alpha=0.5)
+    ax.axvline(0, color='k', linewidth=0.8, alpha=0.5)
+    rect = plt.Rectangle((-half, -half), 2 * half, 2 * half,
+                         linewidth=1.5, edgecolor='k', facecolor='none',
+                         linestyle='--', label=f"cube ±{half} m")
     ax.add_patch(rect)
 
-    # Size legend for the extra mass (3 proxy markers: min / mid / max).
-    if m_g is not None and float(m_g.max() - m_g.min()) > 1e-6:
-        lo, hi = float(m_g.min()), float(m_g.max())
-        for mv in (lo, 0.5 * (lo + hi), hi):
-            sv = s_lo + (s_hi - s_lo) * (mv - lo) / (hi - lo)
-            ax.scatter([], [], s=sv, c="lightgray", edgecolors="k",
-                       linewidths=0.4, label=f"m = {mv:.1f} g")
+    for i in range(N):
+        x0 = torch.cat([task_set.x0_train[i], task_set.x0_eval[i]], dim=0
+                       ).detach().cpu().numpy()
+        z_pos = x0[:, 4] >= 0
+        color = cmap(i % cmap.N)
+        if z_pos.any():
+            ax.scatter(x0[z_pos, 0], x0[z_pos, 2], marker='o', s=14,
+                       color=color, alpha=0.55, edgecolors='none')
+        if (~z_pos).any():
+            ax.scatter(x0[~z_pos, 0], x0[~z_pos, 2], marker='v', s=14,
+                       color=color, alpha=0.55, edgecolors='none')
+        # one legend entry per task
+        ax.plot([], [], 'o', color=color, alpha=0.55, label=task_set.names[i])
 
-    ax.set_aspect("equal"); ax.grid(True)
-    ax.set_title(f"Fixed task set (N={len(positions)}) — body-frame xy")
-    ax.set_xlabel("dx [cm]"); ax.set_ylabel("dy [cm]")
-    ax.legend(fontsize=8)
+    if target_set is not None:
+        for i in range(target_set.N):
+            x0 = torch.cat([target_set.x0_train[i], target_set.x0_eval[i]],
+                           dim=0).detach().cpu().numpy()
+            z_pos = x0[:, 4] >= 0
+            if z_pos.any():
+                ax.scatter(x0[z_pos, 0], x0[z_pos, 2], marker='x',
+                           color='red', s=30, linewidths=1.4, alpha=0.85)
+            if (~z_pos).any():
+                ax.scatter(x0[~z_pos, 0], x0[~z_pos, 2], marker='+',
+                           color='red', s=40, linewidths=1.4, alpha=0.85)
+            ax.plot([], [], 'x', color='red',
+                    label=f"target: {target_set.names[i]}")
 
-    # ── Right: x0 sets ───────────────────────────────────────────────
-    ax = axs[1]
-    x0_t = x0_train.detach().cpu().numpy()
-    x0_e = x0_eval.detach().cpu().numpy()
-    ax.scatter(x0_t[:, 0], x0_t[:, 2], c="C0",
-               label=f"train x0 (n={len(x0_t)})", s=25, alpha=0.8)
-    ax.scatter(x0_e[:, 0], x0_e[:, 2], c="C3",
-               label=f"eval x0 (n={len(x0_e)})",  s=25, alpha=0.8)
-    ax.set_aspect("equal"); ax.grid(True)
-    ax.set_title(f"Initial positions, xy projection (cube ±{half_side}m)")
+    ax.set_aspect("equal"); ax.grid(True, alpha=0.3)
+    ax.set_title("Drone start positions, xy projection  (○ = z≥0, ▽ = z<0)")
     ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
-    ax.legend()
+    ax.legend(fontsize=7, loc='best', ncol=2)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)

@@ -1,27 +1,23 @@
-"""Train a Crazyflie controller with MAML over a fixed uniform mass task set.
+"""Train a Crazyflie controller with MAML over a composite task set.
 
-Task distribution
------------------
-N tasks are sampled *once at startup* from a uniform box:
-    dx ~ Uniform(xy_min, xy_max)
-    dy ~ Uniform(xy_min, xy_max)
-    dz ~ Uniform(z_min,  z_max)
-and reused at every epoch.  This makes the meta-gradient estimate stable and
-lets the baseline be trained on the exact same tasks for a fair comparison.
+Task structure (see ``maml_lib.tasks.CompositeTaskSet``):
+  * each task is a row of a YAML/JSON config, selecting one or more of
+    4 motor-centered isotropic Gaussians (mass attachment position) and
+    one or more of 8 cube octants (drone start position).
+  * extra-mass magnitude is a shared 1-D uniform ``[mass_min, mass_max]``.
+  * ``M_train`` support + ``M_eval`` query points per task are sampled
+    once at startup and reused every epoch (fixed task set philosophy).
 
-GPU parallelism
----------------
-MAML inner loop  : all N tasks are batched into one rollout (N*B_train, 12)
-                   for the first adaptation step; a single GPU forward pass
-                   replaces N sequential calls.
-Baseline         : all N tasks are always batched (N*B_train, 12).
+An optional ``--target-config`` defines a held-out task set: its loss
+after few-shot adaptation is logged every epoch as a generalisation
+metric but **never** feeds the optimiser.
 
 Usage examples:
 
     cd training_MAML
-    python train_maml.py
-    python train_maml.py --n-tasks 50 --xy-min -0.04 --xy-max 0.04 \\
-                         --dynamics linearized --maml-order 1 --epochs 500
+    python train_maml.py --tasks-config tasks.yaml \\
+                         --target-config target.yaml \\
+                         --dynamics nonlinear --epochs 500
     python train_maml.py --resume maml_..._ep200.pt --epochs 500
 """
 import argparse
@@ -37,8 +33,8 @@ if PARENT_DIR not in sys.path:
 
 from maml_lib import (
     config as C,
-    PolicyMLP, FixedUniformMassSet, meta_train,
-    sample_hover_x0, GracefulKiller,
+    PolicyMLP, CompositeTaskSet, meta_train,
+    GracefulKiller,
     DYNAMICS,
 )
 
@@ -76,7 +72,7 @@ def parse_args():
         d = {}
 
     p = argparse.ArgumentParser(
-        description="MAML training for CF2 with fixed uniform mass tasks.",
+        description="MAML training for CF2 with a composite task set.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     p.add_argument("--resume", type=str, default=None,
@@ -92,26 +88,24 @@ def parse_args():
     p.add_argument("--hidden",          type=int,   default=d.get("hidden",        64))
 
     # Task set
-    p.add_argument("--n-tasks",  type=int,   default=d.get("n_tasks",  50),
-                   help="number of fixed tasks sampled at startup")
-    p.add_argument("--mass-min", type=float, default=d.get("mass_min", 0.010),
-                   help="lower bound for the per-task extra mass [kg]")
-    p.add_argument("--mass-max", type=float, default=d.get("mass_max", 0.010),
-                   help="upper bound for the per-task extra mass [kg] "
-                        "(set equal to --mass-min for a constant mass)")
-    p.add_argument("--xy-min",   type=float, default=d.get("xy_min",  -0.04),
-                   help="lower bound for dx and dy [m]")
-    p.add_argument("--xy-max",   type=float, default=d.get("xy_max",   0.04),
-                   help="upper bound for dx and dy [m]")
-    p.add_argument("--z-min",    type=float, default=d.get("z_min",   -0.01),
-                   help="lower bound for dz [m]")
-    p.add_argument("--z-max",    type=float, default=d.get("z_max",    0.01),
-                   help="upper bound for dz [m]")
-
-    # x0 batches
-    p.add_argument("--n-x0-train", type=int,   default=d.get("n_x0_train", 64))
-    p.add_argument("--n-x0-eval",  type=int,   default=d.get("n_x0_eval",  32))
-    p.add_argument("--half-side",  type=float, default=d.get("half_side",   0.3))
+    p.add_argument("--tasks-config",  type=str,   default=d.get("tasks_config", None),
+                   help="path to the training tasks YAML/JSON (required on a "
+                        "fresh run; ignored on resume — tasks come from the ckpt)")
+    p.add_argument("--target-config", type=str,   default=d.get("target_config", None),
+                   help="optional held-out target task YAML/JSON; if given, "
+                        "the policy's loss on it is logged every epoch")
+    p.add_argument("--mass-min",      type=float, default=d.get("mass_min", 0.002),
+                   help="lower bound for the shared 1-D mass uniform [kg]")
+    p.add_argument("--mass-max",      type=float, default=d.get("mass_max", 0.014),
+                   help="upper bound for the shared 1-D mass uniform [kg]")
+    p.add_argument("--mass-pos-sigma", type=float, default=d.get("mass_pos_sigma", 0.01),
+                   help="isotropic σ of the 4 motor-centered Gaussians [m]")
+    p.add_argument("--half-side",     type=float, default=d.get("half_side", 0.3),
+                   help="cube half-side for the drone start octants [m]")
+    p.add_argument("--n-points-train", type=int,  default=d.get("n_points_train", 100),
+                   help="number of support points sampled per task")
+    p.add_argument("--n-points-eval",  type=int,  default=d.get("n_points_eval", 50),
+                   help="number of query points sampled per task")
 
     # Rollout
     p.add_argument("--t-sim",           type=float, default=d.get("t_sim",           2.0))
@@ -160,56 +154,53 @@ def main():
     if args.resume is not None:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
 
-    # ── Fixed task set ─────────────────────────────────────────────────
+    # ── Task sets ──────────────────────────────────────────────────────
     if ckpt is not None:
-        # Reconstruct the exact task set (positions + per-task masses) so
-        # the resumed run is faithful. Old checkpoints store only a scalar
-        # m_extra; broadcast it for backward compatibility.
-        if "m_extras" in ckpt:
-            m_extras = np.asarray(ckpt["m_extras"], dtype=np.float32)
-        else:
-            m_extras = np.full(len(ckpt["task_positions"]),
-                               float(ckpt["m_extra"]), dtype=np.float32)
-        task_set = FixedUniformMassSet.from_arrays(
-            ckpt["task_positions"], m_extras)
-        print(f"[Tasks]  {len(task_set)} fixed tasks restored from checkpoint")
+        task_set = CompositeTaskSet.from_dict(ckpt["task_set"])
+        target_set = (CompositeTaskSet.from_dict(ckpt["target_set"])
+                      if ckpt.get("target_set") is not None else None)
+        print(f"[Tasks]  {len(task_set)} tasks restored from checkpoint "
+              f"(M_train={task_set.M_train}, M_eval={task_set.M_eval})")
+        if target_set is not None:
+            print(f"[Target] {len(target_set)} target task(s) restored "
+                  f"from checkpoint")
     else:
+        if args.tasks_config is None:
+            raise SystemExit(
+                "--tasks-config is required for a fresh run. "
+                "Provide a YAML/JSON describing the training tasks.")
         rng_tasks = np.random.default_rng(args.seed)
-        task_set = FixedUniformMassSet.sample(
-            n_tasks=args.n_tasks,
-            xy_min=args.xy_min, xy_max=args.xy_max,
-            z_min=args.z_min,   z_max=args.z_max,
+        task_set = CompositeTaskSet.from_config(
+            args.tasks_config,
+            M_train=args.n_points_train, M_eval=args.n_points_eval,
+            mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
             mass_min=args.mass_min, mass_max=args.mass_max,
-            rng=rng_tasks,
-        )
-        print(f"[Tasks]  {args.n_tasks} tasks sampled  "
-              f"xy=[{args.xy_min*100:.1f},{args.xy_max*100:.1f}]cm  "
-              f"z=[{args.z_min*100:.1f},{args.z_max*100:.1f}]cm  "
+            rng=rng_tasks)
+        print(f"[Tasks]  {len(task_set)} tasks from {args.tasks_config}  "
+              f"M_train={task_set.M_train}  M_eval={task_set.M_eval}  "
+              f"σ={args.mass_pos_sigma*100:.1f}cm  half_side={args.half_side}m  "
               f"m=[{args.mass_min*1e3:.1f},{args.mass_max*1e3:.1f}]g")
-
-    # ── x0 batches ────────────────────────────────────────────────────
-    if ckpt is not None:
-        x0_train = ckpt["x0_train"].to(device)
-        x0_eval  = ckpt["x0_eval"].to(device)
-        print(f"[x0]    n_train={x0_train.shape[0]}  n_eval={x0_eval.shape[0]}"
-              f"  (restored)")
-    else:
-        x0_gen = torch.Generator(device=device).manual_seed(args.seed + 1)
-        n_total = args.n_x0_train + args.n_x0_eval
-        x0_all  = sample_hover_x0(n_total, args.half_side, x0_gen, device=device)
-        x0_train = x0_all[:args.n_x0_train].contiguous()
-        x0_eval  = x0_all[args.n_x0_train:].contiguous()
-        print(f"[x0]    n_train={args.n_x0_train}  n_eval={args.n_x0_eval}"
-              f"  cube ±{args.half_side}m")
+        if args.target_config is not None:
+            # Independent RNG stream so target sampling does not perturb
+            # the training-task sampling stream.
+            rng_target = np.random.default_rng(args.seed + 1)
+            target_set = CompositeTaskSet.from_config(
+                args.target_config,
+                M_train=args.n_points_train, M_eval=args.n_points_eval,
+                mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
+                mass_min=args.mass_min, mass_max=args.mass_max,
+                rng=rng_target)
+            print(f"[Target] {len(target_set)} target task(s) from "
+                  f"{args.target_config}")
+        else:
+            target_set = None
 
     # ── Policy ────────────────────────────────────────────────────────
-    # Seed the global torch RNG *before* constructing the network so the
-    # weight initialisation is reproducible across runs and identical to the
-    # baseline (which seeds the same way). On resume this is harmless: the
-    # init weights are immediately overwritten by load_state_dict, and
-    # meta_train restores the saved RNG state anyway.
+    # Hover bias = mean extra mass over the *sampled* training points,
+    # i.e. ≈ (mass_min + mass_max)/2 for large enough samples. This is
+    # just the optimisation starting point — meta-training adjusts it.
     torch.manual_seed(args.seed)
-    M_total = C.M_BASE + task_set.m_extra          # mean extra mass over the task set
+    M_total = C.M_BASE + task_set.m_extra
     hover_thrust_u16 = (M_total * C.G * C.UINT16_MAX) / (4 * C.CF2_THRUST_MAX_PER_MOTOR)
     policy = PolicyMLP(hidden=args.hidden, hover_thrust_u16=hover_thrust_u16).to(device)
     if ckpt is not None:
@@ -231,16 +222,13 @@ def main():
 
     # Payload fields that never change between epochs.
     common_payload = {
-        "args":          vars(args),
-        "x_scale":       C.X_SCALE,
-        "pos_scale":     C.POS_SCALE,
-        "nn_freq":       C.NN_FREQ,
-        "att_rate":      C.ATTITUDE_RATE,
-        "task_positions": task_set.positions,   # (N, 3) offsets
-        "m_extras":      task_set.m_extras,      # (N,) per-task extra mass
-        "m_extra":       task_set.m_extra,       # mean — kept for old readers
-        "x0_train":      x0_train.detach().cpu(),
-        "x0_eval":       x0_eval.detach().cpu(),
+        "args":       vars(args),
+        "x_scale":    C.X_SCALE,
+        "pos_scale":  C.POS_SCALE,
+        "nn_freq":    C.NN_FREQ,
+        "att_rate":   C.ATTITUDE_RATE,
+        "task_set":   task_set.to_dict(),
+        "target_set": target_set.to_dict() if target_set is not None else None,
     }
 
     def save_checkpoint(policy_module, history, path,
@@ -250,9 +238,9 @@ def main():
                                     for k, v in policy_module.state_dict().items()}
         payload["history"]       = history
         payload["actual_epochs"] = len(history.get("epoch", []))
-        if optimizer  is not None:
+        if optimizer is not None:
             payload["optimizer_state"] = optimizer.state_dict()
-        if torch_gen  is not None:
+        if torch_gen is not None:
             payload["torch_gen_state"] = torch_gen.get_state().cpu()
         payload["torch_rng_state"] = torch.get_rng_state().cpu()
         if torch.cuda.is_available():
@@ -295,7 +283,8 @@ def main():
 
     # ── Training ──────────────────────────────────────────────────────
     policy, history = meta_train(
-        policy, task_set, x0_train, x0_eval,
+        policy, task_set,
+        target_set=target_set,
         dynamics_step=DYNAMICS[args.dynamics],
         n_steps=n_steps,
         epochs=args.epochs,
