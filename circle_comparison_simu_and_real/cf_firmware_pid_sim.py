@@ -228,6 +228,14 @@ MOTORS_PWM_BITS = 8
 def pwm_to_rpm(pwm_values, kf, truncate_8bit=True):
     """Convert firmware uint16 PWM [0..65535] to RPM for pybullet.
 
+    Numerical reference: this MUST stay equivalent to the differentiable
+    torch version ``maml_lib.pid_chain.pwm_to_rpm`` (which always
+    truncates and uses ``C.KF`` / ``C.UINT16_MAX`` /
+    ``C.CF2_THRUST_MAX_PER_MOTOR``). The two implementations are kept
+    separate because the torch one is needed for training-time
+    backprop, while this one is plain numpy for inference. If you
+    change one, change the other.
+
     Faithfully replicates the real CF2.1+ signal chain:
       1. (optional) Truncate to 8-bit timer resolution, like the real hardware
       2. Map uint16 linearly to [0, THRUST_MAX] Newtons (battery compensation)

@@ -93,7 +93,7 @@ def _validate_task(entry: dict, idx: int) -> tuple:
             or not all(isinstance(x, int) and 1 <= x <= 4 for x in gauss)):
         raise ValueError(
             f"task '{name}': 'mass_gaussians' must be a non-empty list of "
-            "ints in 1..4 (got {gauss!r}).")
+            f"ints in 1..4 (got {gauss!r}).")
 
     oct_ = entry.get("octants")
     if (not isinstance(oct_, list) or not oct_

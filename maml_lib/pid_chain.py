@@ -32,12 +32,50 @@ def _get_pid_gains(dev):
 _MOTORS_PWM_BITS  = 8
 _MOTORS_PWM_SHIFT = 16 - _MOTORS_PWM_BITS  # 8
 
+# Guard against silent drift between this torch pwm_to_rpm and the numpy
+# reference in circle_comparison_simu_and_real.cf_firmware_pid_sim.
+def _check_pwm_to_rpm_constants() -> None:
+    try:
+        from circle_comparison_simu_and_real import cf_firmware_pid_sim as _cf
+    except ImportError:
+        return  # optional dependency at training time
+    mismatches = []
+    if _cf.MOTORS_PWM_BITS != _MOTORS_PWM_BITS:
+        mismatches.append(
+            f"MOTORS_PWM_BITS: pid_chain={_MOTORS_PWM_BITS} "
+            f"vs cf_firmware_pid_sim={_cf.MOTORS_PWM_BITS}")
+    if _cf.CF2_THRUST_MAX_PER_MOTOR != C.CF2_THRUST_MAX_PER_MOTOR:
+        mismatches.append(
+            f"CF2_THRUST_MAX_PER_MOTOR: pid_chain={C.CF2_THRUST_MAX_PER_MOTOR} "
+            f"vs cf_firmware_pid_sim={_cf.CF2_THRUST_MAX_PER_MOTOR}")
+    if _cf.UINT16_MAX != C.UINT16_MAX:
+        mismatches.append(
+            f"UINT16_MAX: pid_chain={C.UINT16_MAX} "
+            f"vs cf_firmware_pid_sim={_cf.UINT16_MAX}")
+    if mismatches:
+        raise RuntimeError(
+            "pwm_to_rpm constants drifted between maml_lib.pid_chain and "
+            "circle_comparison_simu_and_real.cf_firmware_pid_sim:\n  - "
+            + "\n  - ".join(mismatches))
+
+_check_pwm_to_rpm_constants()
+del _check_pwm_to_rpm_constants
+
 
 def pwm_to_rpm(motor_pwm: torch.Tensor) -> torch.Tensor:
     """Replicate the CF2.1+ PWM 8-bit hardware truncation, then map to RPM.
 
     Straight-through estimator on the truncation: forward uses the
     truncated value, backward propagates through as identity.
+
+    Numerical reference: this MUST stay equivalent to the numpy version
+    ``circle_comparison_simu_and_real.cf_firmware_pid_sim.pwm_to_rpm``
+    (with ``truncate_8bit=True`` and ``kf=C.KF``). The two implementations
+    are kept separate because this one needs to be differentiable
+    (training-time rollout) while the other is plain numpy used at
+    inference time on the real firmware pipeline. If you change one,
+    change the other and re-run ``test_batched_outer.py`` plus an
+    inference sanity check.
     """
     scale = float(1 << _MOTORS_PWM_SHIFT)
     pwm_trunc = motor_pwm - (motor_pwm % scale)
