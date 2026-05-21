@@ -28,5 +28,5 @@ python -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.c
 #
 # >>> Mets à jour le chemin du checkpoint après chaque run MAML.
 srun python -u training_MAML/train_baseline.py \
-    --from-maml-ckpt training_MAML/maml_nonlinear_h64_o1_n3_izar_composite_cste_mass_ep500.pt \
-    --tag izar_composite_cste_mass
+    --from-maml-ckpt training_MAML/maml_nonlinear_h64_o1_n4_izar_no_mass_ep500.pt \
+    --tag izar_no_mass

@@ -48,9 +48,10 @@ srun python -u training_MAML/train_maml.py \
     --half-side 0.3 \
     --n-points-train 100 \
     --n-points-eval  50 \
+    --k-samples 5 \
     --obs-noise-scale 1.0 \
     --tau-div 1.0 \
     --t-sim 2.0 \
     --seed 42 \
-    --tag izar_composite_cste_mass \
+    --tag izar_no_mass \
     --profile

@@ -4,6 +4,6 @@
 # the training set never uses — gaussian 4 (motor M4, front-left) and
 # octant 8 (-,-,-) — so the target loss is a genuine OOD test.
 tasks:
-  - name: target_G4_O8
-    mass_gaussians: [4]
-    octants:        [8]
+  - name: target_O5678
+    mass_gaussians: [1, 2, 3, 4]
+    octants:        [5, 6, 7, 8]
