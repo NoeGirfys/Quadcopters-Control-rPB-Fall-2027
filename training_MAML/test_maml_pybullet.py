@@ -48,7 +48,7 @@ from gym_pybullet_drones.utils.utils import sync
 
 from maml_lib import (
     config as C,
-    PolicyMLP, compute_mass_params, maml_adapt,
+    PolicyMLP, compute_mass_params, compute_mass_params_batched, maml_adapt,
     DYNAMICS,
 )
 
@@ -103,7 +103,7 @@ def load_and_adapt(args, device: str):
     ckpt = torch.load(args.weights, map_location=device, weights_only=False)
     saved_args = ckpt["args"]
 
-    # New composite-task-set format (preferred); fall back to legacy ckpts.
+    # Mean training extra mass — used as fallback for --mass.
     if "task_set" in ckpt:
         ts = ckpt["task_set"]
         m_extras_all = np.concatenate([
@@ -111,12 +111,8 @@ def load_and_adapt(args, device: str):
             np.asarray(ts["m_extras_eval"]).reshape(-1),
         ])
         m_extra_train = float(m_extras_all.mean())
-        # Flatten all per-task training x0 into a single adaptation set.
-        x0_train = torch.as_tensor(ts["x0_train"], dtype=torch.float32
-                                   ).reshape(-1, 12).to(device)
     else:
         m_extra_train = float(ckpt["m_extra"])
-        x0_train      = ckpt["x0_train"].to(device)
 
     # --- Target mass position --------------------------------------
     dx = args.target_dx if args.target_dx is not None else 0.0
@@ -178,8 +174,39 @@ def load_and_adapt(args, device: str):
     print(f"[Adapt] n_inner_steps={n_inner}  lr_inner={lr_inner}  "
           f"clip={inner_clip}  rollout={n_steps_rollout} steps")
 
+    # Adaptation support = target distribution's saved support points.
+    # Each row carries its own sampled (mass_pos, m_extra, drone_x0)
+    # drawn from the target distribution at startup — proper few-shot.
+    # The target_set lives on the MAML checkpoint; when --weights is a
+    # baseline checkpoint, look it up via --maml-ckpt.
+    target_src = ckpt
+    target_src_label = args.weights
+    if ckpt.get("target_set") is None:
+        if args.maml_ckpt is None:
+            raise SystemExit(
+                "The --weights checkpoint has no 'target_set' (likely a "
+                "baseline checkpoint). Pass --maml-ckpt <maml.pt> so the "
+                "target-set support points can be loaded.")
+        target_src = torch.load(args.maml_ckpt, map_location="cpu",
+                                weights_only=False)
+        target_src_label = args.maml_ckpt
+        if target_src.get("target_set") is None:
+            raise SystemExit(
+                f"--maml-ckpt {args.maml_ckpt} has no 'target_set' either. "
+                "Retrain MAML with --target-config to embed one.")
+
+    tgt = target_src["target_set"]
+    adapt_positions = np.asarray(tgt["mass_positions_train"]).reshape(-1, 3)
+    adapt_m_extras  = np.asarray(tgt["m_extras_train"]).reshape(-1)
+    adapt_mass = compute_mass_params_batched(
+        adapt_m_extras, adapt_positions).to(device)
+    adapt_x0 = torch.as_tensor(tgt["x0_train"], dtype=torch.float32
+                               ).reshape(-1, 12).to(device)
+    print(f"[Adapt] support: {adapt_x0.shape[0]} points from target_set "
+          f"of {target_src_label} (few-shot on the target distribution)")
+
     theta_adapt, losses = maml_adapt(
-        policy, target_mass, x0_train,
+        policy, adapt_mass, adapt_x0,
         dynamics_step=dynamics_step,
         n_steps=n_steps_rollout,
         n_steps_adapt=n_inner,
@@ -454,7 +481,9 @@ def parse_args():
                    help='MAML checkpoint to source the adaptation '
                         'hyperparameters (n_inner_steps, lr_inner, '
                         'inner_grad_clip) from. Use when --weights is a '
-                        'baseline checkpoint, which stores none of them.')
+                        'baseline checkpoint, which stores none of them. '
+                        'Also used as the source of the target_set when '
+                        '--weights is a baseline checkpoint.')
 
     # sim setup
     p.add_argument('--target-pos', nargs=3, type=float, default=[0.0, 0.0, 1.0],
