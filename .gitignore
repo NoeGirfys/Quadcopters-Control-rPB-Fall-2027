@@ -10,6 +10,7 @@ venv_MAML_SCITAS/
 *.fdb_latexmk
 *.fls
 *.log
+*.err
 *.out
 *.synctex.gz
 *.toc
