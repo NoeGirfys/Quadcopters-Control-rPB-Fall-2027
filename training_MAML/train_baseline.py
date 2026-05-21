@@ -79,6 +79,13 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "dynamics":        str(saved.get("dynamics", "nonlinear")),
         "seed":            int(saved.get("seed", 42)),
         "verbose_every":   int(saved.get("verbose_every", 1)),
+        "k_samples":       saved.get("k_samples", None),
+        # Adaptation hyperparameters: inherited so the baseline's per-epoch
+        # target_loss uses the EXACT same K-shot protocol as the MAML run
+        # and as the test-time protocol in test_maml_pybullet.py.
+        "n_inner_steps":   int(saved.get("n_inner_steps", 0)),
+        "lr_inner":        float(saved.get("lr_inner", 0.0)),
+        "inner_grad_clip": float(saved.get("inner_grad_clip", 1.0)),
     }
 
 
@@ -131,6 +138,28 @@ def parse_args():
     p.add_argument("--half-side",     type=float, default=d.get("half_side", 0.3))
     p.add_argument("--n-points-train", type=int,  default=d.get("n_points_train", 100))
     p.add_argument("--n-points-eval",  type=int,  default=d.get("n_points_eval",  50))
+    p.add_argument("--k-samples",      type=int,  default=d.get("k_samples", None),
+                   help="few-shot adaptation budget used both for the "
+                        "per-epoch target_loss (if --n-inner-steps > 0) "
+                        "and for the test-time adaptation in "
+                        "test_maml_pybullet.py.")
+
+    # Adaptation hyperparameters: if n_inner_steps > 0 and lr_inner > 0,
+    # the per-epoch target_loss is computed *after* adapting the baseline
+    # on K target support points — same protocol as MAML, so the two
+    # histories are directly comparable. Default (0 / 0.0) keeps the
+    # legacy raw-policy eval.
+    p.add_argument("--n-inner-steps",   type=int,
+                   default=d.get("n_inner_steps", 0),
+                   help="adaptation steps for the per-epoch target_loss. "
+                        "0 = raw-policy eval (legacy). Inherited from "
+                        "--from-maml-ckpt by default.")
+    p.add_argument("--lr-inner",        type=float,
+                   default=d.get("lr_inner", 0.0),
+                   help="inner-loop LR for the per-epoch target adaptation.")
+    p.add_argument("--inner-grad-clip", type=float,
+                   default=d.get("inner_grad_clip", 1.0),
+                   help="grad-norm clip on the inner adaptation steps.")
 
     # Rollout
     p.add_argument("--t-sim",           type=float, default=d.get("t_sim",           2.0))
@@ -166,6 +195,13 @@ def main():
     print(f"[Config] lr_outer={args.lr_outer}  hidden={args.hidden}")
     n_steps = int(args.t_sim * C.NN_FREQ)
     print(f"[Config] n_steps={n_steps} ({args.t_sim}s @ {C.NN_FREQ}Hz)")
+    if args.n_inner_steps > 0 and args.lr_inner > 0:
+        print(f"[Config] target eval: K-shot adaptation "
+              f"(n_inner_steps={args.n_inner_steps}, lr_inner={args.lr_inner}, "
+              f"clip={args.inner_grad_clip})  — symmetric with MAML")
+    else:
+        print(f"[Config] target eval: raw policy (no adaptation) — "
+              f"NOT comparable to MAML's target_loss")
 
     # ── Load checkpoint if resuming ────────────────────────────────────
     ckpt = None
@@ -204,14 +240,20 @@ def main():
         print(f"[Tasks]  {len(task_set)} tasks from {args.tasks_config}")
         if args.target_config is not None:
             rng_target = np.random.default_rng(args.seed + 1)
+            # Mirror train_maml.py: size target support to K if set, so the
+            # resulting checkpoint is consistent with a MAML run started
+            # with the same --k-samples.
+            target_M_train = (args.k_samples
+                              if args.k_samples and args.k_samples > 0
+                              else args.n_points_train)
             target_set = CompositeTaskSet.from_config(
                 args.target_config,
-                M_train=args.n_points_train, M_eval=args.n_points_eval,
+                M_train=target_M_train, M_eval=args.n_points_eval,
                 mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
                 mass_min=args.mass_min, mass_max=args.mass_max,
                 rng=rng_target)
             print(f"[Target] {len(target_set)} target task(s) from "
-                  f"{args.target_config}")
+                  f"{args.target_config}  M_train={target_M_train}")
         else:
             target_set = None
 
@@ -316,6 +358,11 @@ def main():
         on_epoch_end=on_epoch_end,
         killer=killer,
         resume_state=resume_state,
+        n_inner_steps=int(args.n_inner_steps),
+        lr_inner=float(args.lr_inner),
+        inner_grad_clip=float(args.inner_grad_clip),
+        k_samples=(args.k_samples if args.k_samples and args.k_samples > 0
+                   else None),
     )
 
     # ── Save final checkpoint ─────────────────────────────────────────

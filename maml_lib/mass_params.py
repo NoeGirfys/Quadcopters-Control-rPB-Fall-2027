@@ -47,6 +47,21 @@ class MassParams:
             r_offset=self.r_offset,
         )
 
+    def __getitem__(self, idx) -> "MassParams":
+        """Slice along the batch dim (B). Useful for few-shot subsampling."""
+        return MassParams(
+            M_total=self.M_total[idx],
+            I=self.I[idx],
+            I_inv=self.I_inv[idx],
+            r_com=self.r_com[idx],
+            hover_rpm=self.hover_rpm[idx],
+            m_extra=self.m_extra,
+            r_offset=self.r_offset,
+        )
+
+    def __len__(self) -> int:
+        return int(self.M_total.shape[0])
+
 
 def compute_mass_params(m_extra: float, r_offset: tuple) -> MassParams:
     """Build the (full Steiner) MassParams for a single mass configuration."""

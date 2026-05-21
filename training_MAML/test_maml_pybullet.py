@@ -198,10 +198,30 @@ def load_and_adapt(args, device: str):
     tgt = target_src["target_set"]
     adapt_positions = np.asarray(tgt["mass_positions_train"]).reshape(-1, 3)
     adapt_m_extras  = np.asarray(tgt["m_extras_train"]).reshape(-1)
+    adapt_x0_full   = torch.as_tensor(tgt["x0_train"], dtype=torch.float32
+                                      ).reshape(-1, 12)
+
+    # K-samples resolution: CLI override > checkpoint > None.
+    # CLI 0 means "use all M_train points" (escape hatch).
+    if args.k_samples is None:
+        k_samples = adapt_src.get("k_samples", None)
+    elif args.k_samples <= 0:
+        k_samples = None
+    else:
+        k_samples = int(args.k_samples)
+
+    if k_samples is not None and k_samples < adapt_positions.shape[0]:
+        adapt_positions = adapt_positions[:k_samples]
+        adapt_m_extras  = adapt_m_extras [:k_samples]
+        adapt_x0_full   = adapt_x0_full  [:k_samples]
+        print(f"[Adapt] few-shot: K={k_samples} (first K of target support)")
+    else:
+        print(f"[Adapt] full support: K={adapt_positions.shape[0]} (no "
+              f"subsampling)")
+
     adapt_mass = compute_mass_params_batched(
         adapt_m_extras, adapt_positions).to(device)
-    adapt_x0 = torch.as_tensor(tgt["x0_train"], dtype=torch.float32
-                               ).reshape(-1, 12).to(device)
+    adapt_x0 = adapt_x0_full.to(device)
     print(f"[Adapt] support: {adapt_x0.shape[0]} points from target_set "
           f"of {target_src_label} (few-shot on the target distribution)")
 
@@ -477,13 +497,20 @@ def parse_args():
     # adaptation overrides (default = checkpoint values)
     p.add_argument('--n-inner-steps', type=int, default=None)
     p.add_argument('--lr-inner', type=float, default=None)
+    p.add_argument('--k-samples', type=int, default=None,
+                   help='few-shot adaptation budget: use only the first K '
+                        "points of the target support set. Defaults to the "
+                        "value stored in the checkpoint's args (k_samples "
+                        "from train_maml.py). Pass an explicit int to "
+                        "override; pass 0 to force using all M_train points.")
     p.add_argument('--maml-ckpt', type=str, default=None,
                    help='MAML checkpoint to source the adaptation '
                         'hyperparameters (n_inner_steps, lr_inner, '
-                        'inner_grad_clip) from. Use when --weights is a '
-                        'baseline checkpoint, which stores none of them. '
-                        'Also used as the source of the target_set when '
-                        '--weights is a baseline checkpoint.')
+                        'inner_grad_clip, k_samples) from. Use when '
+                        '--weights is a baseline checkpoint, which stores '
+                        'none of the MAML-specific ones. Also used as the '
+                        'source of the target_set when --weights is a '
+                        'baseline checkpoint.')
 
     # sim setup
     p.add_argument('--target-pos', nargs=3, type=float, default=[0.0, 0.0, 1.0],

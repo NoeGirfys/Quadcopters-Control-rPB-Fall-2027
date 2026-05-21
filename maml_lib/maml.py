@@ -156,14 +156,27 @@ def _eval_target_maml(policy, target_set, *,
                       dynamics_step, n_steps, n_inner_steps, lr_inner,
                       terminal_weight, pos_weight, z_weight,
                       obs_noise_std, tau_div, inner_grad_clip,
-                      device, seed):
-    """Per-target-task: few-shot adapt on support, query loss on eval."""
+                      device, seed, k_samples: Optional[int] = None):
+    """Per-target-task: few-shot adapt on support, query loss on eval.
+
+    ``k_samples`` (if set) restricts the adaptation support to the first
+    ``K`` points of each target task — proper few-shot evaluation. Taking
+    the *first* K (rather than a random subset) keeps the metric stable
+    across epochs since the per-task support points are frozen at
+    startup.
+    """
     losses = []
     for t in range(target_set.N):
+        mass_t = target_set.masses_train[t]
+        x0_t   = target_set.x0_train[t]
+        if k_samples is not None:
+            k = min(int(k_samples), len(mass_t))
+            mass_t = mass_t[:k]
+            x0_t   = x0_t[:k]
         adapted_theta, _ = maml_adapt(
             policy,
-            mass=target_set.masses_train[t],
-            x0=target_set.x0_train[t],
+            mass=mass_t,
+            x0=x0_t,
             dynamics_step=dynamics_step,
             n_steps=n_steps, n_steps_adapt=n_inner_steps,
             lr_inner=lr_inner,
@@ -239,6 +252,7 @@ def meta_train(
     resume_state: dict = None,
     profile: bool = False,
     grad_chunk: int = None,
+    k_samples: Optional[int] = None,
 ):
     """Meta-train ``policy`` with MAML over a CompositeTaskSet.
 
@@ -246,6 +260,16 @@ def meta_train(
     loss after few-shot adaptation is computed every epoch with
     ``torch.no_grad`` on the outer rollout, and logged to
     ``history["target_loss"]``.
+
+    ``k_samples`` (optional) limits the number of support points used
+    during target-task adaptation (« proper few-shot »). ``None`` = use
+    the full target support set (target_set.M_train points).
+
+    In normal use, the target_set is already created with ``M_train=K``
+    (see train_maml.py), so this slicing is a no-op. It only matters
+    when resuming an older checkpoint whose target_set was sized to
+    ``n_points_train`` (legacy 100 points) but the user wants to
+    evaluate at fewer points.
     """
     N = task_set.N
     B_train = task_set.M_train
@@ -397,7 +421,8 @@ def meta_train(
                 pos_weight=pos_weight, z_weight=z_weight,
                 obs_noise_std=obs_noise_std, tau_div=tau_div,
                 inner_grad_clip=inner_grad_clip,
-                device=device, seed=seed)
+                device=device, seed=seed,
+                k_samples=k_samples)
         t_target = _now()
 
         history["epoch"].append(ep + 1)
@@ -466,6 +491,10 @@ def baseline_train(
     on_epoch_end: Callable = None,
     killer=None,
     resume_state: dict = None,
+    n_inner_steps: int = 0,
+    lr_inner: float = 0.0,
+    inner_grad_clip: float = 1.0,
+    k_samples: Optional[int] = None,
 ):
     """Multi-task baseline: train on all N tasks simultaneously.
 
@@ -473,6 +502,16 @@ def baseline_train(
     points) and, if ``target_set`` is given, ``target_loss`` — all
     measured on the same query points the MAML run uses, so the two
     histories are directly comparable.
+
+    Fair-comparison target eval: if ``n_inner_steps > 0`` and
+    ``lr_inner > 0``, the target_loss is computed by **adapting** the
+    baseline on K target support points (same protocol as MAML), then
+    evaluating on the target query — matching the test-time protocol in
+    ``test_maml_pybullet.py``. The adaptation is forgotten between
+    epochs (``maml_adapt`` returns a detached theta), so no data leak.
+
+    If ``n_inner_steps == 0``, falls back to the raw-policy target eval
+    (legacy behavior).
     """
     N = task_set.N
     B_train = task_set.M_train
@@ -536,12 +575,28 @@ def baseline_train(
 
         target_losses = None
         if target_set is not None:
-            target_losses = _eval_target_baseline(
-                policy, target_set,
-                dynamics_step=dynamics_step, n_steps=n_steps,
-                terminal_weight=terminal_weight,
-                pos_weight=pos_weight, z_weight=z_weight,
-                tau_div=tau_div, device=device)
+            if n_inner_steps > 0 and lr_inner > 0:
+                # Same protocol as MAML: adapt K samples, evaluate on query.
+                # Symmetric with test_maml_pybullet so the metric reflects
+                # what the user will actually measure at deployment.
+                target_losses = _eval_target_maml(
+                    policy, target_set,
+                    dynamics_step=dynamics_step,
+                    n_steps=n_steps, n_inner_steps=n_inner_steps,
+                    lr_inner=lr_inner,
+                    terminal_weight=terminal_weight,
+                    pos_weight=pos_weight, z_weight=z_weight,
+                    obs_noise_std=obs_noise_std, tau_div=tau_div,
+                    inner_grad_clip=inner_grad_clip,
+                    device=device, seed=seed,
+                    k_samples=k_samples)
+            else:
+                target_losses = _eval_target_baseline(
+                    policy, target_set,
+                    dynamics_step=dynamics_step, n_steps=n_steps,
+                    terminal_weight=terminal_weight,
+                    pos_weight=pos_weight, z_weight=z_weight,
+                    tau_div=tau_div, device=device)
 
         history["epoch"].append(ep + 1)
         history["train_loss"].append(float(L_tr.item()))

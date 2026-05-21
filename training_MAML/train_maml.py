@@ -106,6 +106,14 @@ def parse_args():
                    help="number of support points sampled per task")
     p.add_argument("--n-points-eval",  type=int,  default=d.get("n_points_eval", 50),
                    help="number of query points sampled per task")
+    p.add_argument("--k-samples",      type=int,  default=d.get("k_samples", None),
+                   help="few-shot adaptation budget on the held-out target "
+                        "task(s). If set, the target support set is sized "
+                        "to exactly K points (saving memory and making the "
+                        "few-shot semantics explicit); the per-epoch target "
+                        "eval and the test-time adaptation then use all K. "
+                        "None = target support sized to --n-points-train "
+                        "(legacy behavior, used as full support).")
 
     # Rollout
     p.add_argument("--t-sim",           type=float, default=d.get("t_sim",           2.0))
@@ -184,14 +192,24 @@ def main():
             # Independent RNG stream so target sampling does not perturb
             # the training-task sampling stream.
             rng_target = np.random.default_rng(args.seed + 1)
+            # Few-shot K: if --k-samples is set, the target support set is
+            # sized to exactly K (no point storing more than what
+            # adaptation will use). Otherwise fall back to n_points_train
+            # for backward compatibility.
+            target_M_train = (args.k_samples
+                              if args.k_samples and args.k_samples > 0
+                              else args.n_points_train)
             target_set = CompositeTaskSet.from_config(
                 args.target_config,
-                M_train=args.n_points_train, M_eval=args.n_points_eval,
+                M_train=target_M_train, M_eval=args.n_points_eval,
                 mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
                 mass_min=args.mass_min, mass_max=args.mass_max,
                 rng=rng_target)
+            kspec = (f"K={target_M_train} (few-shot)"
+                     if args.k_samples and args.k_samples > 0
+                     else f"M_train={target_M_train} (full)")
             print(f"[Target] {len(target_set)} target task(s) from "
-                  f"{args.target_config}")
+                  f"{args.target_config}  {kspec}")
         else:
             target_set = None
 
@@ -306,6 +324,8 @@ def main():
         resume_state=resume_state,
         profile=args.profile,
         grad_chunk=(args.grad_chunk if args.grad_chunk > 0 else None),
+        k_samples=(args.k_samples if args.k_samples and args.k_samples > 0
+                   else None),
     )
 
     # ── Save final checkpoint ─────────────────────────────────────────
