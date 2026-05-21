@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=01:40:00          # baseline batchée -> rapide, marge large
+#SBATCH --time=12:00:00          # baseline batchée -> rapide, marge large
 #SBATCH --output=logs/baseline_%j.out
 #SBATCH --error=logs/baseline_%j.err
 
