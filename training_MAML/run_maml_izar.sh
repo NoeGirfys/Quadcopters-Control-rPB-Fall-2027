@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=03:00:00          # N*M_train est plus petit qu'avant -> à mesurer en debug
+#SBATCH --time=04:30:00          # N*M_train est plus petit qu'avant -> à mesurer en debug
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
 
@@ -42,8 +42,8 @@ srun python -u training_MAML/train_maml.py \
     --lr-outer 3e-4 \
     --lr-inner 0.05 \
     --n-inner-steps 1 \
-    --mass-min 0.002 \
-    --mass-max 0.014 \
+    --mass-min 0.000 \
+    --mass-max 0.000 \
     --mass-pos-sigma 0.01 \
     --half-side 0.3 \
     --n-points-train 100 \
@@ -52,5 +52,5 @@ srun python -u training_MAML/train_maml.py \
     --tau-div 1.0 \
     --t-sim 2.0 \
     --seed 42 \
-    --tag izar_composite \
+    --tag izar_composite_cste_mass \
     --profile
