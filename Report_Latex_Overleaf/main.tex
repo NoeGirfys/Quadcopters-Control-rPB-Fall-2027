@@ -876,6 +876,16 @@ explicitly optimises for fast \emph{within-task} adaptation rather than for
 average performance across tasks, which is what distinguishes MAML from a
 joint-training baseline.
 
+In the canonical formulation of~\cite{finn2017maml} recalled above and
+summarised in Algorithm~\ref{alg:maml}, a fresh batch of tasks is drawn from
+$p(\mathcal{T})$ at every meta-iteration, and the support and query batches are
+re-sampled at each iteration. The concrete sampling protocol adopted in this
+work --- a \emph{fixed} task set whose support and query points are drawn once
+at start-up and reused at every epoch --- deviates from this canonical
+formulation for the sake of reproducibility and of a strictly fair comparison
+with the baseline; it is detailed and contrasted with both~\cite{finn2017maml}
+and~\cite{goffin2026} in Section~\ref{sec:maml_training}.
+
 \subsubsection*{Few-shot adaptation on a new task}
 
 Once meta-training has converged, the resulting initialisation
@@ -991,21 +1001,23 @@ an initialisation obtained from averaging across tasks.
 \end{figure}
 
 \begin{algorithm}[h]
-\caption{MAML meta-training and few-shot adaptation.}
+\caption{MAML meta-training and few-shot adaptation (canonical
+formulation~\cite{finn2017maml}). The fixed-task-set variant used in this work
+is described in Section~\ref{sec:maml_training}.}
 \label{alg:maml}
 \begin{algorithmic}[1]
 \Require Task distribution $p(\mathcal{T})$; inner LR $\alpha$; outer LR $\beta$;
          support/query sizes $K_{\mathrm{inner}}, K_{\mathrm{outer}}$;
-         number of tasks $m$.
-\State Sample $m$ tasks $\{\mathcal{T}_i\}_{i=1}^{m} \sim p(\mathcal{T})$.
+         meta-batch size $m$.
 \State Initialise meta-parameters $\boldsymbol{\theta}$ randomly.
 \While{not converged}
+    \State Sample a batch of $m$ tasks $\{\mathcal{T}_i\}_{i=1}^{m} \sim p(\mathcal{T})$.
     \For{$i = 1$ to $m$}
         \State Draw $K_{\mathrm{inner}}$ support samples from $\mathcal{T}_i$.
         \State $\boldsymbol{\theta}_i' \gets \boldsymbol{\theta}
                - \alpha\,\nabla_{\boldsymbol{\theta}}\,
                \mathcal{L}_{\mathcal{T}_i}(f_{\boldsymbol{\theta}})$
-               \Comment{inner update~\eqref{eq:maml_inner}}
+               \Comment{inner update~\eqref{eq:maml_inner}, on the support batch}
         \State Draw $K_{\mathrm{outer}}$ query samples from $\mathcal{T}_i$.
         \State Evaluate $\mathcal{L}_{\mathcal{T}_i}\!\left(f_{\boldsymbol{\theta}_i'}\right)$
                on the query batch.
@@ -1016,7 +1028,7 @@ an initialisation obtained from averaging across tasks.
            \Comment{meta-update~\eqref{eq:maml_outer}}
 \EndWhile
 \Statex
-\State \textbf{Few-shot adaptation on $\mathcal{T}_{\mathrm{target}} \sim p(\mathcal{T})$:}
+\State \textbf{Few-shot adaptation on an unseen $\mathcal{T}_{\mathrm{target}} \sim p(\mathcal{T})$:}
 \State Draw $K_{\mathrm{inner}}$ samples from $\mathcal{T}_{\mathrm{target}}$.
 \State $\boldsymbol{\theta}_{\mathrm{final}} \gets \boldsymbol{\theta}
        - \alpha\,\nabla_{\boldsymbol{\theta}}\,
