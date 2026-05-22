@@ -357,6 +357,7 @@ I_x \dot{p} &= \tau_{Bx} - (I_z - I_y)\, q r, \label{eq:nl_p}\\
 I_y \dot{q} &= \tau_{By} - (I_x - I_z)\, p r, \label{eq:nl_q}\\
 I_z \dot{r} &= \tau_{Bz} - (I_y - I_x)\, p q, \label{eq:nl_r}
 \end{align}
+NEED TO CHANGE $\tau_{B..}$ because it is used at two places for two different things
 completed by an orientation kinematic relation that closes the system: either
 $\dot{\Phi} = W(\phi, \theta)^{-1} \omega_B$ from~\eqref{eq:kinematic} when the Euler angles
 are kept in the state vector, or the quaternion propagation law
@@ -1041,13 +1042,107 @@ is described in Section~\ref{sec:maml_training}.}
 % =====================================================
 \newpage
 \section{Simulation Environment}
+
+A faithful simulation environment is the prerequisite for both training the
+controllers of Sections~\ref{sec:nn_pid_arch} and~\ref{sec:maml_training} and for
+closing the sim-to-real gap discussed in Section~\ref{sec:simreal}. This chapter
+introduces the simulation backend adopted in this work
+(Section~\ref{sec:gym_pybullet}), quantifies its agreement with Goffin's dynamics
+model in open loop (Section~\ref{sec:dyn_comparison}), and describes how the
+Crazyflie firmware was ported into it to obtain a realistic closed-loop pipeline
+(Section~\ref{sec:firmware_integration}).
+
 \subsection{gym-pybullet-drones}\label{sec:gym_pybullet}
+
+The simulation backend used throughout this project is
+\texttt{gym-pybullet-drones}~\cite{panerati2021}, an open-source quadcopter
+simulator built on the Bullet physics engine through its Python binding
+PyBullet~\cite{coumans2021pybullet} and exposing the standard Gymnasium
+environment interface. The library ships with a validated model of the
+Bitcraze Crazyflie 2.x --- the platform targeted in this project --- and was
+developed precisely for learning-based multi-agent quadcopter control, which
+makes it a natural fit for the present work.
+
+\subsubsection*{Choice of simulator}
+
+The main alternative considered was Webots~\cite{michel2004webots}, a mature
+general-purpose robotics simulator that also provides a Crazyflie model. Webots
+was discarded in favour of \texttt{gym-pybullet-drones} for three reasons that
+are decisive given the training method of Section~\ref{sec:bptt}. First, the
+training procedure relies on \emph{back-propagation through time} across an
+unrolled rollout, which requires the entire closed loop --- policy, inner PID
+loops and dynamics --- to be expressed as differentiable operations in the same
+automatic-differentiation framework (PyTorch) as the network. A
+Python-native simulator whose dynamics can be re-implemented as differentiable
+tensor operations is therefore essential, whereas Webots couples the controller
+to a C/C++ physics core through an external supervisor interface that is not
+designed to be differentiated through. Second, \texttt{gym-pybullet-drones} is
+lightweight and scriptable: thousands of short rollouts can be run headlessly
+per training epoch from a single Python process, without the overhead of a
+full graphical robotics environment. Third, it directly exposes an
+\emph{explicit} dynamics mode (described below) whose equations coincide with
+the rigid-body model derived in Section~\ref{sec:dynamics} and used by
+Goffin~\cite{goffin2026}, which both guarantees comparability with the prior
+work and gives full control over every term of the model.
+
+\subsubsection*{Physics modes}
+
+\texttt{gym-pybullet-drones} decouples two frequencies: the rate
+\texttt{PYB\_FREQ} at which the physics is advanced (default $240\,\mathrm{Hz}$)
+and the rate \texttt{CTRL\_FREQ} at which a new control action is applied, the
+former being an integer multiple of the latter so that each action is held for
+\texttt{PYB\_STEPS\_PER\_CTRL} physics sub-steps. The way the physics step is
+computed is selected through a \texttt{Physics} flag, of which the library
+offers two families:
+\begin{itemize}
+    \item \texttt{PYB} --- the per-rotor thrusts and the reaction torques are
+    applied as external wrenches to the rigid body and the state is advanced by
+    the full Bullet constraint solver via \texttt{stepSimulation}. Variants
+    \texttt{PYB\_GND}, \texttt{PYB\_DRAG} and \texttt{PYB\_DW} add empirical
+    ground-effect, blade-drag and downwash corrections on top of this base
+    update.
+    \item \texttt{DYN} --- the rigid-body equations of motion are integrated
+    explicitly in closed form and the result is written back into PyBullet,
+    which is then used merely as a kinematic container and visualiser rather
+    than as a physics solver.
+\end{itemize}
+A third mode, \texttt{DYN\_OFFSET}, is a contribution of this project: it
+extends \texttt{DYN} with an attached offset point mass --- a shifted centre of
+mass and a Steiner-corrected inertia tensor --- and is the mode used for the
+MAML experiments of Section~\ref{sec:maml_offset}; it is described in detail in
+Section~\ref{sec:maml_task}.
+
+\subsubsection*{The DYN mode}
+
+All experiments in this report use the explicit \texttt{DYN} mode (NEED TO CHECK THAT INDEED IT IS THE CASE), because it
+implements exactly the nonlinear model of Section~\ref{sec:dynamics} and is the
+most directly comparable to Goffin's simulator. Given the four rotor speeds, the
+per-rotor thrusts $F_i = k_t\omega_i^2$ and drag torques $k_d\omega_i^2$ are
+combined into the body force and the body torques through the
+X-configuration motor mixing of Equations~\eqref{eq:taux_X}--\eqref{eq:tauz_X},
+the gyroscopic coupling $\omega_B \times (J_B\omega_B)$ of
+Equation~\eqref{eq:euler_components} is subtracted, and the linear and angular
+accelerations are obtained from Newton's and Euler's equations. The state is then
+advanced with the \emph{semi-implicit} (symplectic) Euler scheme already
+discussed in Section~\ref{sec:dynamics}: the linear and angular velocities are
+updated first, after which the position is integrated with the new linear
+velocity and the orientation is propagated as a unit quaternion with the new
+body rates, using the closed-form update~\eqref{eq:quat_update}. The orientation is represented internally by a quaternion
+to avoid the gimbal-lock singularity of the Euler-angle kinematics, and the
+Euler angles $(\phi,\theta,\psi)$ are recovered only when the state vector is
+assembled for the controller. As established in Section~\ref{sec:dynamics}, the
+angular state propagated by the simulator is the body-rate vector
+$\omega_B = (p,q,r)^\top$, not the Euler-angle derivatives; this is the same
+quantity observed by the policy~\eqref{eq:observation} and measured by the
+gyroscope on the real drone, so the convention is consistent across simulation
+and hardware.
+
 \subsection{Dynamics Model Comparison}\label{sec:dyn_comparison}
 \subsection{Crazyflie Firmware Integration}\label{sec:firmware_integration}
 
 % =====================================================
 \newpage
-\section{Sim-to-Real Validation}
+\section{Sim-to-Real Validation}\label{sec:simreal}
 \subsection{Experimental Setup}
 \subsection{Flowdeck vs Lighthouse}
 \subsection{Circle Trajectory: Simulation vs Reality}
