@@ -1072,11 +1072,14 @@ are decisive given the training method of Section~\ref{sec:bptt}. First, the
 training procedure relies on \emph{back-propagation through time} across an
 unrolled rollout, which requires the entire closed loop --- policy, inner PID
 loops and dynamics --- to be expressed as differentiable operations in the same
-automatic-differentiation framework (PyTorch) as the network. A
-Python-native simulator whose dynamics can be re-implemented as differentiable
-tensor operations is therefore essential, whereas Webots couples the controller
-to a C/C++ physics core through an external supervisor interface that is not
-designed to be differentiated through. Second, \texttt{gym-pybullet-drones} is
+automatic-differentiation framework (PyTorch) as the network. What is needed is
+therefore a simulator whose dynamics are transparent enough to be
+\emph{re-implemented} as differentiable PyTorch tensor operations; the explicit
+\texttt{DYN} dynamics of \texttt{gym-pybullet-drones} (below) are exactly that,
+and the controllers are in fact trained on such a PyTorch port. Webots, by
+contrast, couples the controller to an opaque C/C++ physics core through an
+external supervisor interface that cannot be differentiated through. Second,
+\texttt{gym-pybullet-drones} is
 lightweight and scriptable: thousands of short rollouts can be run headlessly
 per training epoch from a single Python process, without the overhead of a
 full graphical robotics environment. Third, it directly exposes an
@@ -1114,9 +1117,16 @@ Section~\ref{sec:maml_task}.
 
 \subsubsection*{The DYN mode}
 
-All experiments in this report use the explicit \texttt{DYN} mode (NEED TO CHECK THAT INDEED IT IS THE CASE), because it
-implements exactly the nonlinear model of Section~\ref{sec:dynamics} and is the
-most directly comparable to Goffin's simulator. Given the four rotor speeds, the
+The explicit \texttt{DYN} mode is central to this project. It is the mode used for
+the high-fidelity, closed-loop \emph{sim-to-real validation} of
+Section~\ref{sec:simreal} --- in closed loop it is nearly indistinguishable from
+\texttt{PYB} --- and it implements exactly the nonlinear model of
+Section~\ref{sec:dynamics}, which makes it the natural reference for the dynamics
+comparison of Section~\ref{sec:dyn_comparison}. The controllers themselves are not
+trained inside \texttt{gym-pybullet-drones} but on a PyTorch re-implementation of
+these dynamics, in the simpler analytic form of Goffin's model (the two forms are
+shown to agree in Section~\ref{sec:dyn_comparison}). We describe the \texttt{DYN}
+update here, as it underlies both uses. Given the four rotor speeds, the
 per-rotor thrusts $F_i = k_t\omega_i^2$ and drag torques $k_d\omega_i^2$ are
 combined into the body force and the body torques through the
 X-configuration motor mixing of Equations~\eqref{eq:taux_X}--\eqref{eq:tauz_X},
