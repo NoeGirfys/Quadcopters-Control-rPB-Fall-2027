@@ -1143,9 +1143,9 @@ Before the simulator can be trusted as a training ground, it must be checked
 that its dynamics actually reproduce the rigid-body model derived in
 Section~\ref{sec:dynamics} and used by Goffin~\cite{goffin2026}. This section
 reports an open-loop comparison between \texttt{gym-pybullet-drones} and Goffin's
-model, in both the nonlinear and the linearized variants, for the two motor
-layouts (X and $+$) and the two physics back-ends (\texttt{PYB} and
-\texttt{DYN}).
+model, in both the nonlinear and the linearized variants, for the
+X-configuration of the real Crazyflie and the two physics back-ends
+(\texttt{PYB} and \texttt{DYN}).
 
 \subsubsection*{Protocol}
 
@@ -1166,22 +1166,20 @@ metrics are used.
 
 \subsubsection*{Open-loop trajectory}
 
-The first metric simply integrates Goffin's model in free run over the whole
-$10\,\mathrm{s}$ circle and overlays the result on the reference.
-Figure~\ref{fig:openloop_traj} shows this for the X-configuration in
-\texttt{DYN} mode. The nonlinear model tracks the reference circle, altitude and
-attitude almost perfectly for the entire period; the small per-step
-discrepancies analysed below accumulate only into a sub-millimetre altitude
-drift and a barely visible lag by the end of the circle. The linearized model,
-by contrast, follows the reference for roughly the first two seconds and then
-spirals away, which is the expected consequence of the small-angle approximation
-once the integrated error leaves the hover neighbourhood. This already indicates
-that the \emph{nonlinear} model is the faithful one and that the simulator and
-Goffin's model agree; the open-loop view, however, conflates the per-step
-dynamics mismatch with its free accumulation, and the latter dominates the
-picture.
+The first metric integrates Goffin's model in free run over the whole
+$10\,\mathrm{s}$ circle and overlays the result on the reference
+(Figure~\ref{fig:openloop_traj}, X-configuration, \texttt{DYN} mode). Two
+features stand out and, at first sight, seem contradictory: the roll and pitch
+angles of the nonlinear model stay glued to the reference for the entire flight,
+yet its horizontal position tracks well only for about the first half of the
+circle and then visibly decouples, drifting by $\sim 0.4\,\mathrm{m}$ by
+$t = 10\,\mathrm{s}$; the altitude, by contrast, drifts by barely
+$\sim 1\,\mathrm{mm}$. The linearized model follows the reference for roughly the
+first two seconds and then spirals away entirely, as expected from the
+small-angle approximation once the integrated error leaves the hover
+neighbourhood.
 
-\begin{figure}[h]
+\begin{figure}[H]
     \centering
     \includegraphics[width=\textwidth]{images/openloop_cross_dyn_traj.png}
     \caption{Open-loop trajectory comparison for the X-configuration in
@@ -1191,11 +1189,49 @@ picture.
     replayed open-loop from the same initial state with the same logged motor
     commands. Top left: top view in the $x$--$y$ plane; the other panels show
     altitude $z$, roll $\phi$ and pitch $\theta$ versus time. Axis limits track
-    the reference, so the linearized model leaves the frame once it diverges. The
-    nonlinear model overlays the reference for the whole circle, while the
-    linearized model diverges after about two seconds.}
+    the reference, so the linearized model leaves the frame once it diverges.}
     \label{fig:openloop_traj}
 \end{figure}
+
+The apparent paradox -- glued attitude but diverging horizontal position -- is a
+textbook consequence of open-loop integration rather than a modelling error, and
+it follows from the way an attitude error feeds the position. In open loop the
+position is obtained by integrating the acceleration \emph{twice}, and near hover
+a tilt of the airframe is exactly what creates horizontal acceleration: a pitch
+$\theta$ tips the thrust vector forward and gives $\ddot{x} \simeq g\,\theta$,
+while a roll gives $\ddot{y} \simeq -g\,\phi$ (the linearised
+relations~\eqref{eq:linearized}). A small error $\delta\theta$ on the attitude
+therefore acts as a horizontal-acceleration error $g\,\delta\theta$ -- to
+\emph{first order} in the attitude error -- which is then integrated twice into
+the position.
+
+The attitude error between the two models stays below $\sim 10^{-2}\,\mathrm{rad}$
+for the whole flight, a few percent of the plotted range and hence invisible on
+the $\phi$/$\theta$ panels; yet the double time integral turns this almost
+invisible error into a horizontal drift of order $0.4\,\mathrm{m}$ by
+$t = 10\,\mathrm{s}$, concentrated in the second half of the circle simply
+because a double integral grows steeply with time. To check that this is the
+\emph{entire} story, one can take the attitude error \emph{actually measured
+along the run}, convert it into the implied horizontal-acceleration error by
+multiplying by $g$, and integrate it twice in time; the result reproduces the
+observed position drift to within a few percent ($x$: $0.42\,\mathrm{m}$ from this
+double integral vs $0.42\,\mathrm{m}$ observed; $y$: $0.13$ vs
+$0.13\,\mathrm{m}$). The horizontal drift is thus, quantitatively, nothing but the
+twice-integrated attitude error.
+
+The altitude is spared because the attitude does not enter the vertical
+acceleration at first order: $\ddot{z} = (F/m)\cos\phi\cos\theta - g$ depends on
+the tilt only through $\cos\phi\cos\theta \simeq 1 - \tfrac{1}{2}(\phi^2+\theta^2)$,
+so the same small attitude error perturbs $\ddot{z}$ only at \emph{second} order
+in the angles -- a far weaker effect than the first-order horizontal coupling
+$g\,\delta\theta$. Its double integral consequently stays at the millimetre level,
+more than two orders of magnitude below the horizontal drift, as
+Figure~\ref{fig:openloop_traj} shows. This is precisely the regime in which an
+open-loop trajectory comparison is misleading: it conflates the per-step dynamics
+mismatch with its double-integrated accumulation, and the latter -- amplified by
+the first-order attitude-to-horizontal-position coupling -- dominates the picture.
+The single-step metric introduced next removes this amplification and isolates the
+true agreement of the dynamics.
 
 \subsubsection*{Single-step prediction error}
 
@@ -1217,7 +1253,7 @@ states into position, velocity, attitude and body rates,
 Figure~\ref{fig:openloop_singlestep} reports the Euclidean norm of $\mathbf{e}_k$
 within each group for the X-configuration in \texttt{DYN} mode, and
 Table~\ref{tab:singlestep_rms} collects the root-mean-square error over the whole
-trajectory for all six cases.
+trajectory for the three physics back-ends.
 
 \begin{figure}[h]
     \centering
@@ -1230,9 +1266,9 @@ trajectory for all six cases.
     identical; the linearized model (red) incurs a $\sim 10^{-4}\,\mathrm{m/s}$
     error from the small-angle approximation. Position, attitude and body-rate
     errors are essentially the same for both Goffin variants (the dashed and
-    dotted curves overlap) and stem from the integration scheme and the
-    Euler-angle versus body-rate/quaternion representation, not from the
-    linearization.}
+    dotted curves overlap): they stem from the integration scheme (position and
+    attitude angle) and the body-rate versus Euler-rate formulation (body rate),
+    not from the linearization.}
     \label{fig:openloop_singlestep}
 \end{figure}
 
@@ -1242,66 +1278,65 @@ The single-step errors decompose cleanly into three contributions, each of which
 maps onto a modelling choice discussed in Section~\ref{sec:dynamics}.
 \begin{itemize}
     \item \textbf{Position} ($\sim 2\times10^{-6}\,\mathrm{m}$ per step,
-    identical for both Goffin variants and for both physics modes). This is the
-    signature of the integration scheme alone: \texttt{gym-pybullet-drones}
-    advances the position with the \emph{updated} velocity (semi-implicit Euler),
-    whereas Goffin's forward-Euler step uses the old velocity, so the two differ
-    by $\Delta t^2$ times the acceleration. For the centripetal acceleration of
-    the circle ($a = R\,\Omega^2 \approx 0.12\,\mathrm{m/s^2}$ with
-    $\Omega = 2\pi/10\,\mathrm{s}$) this predicts
-    $\Delta t^2 a \approx 2\times10^{-6}\,\mathrm{m}$, in exact agreement with the
-    measured value.
+    identical for both Goffin variants and for both physics modes). The position
+    update is purely kinematic, $\mathbf{p}_{k+1} = \mathbf{p}_k +
+    \Delta t\,\mathbf{v}$, and the sole difference between the two is which
+    velocity is used: \texttt{gym-pybullet-drones} integrates with the
+    \emph{updated} velocity (semi-implicit Euler) and Goffin with the old one
+    (forward Euler). Since the velocity itself agrees to machine precision (next
+    item), the single-step position error solely depends on the integration scheme.
     \item \textbf{Velocity.} For the nonlinear model in \texttt{DYN} mode the
     error is at machine precision ($3.4\times10^{-18}\,\mathrm{m/s}$,
-    Table~\ref{tab:singlestep_rms}): the translational
-    equations~\eqref{eq:nl_x}--\eqref{eq:nl_z} are implemented identically in the
-    simulator and in Goffin's model. The linearized model instead replaces the
-    full thrust projection by $g\,\theta$ (resp.\ $-g\,\phi$) and therefore incurs
-    a $\sim 6\times10^{-4}\,\mathrm{m/s}$ per-step error -- still small, but
-    fourteen orders of magnitude larger than the nonlinear one. This single panel
-    is the clearest evidence that the nonlinear models coincide.
-    \item \textbf{Attitude and body rates} ($\sim 5\times10^{-4}\,\mathrm{rad}$
-    and $\sim 2\times10^{-3}\,\mathrm{rad/s}$ per step). These errors are the same
-    for the nonlinear and the linearized model, which confirms that they are
-    \emph{not} a linearization artefact: near hover the gyroscopic coupling that
-    distinguishes the two rotational models is second-order in the body rates and
-    hence negligible. What remains is the representational mismatch analysed in
-    Section~\ref{sec:dynamics}: Goffin integrates the orientation directly through
-    Euler angles, whereas \texttt{gym-pybullet-drones} propagates body rates and
-    integrates a quaternion. This is exactly the discrepancy anticipated there,
-    and it stays bounded and small throughout the flight.
+    Table~\ref{tab:singlestep_rms}). The translational acceleration
+    $\tfrac{F}{m}\,R(\phi,\theta,\psi)\hat{z} - g\hat{z}$ depends on the attitude
+    \emph{angles} and the thrust, not on the angular rates -- so the
+    body-rate-versus-Euler-rate distinction does not enter this channel at all.
+    With the exact (reset) angles and the full thrust projection, which Goffin's
+    nonlinear equations~\eqref{eq:nl_x}--\eqref{eq:nl_z} reproduce identically, the
+    one-step velocity matches bit for bit. The linearized model instead replaces
+    the projection by $g\,\theta$ (resp.\ $-g\,\phi$) and incurs a
+    $\sim 6\times10^{-4}\,\mathrm{m/s}$ error from the small-angle approximation.
+    \item \textbf{Attitude.} The attitude-\emph{angle} error
+    ($\sim 5\times10^{-4}\,\mathrm{rad}$ per step) is the rotational
+    analogue of the position error: exactly as the position update differs only in
+    whether the old or the updated \emph{velocity} is integrated, the orientation
+    update differs only in whether the old or the updated \emph{body rate} is
+    integrated (the updated one in the simulator, the old one in Goffin).
+    Whether the orientation is then propagated as Euler angles (Goffin) or as a
+    quaternion (the simulator) makes, by itself, no measurable difference.
+    \item \textbf{Body rates.} The
+    \emph{body-rate} error ($\sim 2\times10^{-3}\,\mathrm{rad/s}$ per step) is the
+    numerical fingerprint of the body-rate-versus-Euler-rate distinction of
+    Section~\ref{sec:dynamics}: Goffin advances the angular rate through Euler's
+    equation written for the Euler-angle derivatives, whereas the simulator uses
+    the body rates $\omega_B$. Rewriting Goffin's rotational equation in the
+    body-rate form $J\dot{\omega}_B = \tau_B - \omega_B\times(J\omega_B)$ brings
+    this error down to machine precision.
 \end{itemize}
 
 \begin{table}[h]
     \centering
     \caption{Root-mean-square single-step prediction
     error~\eqref{eq:single_step_err} over the $10\,\mathrm{s}$ circular
-    trajectory, by motor configuration, physics back-end and Goffin model. The
-    X-configuration is the one used on the real Crazyflie; the $+$-configuration
-    reproduces Goffin's original layout as a cross-check. Units are per step
-    ($\Delta t = 1/240\,\mathrm{s}$).}
+    trajectory in the X-configuration, by physics back-end and Goffin model.
+    Units are per step ($\Delta t = 1/240\,\mathrm{s}$).}
     \label{tab:singlestep_rms}
     \small
-    \begin{tabular}{lll rrrr}
+    \begin{tabular}{ll rrrr}
         \toprule
-        Config & Physics & Model & Pos.\ (m) & Vel.\ (m/s) & Att.\ (rad) & Rate (rad/s) \\
+        Physics & Model & Pos.\ (m) & Vel.\ (m/s) & Att.\ (rad) & Rate (rad/s) \\
         \midrule
-        X & \texttt{DYN} & nonlin. & $2.07\!\times\!10^{-6}$ & $3.4\!\times\!10^{-18}$ & $5.36\!\times\!10^{-4}$ & $2.01\!\times\!10^{-3}$ \\
-        X & \texttt{DYN} & linear. & $2.07\!\times\!10^{-6}$ & $6.48\!\times\!10^{-4}$ & $5.36\!\times\!10^{-4}$ & $1.96\!\times\!10^{-3}$ \\
-        X & \texttt{PYB} & nonlin. & $2.19\!\times\!10^{-6}$ & $5.52\!\times\!10^{-5}$ & $5.38\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
-        X & \texttt{PYB} & linear. & $2.19\!\times\!10^{-6}$ & $6.82\!\times\!10^{-4}$ & $5.38\!\times\!10^{-4}$ & $2.07\!\times\!10^{-3}$ \\
-        X & \texttt{PYB+aero} & nonlin. & $2.12\!\times\!10^{-6}$ & $1.25\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.17\!\times\!10^{-3}$ \\
-        X & \texttt{PYB+aero} & linear. & $2.12\!\times\!10^{-6}$ & $6.98\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
-        \midrule
-        $+$ & \texttt{DYN} & nonlin. & $1.83\!\times\!10^{-6}$ & $3.4\!\times\!10^{-18}$ & $3.53\!\times\!10^{-4}$ & $7.50\!\times\!10^{-4}$ \\
-        $+$ & \texttt{DYN} & linear. & $1.83\!\times\!10^{-6}$ & $5.52\!\times\!10^{-4}$ & $3.53\!\times\!10^{-4}$ & $7.49\!\times\!10^{-4}$ \\
-        $+$ & \texttt{PYB} & nonlin. & $1.81\!\times\!10^{-6}$ & $4.76\!\times\!10^{-5}$ & $3.52\!\times\!10^{-4}$ & $7.43\!\times\!10^{-4}$ \\
-        $+$ & \texttt{PYB} & linear. & $1.81\!\times\!10^{-6}$ & $5.48\!\times\!10^{-4}$ & $3.52\!\times\!10^{-4}$ & $7.43\!\times\!10^{-4}$ \\
+        \texttt{DYN} & nonlin. & $2.07\!\times\!10^{-6}$ & $3.4\!\times\!10^{-18}$ & $5.36\!\times\!10^{-4}$ & $2.01\!\times\!10^{-3}$ \\
+        \texttt{DYN} & linear. & $2.07\!\times\!10^{-6}$ & $6.48\!\times\!10^{-4}$ & $5.36\!\times\!10^{-4}$ & $1.96\!\times\!10^{-3}$ \\
+        \texttt{PYB} & nonlin. & $2.19\!\times\!10^{-6}$ & $5.52\!\times\!10^{-5}$ & $5.38\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
+        \texttt{PYB} & linear. & $2.19\!\times\!10^{-6}$ & $6.82\!\times\!10^{-4}$ & $5.38\!\times\!10^{-4}$ & $2.07\!\times\!10^{-3}$ \\
+        \texttt{PYB+aero} & nonlin. & $2.12\!\times\!10^{-6}$ & $1.25\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.17\!\times\!10^{-3}$ \\
+        \texttt{PYB+aero} & linear. & $2.12\!\times\!10^{-6}$ & $6.98\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-\subsubsection*{PYB versus DYN and configuration cross-check}
+\subsubsection*{PYB versus DYN}
 
 Table~\ref{tab:singlestep_rms} also quantifies the effect of the physics
 back-end. In \texttt{PYB} mode the nonlinear velocity error rises from machine
@@ -1315,23 +1350,32 @@ remains three to four orders of magnitude below the linearization error, so even
 \texttt{PYB} stays close to the analytical model. The position, attitude and
 body-rate errors are insensitive to the physics mode, as they are governed by the
 integration scheme and the angle representation rather than by the force model.
-Finally, the X- and $+$-configurations yield single-step errors of the same
-order (the $+$ layout has a smaller body-rate error simply because its inertia
-distribution and motor mixing differ), which validates the
-configuration-dependent motor mixing of
-Equations~\eqref{eq:taux_X}--\eqref{eq:tauz_X} in both cases.
+The machine-precision velocity match in \texttt{DYN} mode moreover confirms that
+the X-configuration motor mixing of
+Equations~\eqref{eq:taux_X}--\eqref{eq:tauz_X} is implemented correctly.
 
 \subsubsection*{Conclusion}
 
 The two models agree to machine precision in the translational channel and to
 within a small, bounded and well-understood per-step error in the rotational
-channel, the latter being entirely accounted for by the integration scheme and
-the Euler-angle versus body-rate representation discussed in
-Section~\ref{sec:dynamics}. Since training relies on a single-step rollout, this
-level of agreement is more than sufficient: \texttt{gym-pybullet-drones} in
-\texttt{DYN} mode is a faithful re-implementation of the dynamics whose results
-are directly comparable to Goffin's. The \texttt{DYN} mode is therefore used
-throughout the remainder of the report.
+channel, the latter being entirely accounted for by the symplectic integration
+scheme (attitude angle) and the body-rate versus Euler-rate formulation (angular
+rate) discussed in Section~\ref{sec:dynamics}. Since training relies on an
+autoregressive, single-step rollout (Section~\ref{sec:bptt}), this per-step
+agreement is more than sufficient, and on the time scale that actually matters
+the two models may be treated as interchangeable.
+
+This justifies the division of labour adopted in the remainder of the report. The
+closed-loop \emph{sim-to-real validation} experiments, which must mirror the real
+platform as faithfully as possible, are run on the PyBullet model -- in
+\texttt{DYN} or \texttt{PYB} mode, the two being nearly indistinguishable in
+closed loop, where feedback continually corrects the small open-loop
+discrepancies analysed above. \emph{Training}, by contrast, is carried out on a
+lightweight PyTorch re-implementation of Goffin's model: back-propagation through
+time requires a fully differentiable simulator in the network's own framework,
+which the Bullet-based \texttt{gym-pybullet-drones} cannot provide, whereas
+Goffin's model -- accurate per step and, under closed-loop feedback, accurate
+overall -- is both simple to differentiate and faithful enough to train on.
 
 \subsection{Crazyflie Firmware Integration}\label{sec:firmware_integration}
 
