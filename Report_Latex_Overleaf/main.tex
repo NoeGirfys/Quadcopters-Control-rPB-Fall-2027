@@ -27,6 +27,9 @@
 \usepackage{algpseudocode}
 \usepackage{needspace}
 
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, calc}
+
 \usepackage{cellspace}
 \setlength\cellspacetoplimit{6pt}    % Espace vide au-dessus
 \setlength\cellspacebottomlimit{6pt} % Espace vide en-dessous
@@ -810,6 +813,219 @@ illustrated in Figure~\ref{fig:curric_reset}.
 
 \subsection{Model-Agnostic Meta-Learning (MAML)}\label{sec:maml_bg}
 
+Meta-learning, often referred to as \emph{learning to learn}, aims at training
+models that can rapidly adapt to new tasks from only a handful of observations,
+by exploiting the structure shared across a family of related tasks. Several
+methodological families have been proposed in the literature: \emph{model-based}
+methods rely on recurrent or memory-augmented architectures, \emph{metric-based}
+methods learn an embedding space in which new samples can be efficiently
+compared to previously seen ones, and \emph{optimisation-based} methods learn an
+initialisation tuned for fast gradient-based adaptation. The present work
+adopts an optimisation-based method, namely Model-Agnostic Meta-Learning
+(MAML)~\cite{finn2017maml}; this mirrors the choice made by
+Goffin~\cite{goffin2026} in the preceding semester, both for direct
+comparability and because MAML is particularly well suited to closed-loop
+control: the rapidly-adaptable initialisation it produces can be fine-tuned
+online from a few real-world trajectories after deployment, without requiring
+any change to the controller architecture.
+
+\subsubsection*{Meta-training}
+
+MAML assumes a distribution of tasks $p(\mathcal{T})$, where each task
+$\mathcal{T}_i$ is equipped with its own loss function
+$\mathcal{L}_{\mathcal{T}_i}$ -- the cumulative trajectory
+cost~\eqref{eq:cumulative_cost} in this work. The goal is to learn a parameter
+initialisation $\boldsymbol{\theta}$ from which a small number of gradient
+steps on any task drawn from $p(\mathcal{T})$ yields an adapted parameter set
+that performs well on that task. To this end, $m$ tasks
+$\{\mathcal{T}_i\}_{i=1}^{m}$ are sampled from $p(\mathcal{T})$, and
+meta-training proceeds as an alternation of two nested loops, illustrated in
+Figure~\ref{fig:maml_schematic} and summarised in Algorithm~\ref{alg:maml}.
+
+In the \emph{inner loop}, each task $\mathcal{T}_i$ is presented with a small
+``support'' batch of $K_{\mathrm{inner}}$ samples, on which one (or a few)
+gradient steps of the task loss produce task-adapted parameters
+\begin{equation}
+\boldsymbol{\theta}_i' \;=\; \boldsymbol{\theta}
+- \alpha \, \nabla_{\boldsymbol{\theta}}\,
+  \mathcal{L}_{\mathcal{T}_i}\!\left(f_{\boldsymbol{\theta}}\right),
+\label{eq:maml_inner}
+\end{equation}
+where $\alpha$ is the inner-loop learning rate and $f_{\boldsymbol{\theta}}$
+denotes the controller parameterised by $\boldsymbol{\theta}$. In the
+\emph{outer loop}, each adapted controller is evaluated on a fresh ``query''
+batch of $K_{\mathrm{outer}}$ samples drawn from the same task, and the
+meta-parameters are updated to minimise the sum of these post-adaptation losses
+across all tasks:
+\begin{equation}
+\boldsymbol{\theta} \;\leftarrow\; \boldsymbol{\theta}
+- \beta\, \nabla_{\boldsymbol{\theta}} \sum_{i=1}^{m}
+  \mathcal{L}_{\mathcal{T}_i}\!\left(f_{\boldsymbol{\theta}_i'}\right),
+\label{eq:maml_outer}
+\end{equation}
+with $\beta$ the outer-loop learning rate. The key point
+of~\eqref{eq:maml_outer} is that the gradient is taken with respect to the
+meta-parameters $\boldsymbol{\theta}$ \emph{before} adaptation, so it
+back-propagates through the inner update~\eqref{eq:maml_inner}. In its standard
+second-order form this involves the Hessian of $\mathcal{L}_{\mathcal{T}_i}$
+through the chain rule; a first-order approximation that treats the inner
+update as identity, originally proposed in~\cite{finn2017maml}, halves the
+computational cost and was found to yield indistinguishable results in our
+experiments (TO CHECK AT THE END OF THE PROJECT). The meta-loss~\eqref{eq:maml_outer}
+explicitly optimises for fast \emph{within-task} adaptation rather than for
+average performance across tasks, which is what distinguishes MAML from a
+joint-training baseline.
+
+\subsubsection*{Few-shot adaptation on a new task}
+
+Once meta-training has converged, the resulting initialisation
+$\boldsymbol{\theta}$ is expected to enable rapid adaptation to any new task
+$\mathcal{T}_{\mathrm{target}} \sim p(\mathcal{T})$. Given $K_{\mathrm{inner}}$
+samples drawn from $\mathcal{T}_{\mathrm{target}}$, the adapted parameters are
+obtained by performing exactly the same gradient step as in the inner loop,
+possibly repeated a few times:
+\begin{equation}
+\boldsymbol{\theta}_{\mathrm{final}} \;=\; \boldsymbol{\theta}
+- \alpha \, \nabla_{\boldsymbol{\theta}}\,
+  \mathcal{L}_{\mathcal{T}_{\mathrm{target}}}\!\left(f_{\boldsymbol{\theta}}\right),
+\label{eq:maml_adapt}
+\end{equation}
+and the controller $f_{\boldsymbol{\theta}_{\mathrm{final}}}$ is then deployed.
+Adaptation thus uses the very same machinery as training, with no retraining
+from scratch and no modification of the network architecture; the cost of
+deploying on a new task is reduced to a few backward passes through the
+unrolled rollout.
+
+\subsubsection*{Joint-training baseline}
+
+The natural baseline against which the meta-learned controller will be compared
+in Section~\ref{sec:maml_results} is a controller trained jointly on all $m$
+tasks, i.e.\ by minimising the average loss
+$\sum_{i=1}^{m} \mathcal{L}_{\mathcal{T}_i}(f_{\boldsymbol{\theta}})$ with
+standard gradient descent until convergence. This baseline has no notion of
+fast adaptation: it learns one set of parameters that is a compromise across
+the entire training distribution. To make the comparison fair, the same
+few-shot adaptation~\eqref{eq:maml_adapt} is applied to the jointly-trained
+controller at test time (and, in this work, also during training to monitor a
+target-task generalisation metric in a symmetric fashion -- see
+Section~\ref{sec:maml_training}). Any performance gap between the two then
+reflects the specific contribution of the meta-optimisation: whether the
+meta-trained initialisation truly enables faster gradient-based adaptation than
+an initialisation obtained from averaging across tasks.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{0.95\textwidth}{!}{%
+    \begin{tikzpicture}[
+        node distance=1.5cm and 1.5cm,
+        box/.style={rectangle, draw, thick, minimum width=3.2cm, minimum height=0.8cm, font=\large},
+        arrow/.style={-Stealth, thick},
+        label_font/.style={font=\small}
+    ]
+    % --- Task blocks and computations ---
+    \node[box] (T0) {Task $\mathcal{T}_0$};
+    \node[below=1.8cm of T0, xshift=-1.2cm] (eq0) {$\textcolor{blue}{\boldsymbol{\theta}'_0} = \textcolor{purple}{\boldsymbol{\theta}} - \alpha \nabla_{\textcolor{purple}{\boldsymbol{\theta}}} \mathcal{L}_{\mathcal{T}_0}(f_{\textcolor{purple}{\boldsymbol{\theta}}})$};
+    \node[below=4.8cm of T0, xshift=1.2cm] (loss0) {$\mathcal{L}_{\mathcal{T}_0}\left(f_{\textcolor{blue}{\boldsymbol{\theta}'_0}}\right)$};
+
+    \node[box, right=4cm of T0] (T1) {Task $\mathcal{T}_1$};
+    \node[below=1.8cm of T1, xshift=-1.2cm] (eq1) {$\textcolor{blue}{\boldsymbol{\theta}'_1} = \textcolor{purple}{\boldsymbol{\theta}} - \alpha \nabla_{\textcolor{purple}{\boldsymbol{\theta}}} \mathcal{L}_{\mathcal{T}_1}(f_{\textcolor{purple}{\boldsymbol{\theta}}})$};
+    \node[below=4.8cm of T1, xshift=1.2cm] (loss1) {$\mathcal{L}_{\mathcal{T}_1}\left(f_{\textcolor{blue}{\boldsymbol{\theta}'_1}}\right)$};
+
+    \node[box, right=4cm of T1] (Tm) {Task $\mathcal{T}_m$};
+    \node[below=1.8cm of Tm, xshift=-1.2cm] (eqm) {$\textcolor{blue}{\boldsymbol{\theta}'_m} = \textcolor{purple}{\boldsymbol{\theta}} - \alpha \nabla_{\textcolor{purple}{\boldsymbol{\theta}}} \mathcal{L}_{\mathcal{T}_m}(f_{\textcolor{purple}{\boldsymbol{\theta}}})$};
+    \node[below=4.8cm of Tm, xshift=1.2cm] (lossm) {$\mathcal{L}_{\mathcal{T}_m}\left(f_{\textcolor{blue}{\boldsymbol{\theta}'_m}}\right)$};
+
+    % --- Aligned ellipses ---
+    \coordinate (center_dots) at ($(T1)!0.5!(Tm)$);
+    \node at (center_dots) {\Large $\dots$};
+    \node at (center_dots |- loss1) {\Large $\dots$};
+
+    % --- Arrows and labels ---
+    \foreach \i in {0,1,m} {
+        \draw[arrow] ([xshift=-1.2cm]T\i.south) -- node[left, label_font] {$K_{\text{inner}}$ samples} (eq\i.north);
+        \draw[arrow] ([xshift=1.2cm]T\i.south) -- node[left, pos=0.75, label_font] {$K_{\text{outer}}$ samples} (loss\i.north);
+    }
+
+    % --- Meta-update block ---
+    \coordinate (center_all) at ($(loss0)!0.5!(lossm)$);
+    \node[below=1.5cm of center_all] (final_update) {$\displaystyle \textcolor{purple}{\boldsymbol{\theta}} \leftarrow \textcolor{purple}{\boldsymbol{\theta}} - \beta \nabla_{\textcolor{purple}{\boldsymbol{\theta}}} \sum_{\mathcal{T}_i \sim p(\mathcal{T})} \mathcal{L}_{\mathcal{T}_i}\left(f_{\textcolor{blue}{\boldsymbol{\theta}'_i}}\right)$};
+
+    \coordinate (merge_line) at ($(loss0.south) + (0,-0.6)$);
+    \draw[thick] (loss0.south) -- (loss0.south |- merge_line);
+    \draw[thick] (loss1.south) -- (loss1.south |- merge_line);
+    \draw[thick] (lossm.south) -- (lossm.south |- merge_line);
+    \draw[thick] (loss0.south |- merge_line) -- (lossm.south |- merge_line);
+    \draw[arrow] (center_all |- merge_line) -- (final_update.north);
+
+    % --- Inner / Outer loop frames ---
+    \coordinate (inner_top_left)     at ($(T0.north west) + (-3.8, 0.6)$);
+    \coordinate (inner_bottom_right) at ($(Tm.south east) + (2, -3.2)$);
+    \draw[blue, thick] (inner_top_left) rectangle (inner_bottom_right);
+    \node[blue, rotate=90, anchor=south, font=\bfseries] at ($(inner_top_left)!0.5!(inner_top_left |- inner_bottom_right)$) {INNER LOOP};
+
+    \coordinate (outer_top_left)     at ($(T0.north west) + (-4.8, 1.2)$);
+    \coordinate (outer_bottom_right) at ($(Tm.south east) + (2.3, -8.0)$);
+    \draw[purple, thick] (outer_top_left) rectangle (outer_bottom_right);
+    \node[purple, rotate=90, anchor=south, font=\bfseries] at ($(outer_top_left)!0.5!(outer_top_left |- outer_bottom_right)$) {OUTER LOOP};
+
+    % --- Target task (meta-test) outside the training loops ---
+    \node[box, right=4.5cm of Tm] (Ttarget) {Task $\mathcal{T}_{\text{target}}$};
+    \node[below=1.8cm of Ttarget] (eqtarget) {$\textcolor{blue}{\boldsymbol{\theta}_{\text{final}}} = \textcolor{purple}{\boldsymbol{\theta}} - \alpha \nabla_{\textcolor{purple}{\boldsymbol{\theta}}} \mathcal{L}_{\mathcal{T}_{\text{target}}}(f_{\textcolor{purple}{\boldsymbol{\theta}}})$};
+    \draw[arrow] (Ttarget.south) -- node[left, label_font] {$K_{\text{inner}}$ samples} (eqtarget.north);
+    \end{tikzpicture}%
+    }
+    \caption{Schematic overview of the MAML algorithm, extended with the held-out
+    target task $\mathcal{T}_{\mathrm{target}}$ used for few-shot adaptation at
+    meta-test time. The inner loop (blue) computes a task-specific adapted
+    parameter set $\boldsymbol{\theta}'_i$ from $K_{\mathrm{inner}}$ samples of
+    each training task. The outer loop (purple) evaluates the adapted
+    controllers on $K_{\mathrm{outer}}$ fresh samples per task and updates the
+    meta-parameters $\boldsymbol{\theta}$ to minimise the resulting sum of
+    post-adaptation losses. At meta-test time (right), the very same gradient
+    step is applied on $K_{\mathrm{inner}}$ samples from the unseen target task
+    to obtain the deployed parameters $\boldsymbol{\theta}_{\mathrm{final}}$.
+    Adapted from~\cite[Fig.~3.1]{goffin2026}, with the target-task block added
+    to emphasise the symmetry between the inner update and the few-shot
+    adaptation.}
+    \label{fig:maml_schematic}
+\end{figure}
+
+\begin{algorithm}[h]
+\caption{MAML meta-training and few-shot adaptation.}
+\label{alg:maml}
+\begin{algorithmic}[1]
+\Require Task distribution $p(\mathcal{T})$; inner LR $\alpha$; outer LR $\beta$;
+         support/query sizes $K_{\mathrm{inner}}, K_{\mathrm{outer}}$;
+         number of tasks $m$.
+\State Sample $m$ tasks $\{\mathcal{T}_i\}_{i=1}^{m} \sim p(\mathcal{T})$.
+\State Initialise meta-parameters $\boldsymbol{\theta}$ randomly.
+\While{not converged}
+    \For{$i = 1$ to $m$}
+        \State Draw $K_{\mathrm{inner}}$ support samples from $\mathcal{T}_i$.
+        \State $\boldsymbol{\theta}_i' \gets \boldsymbol{\theta}
+               - \alpha\,\nabla_{\boldsymbol{\theta}}\,
+               \mathcal{L}_{\mathcal{T}_i}(f_{\boldsymbol{\theta}})$
+               \Comment{inner update~\eqref{eq:maml_inner}}
+        \State Draw $K_{\mathrm{outer}}$ query samples from $\mathcal{T}_i$.
+        \State Evaluate $\mathcal{L}_{\mathcal{T}_i}\!\left(f_{\boldsymbol{\theta}_i'}\right)$
+               on the query batch.
+    \EndFor
+    \State $\boldsymbol{\theta} \gets \boldsymbol{\theta}
+           - \beta\,\nabla_{\boldsymbol{\theta}}\sum_{i=1}^{m}
+           \mathcal{L}_{\mathcal{T}_i}\!\left(f_{\boldsymbol{\theta}_i'}\right)$
+           \Comment{meta-update~\eqref{eq:maml_outer}}
+\EndWhile
+\Statex
+\State \textbf{Few-shot adaptation on $\mathcal{T}_{\mathrm{target}} \sim p(\mathcal{T})$:}
+\State Draw $K_{\mathrm{inner}}$ samples from $\mathcal{T}_{\mathrm{target}}$.
+\State $\boldsymbol{\theta}_{\mathrm{final}} \gets \boldsymbol{\theta}
+       - \alpha\,\nabla_{\boldsymbol{\theta}}\,
+       \mathcal{L}_{\mathcal{T}_{\mathrm{target}}}(f_{\boldsymbol{\theta}})$
+       \Comment{can be iterated for $n_{\mathrm{adapt}} > 1$ steps}
+\State \Return $\boldsymbol{\theta}_{\mathrm{final}}$.
+\end{algorithmic}
+\end{algorithm}
+
 % =====================================================
 \newpage
 \section{Simulation Environment}
@@ -834,10 +1050,10 @@ illustrated in Figure~\ref{fig:curric_reset}.
 
 % =====================================================
 \newpage
-\section{MAML for Offset Mass Compensation}
-\subsection{Task Definition}
-\subsection{Training}
-\subsection{Results}
+\section{MAML for Offset Mass Compensation}\label{sec:maml_offset}
+\subsection{Task Definition}\label{sec:maml_task}
+\subsection{Training}\label{sec:maml_training}
+\subsection{Results}\label{sec:maml_results}
 
 % =====================================================
 \newpage

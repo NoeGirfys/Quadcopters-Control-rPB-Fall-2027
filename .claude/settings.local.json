@@ -19,7 +19,10 @@
       "WebFetch(domain:scitas-doc.epfl.ch)",
       "Bash(ls 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\maml_lib')",
       "Bash(ls 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\training_MAML\\\\maml_lib')",
-      "Bash([ -f \"$p/Scripts/python.exe\" ])"
+      "Bash([ -f \"$p/Scripts/python.exe\" ])",
+      "Bash(grep -nA 35 \"point_per_task = 50\" 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\MetaLearning-Control-Quadcopters-main\\\\notebooks\\\\meta_experiments\\\\exp_meta_all_directions.ipynb')",
+      "Bash(grep -nA 3 \"meta_train_nn_policy\\(\" 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\MetaLearning-Control-Quadcopters-main\\\\notebooks\\\\meta_experiments\\\\exp_meta_all_directions.ipynb')",
+      "Bash(grep -nA 12 \"meta_train_nn_policy\\(\" 'C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\MetaLearning-Control-Quadcopters-main\\\\notebooks\\\\meta_experiments\\\\exp_meta_all_directions.ipynb')"
     ]
   }
 }
