@@ -1090,17 +1090,16 @@ work and gives full control over every term of the model.
 
 \subsubsection*{Physics modes}
 
-\texttt{gym-pybullet-drones} decouples two frequencies: the rate
-\texttt{PYB\_FREQ} at which the physics is advanced (default $240\,\mathrm{Hz}$)
-and the rate \texttt{CTRL\_FREQ} at which a new control action is applied, the
-former being an integer multiple of the latter so that each action is held for
-\texttt{PYB\_STEPS\_PER\_CTRL} physics sub-steps. The way the physics step is
-computed is selected through a \texttt{Physics} flag, of which the library
-offers two families:
+\texttt{gym-pybullet-drones} decouples two frequencies: the physics rate at which
+the simulation is advanced (default $240\,\mathrm{Hz}$) and the control rate at
+which a new control action is applied, the former being an integer multiple of
+the latter so that each action is held for a fixed number of physics sub-steps.
+The way the physics step is computed is selected through a physics-mode flag, of
+which the library offers two families:
 \begin{itemize}
     \item \texttt{PYB} --- the per-rotor thrusts and the reaction torques are
     applied as external wrenches to the rigid body and the state is advanced by
-    the full Bullet constraint solver via \texttt{stepSimulation}. Variants
+    the full Bullet constraint solver. Variants
     \texttt{PYB\_GND}, \texttt{PYB\_DRAG} and \texttt{PYB\_DW} add empirical
     ground-effect, blade-drag and downwash corrections on top of this base
     update.
@@ -1161,8 +1160,8 @@ X-configuration of the real Crazyflie and the two physics back-ends
 
 The comparison is run in open loop, so that the only thing being tested is the
 dynamics, not a controller. A reference flight is first generated entirely
-inside \texttt{gym-pybullet-drones}: the built-in DSL cascade PID flies the
-circular trajectory of the library's \texttt{pid.py} example (radius
+inside \texttt{gym-pybullet-drones}: its built-in default PID controller flies a
+circular trajectory (radius
 $R = 0.3\,\mathrm{m}$, period $10\,\mathrm{s}$, hover altitude $1\,\mathrm{m}$) at
 a control rate of $48\,\mathrm{Hz}$ over a physics step of $240\,\mathrm{Hz}$.
 At every physics sub-step the four motor speeds and the full $12$-dimensional
@@ -1389,6 +1388,134 @@ overall -- is both simple to differentiate and faithful enough to train on.
 
 \subsection{Crazyflie Firmware Integration}\label{sec:firmware_integration}
 
+Section~\ref{sec:dyn_comparison} established that the \texttt{DYN} dynamics are
+faithful to the real airframe. A closed-loop simulation, however, is only as
+realistic as the \emph{controller} that drives those dynamics: if the simulated
+drone is flown by a different controller than the physical one, a sim-to-real
+comparison can no longer separate a dynamics mismatch from a controller mismatch.
+This section explains why the controller shipped with
+\texttt{gym-pybullet-drones} is not adequate for this purpose, and how the real
+Crazyflie firmware was ported into the simulator to obtain a faithful closed
+loop.
+
+\subsubsection*{Why the default controller is not enough}
+
+\texttt{gym-pybullet-drones} ships with a default PID controller, re-tuned at
+UTIAS for use inside the simulator. It departs from the on-board
+Crazyflie firmware in both structure and gains. Structurally it is a single-rate,
+two-stage controller: a position/velocity stage produces a target thrust and
+target attitude, and an attitude stage produces a body-torque vector, which a
+fixed mixing matrix and an affine PWM-to-RPM fit turn directly into rotor speeds.
+It therefore collapses the firmware's four nested loops into two, runs them at a
+single rate rather than the firmware's $100/500\,\mathrm{Hz}$ split, and uses
+gains (e.g.\ attitude proportional terms of $7\times10^{4}$ in PWM units) that are
+chosen to fly well in simulation and bear no relation to the firmware's. Such a
+controller is perfectly adequate for generating trajectories --- it is exactly
+what was used to drive the open-loop benchmark of
+Section~\ref{sec:dyn_comparison} --- but flying the simulated drone with it would
+mean the simulated and the real closed loops are governed by different control
+laws, which would invalidate any sim-to-real comparison.
+
+\subsubsection*{Porting the firmware}
+
+To remove this discrepancy, the control stack of the official Crazyflie~2.x C
+firmware was translated line-by-line into Python. Each routine was kept traceable
+to its counterpart in the original firmware source, so that the port can be
+audited against it. The translation reproduces:
+\begin{itemize}
+    \item the firmware's generic PID object, including the details that
+    shape the closed-loop response --- derivative taken on the measurement rather
+    than the error (to avoid derivative kick), integral clamping, an optional
+    two-pole Butterworth low-pass on the derivative term, a feed-forward term, and
+    $\pm 180^\circ$ wrapping of the yaw error;
+    \item the four cascade stages of Section~\ref{sec:cascade_pid} (position,
+    velocity, attitude, attitude-rate), with the exact firmware default gains
+    reproduced in Table~\ref{tab:cf_gains};
+    \item the firmware's coordinate and bookkeeping conventions: the
+    body-yaw-aligned frame in which the position and velocity loops operate, the
+    accumulation of the commanded yaw \emph{rate} into a yaw-angle setpoint, the
+    integral limits and output saturations of each loop, and the legacy
+    quadrotor power distribution with its attitude-priority capping (if a motor
+    command exceeds the $16$-bit range, all four are shifted down together so that
+    the relative attitude command is preserved at the expense of absolute
+    thrust);
+    \item the multi-rate scheduling, the position and velocity loops being
+    executed once every five attitude/rate updates, exactly as the firmware fires
+    its $100\,\mathrm{Hz}$ loops every tenth $1\,\mathrm{kHz}$ tick.
+\end{itemize}
+The interface also respects the unit and sign conventions of the firmware, which
+works in degrees, degrees per second and body-frame gyro rates; in particular the
+pitch angle and pitch rate are negated at the boundary, owing to the pitch-sign
+difference between PyBullet and the firmware's aerospace convention noted in
+Section~\ref{sec:nn_policy}.
+
+\begin{table}[h]
+    \centering
+    \caption{Default Crazyflie~2.x cascade-PID gains, taken verbatim from the
+    firmware defaults and used in the Python port. The
+    position and velocity loops run at $100\,\mathrm{Hz}$, the attitude and
+    attitude-rate loops at $500\,\mathrm{Hz}$.}
+    \label{tab:cf_gains}
+    \small
+    \begin{tabular}{ll rrr}
+        \toprule
+        Loop & Axis & $K_P$ & $K_I$ & $K_D$ \\
+        \midrule
+        Position & $x,y$ & $2.0$ & $0$ & $0$ \\
+                 & $z$   & $2.0$ & $0.5$ & $0$ \\
+        \midrule
+        Velocity & $x,y$ & $25.0$ & $1.0$ & $0$ \\
+                 & $z$   & $25.0$ & $15.0$ & $0$ \\
+        \midrule
+        Attitude & roll, pitch & $6.0$ & $3.0$ & $0$ \\
+                 & yaw         & $6.0$ & $1.0$ & $0.35$ \\
+        \midrule
+        Attitude rate & roll, pitch & $250.0$ & $500.0$ & $2.5$ \\
+                      & yaw         & $120.0$ & $16.7$  & $0$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{From motor command to rotor speed}
+
+The real firmware does not output rotor speeds: its power distribution emits four
+$16$-bit motor commands, whereas the \texttt{DYN} dynamics are driven by the rotor
+speeds $\omega_i$. The bridge therefore reproduces the firmware's actuator path in
+two steps. \emph{First}, each $16$-bit command is turned into a per-motor thrust.
+The firmware's power distribution defines this command as a \emph{linear} encoding
+of the requested per-motor force --- it sets the command to
+$\mathrm{force}/F_{\max} \times 65535$, with $F_{\max} \approx 0.12\,\mathrm{N}$
+the maximum thrust of one motor --- so the command and the requested thrust are
+proportional by construction. \emph{On the real drone}, battery-voltage
+compensation (enabled by default) then picks the PWM duty cycle that actually
+\emph{delivers} this requested thrust despite the quadratic, battery-dependent
+duty-cycle-to-thrust curve of the motor, so that the delivered thrust tracks the
+command regardless of the battery's state of charge. \emph{In our simulated
+firmware} there is neither a battery nor motor electronics to model, so we keep
+only this net command-to-thrust relation and map the command linearly to a
+per-motor thrust, $F_i = (\mathrm{command}_i/65535)\,F_{\max}$. \emph{Second}, the
+thrust is converted to a rotor speed --- the quantity the
+dynamics integrate --- by inverting the rotor thrust model $F_i = k_t\,\omega_i^2$,
+i.e.\ $\omega_i = \sqrt{F_i/k_t}$. Finally, the finite spin-up time of the motors
+is modelled by a first-order lag on the rotor speed, with a time constant
+$\tau \approx 20\,\mathrm{ms}$ --- a value representative of the Crazyflie's small
+brushed coreless motors, whose mechanical and electrical response is of the order
+of a few tens of milliseconds. With this lag in place, the simulated drone is
+actuated essentially as the physical one.
+
+\subsubsection*{Resulting pipeline}
+
+With the ported firmware closing the loop around the \texttt{DYN} dynamics, the
+\emph{same} controller now runs in simulation and on the hardware. The sim-to-real
+comparison of Section~\ref{sec:simreal} can therefore attribute any residual
+discrepancy to the dynamics and the state estimation rather than to the
+controller. This pipeline plays two further roles in the rest of the report: its
+inner attitude and attitude-rate loops are exactly the ones kept on board when the
+neural network replaces the outer position and velocity loops
+(Section~\ref{sec:nn_pid_arch}), and the full firmware cascade flies the
+takeoff, hover and landing phases that bracket the learned manoeuvre in the
+real-world experiments (Section~\ref{sec:nn_results}).
+
 % =====================================================
 \newpage
 \section{Sim-to-Real Validation}\label{sec:simreal}
@@ -1402,7 +1529,7 @@ overall -- is both simple to differentiate and faithful enough to train on.
 \subsection{NN-PID Hybrid Architecture}\label{sec:nn_pid_arch}
 \subsection{Training}\label{sec:nn_training}
 \subsection{Simulation Results}
-\subsection{Real-World Results}
+\subsection{Real-World Results}\label{sec:nn_results}
 
 % =====================================================
 \newpage

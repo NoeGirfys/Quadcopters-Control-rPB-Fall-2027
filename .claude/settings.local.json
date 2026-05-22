@@ -37,7 +37,16 @@
       "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_openloop.py)",
       "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_attitude.py)",
       "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_2x2.py)",
-      "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_pos.py)"
+      "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_pos.py)",
+      "Bash(grep -vE \"^\\\\s*$\")",
+      "Bash(echo \"=== remaining code-like \\\\\\\\texttt in 3.3 region \\(lines 1400-1505\\) ===\")",
+      "Bash(sed -n '1400,1505p' main.tex)",
+      "Bash(grep -oE \"\\\\\\\\\\\\\\\\texttt\\\\{[^}]*\\\\}\")",
+      "Bash(grep -noE \"\\\\\\\\\\\\\\\\texttt\\\\{[^}]*\\\\}\" main.tex)",
+      "Bash(sort -t: -k2)",
+      "Bash(awk -F: '{print $1\": \"$2}')",
+      "Bash(sort -u -t: -k2)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }
