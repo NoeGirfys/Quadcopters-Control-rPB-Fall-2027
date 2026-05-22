@@ -27,7 +27,13 @@
       "Bash(C:/Users/niels/anaconda3/python.exe -c \"import torch, yaml; print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
       "Bash(C:/Users/niels/anaconda3/Scripts/conda.exe env *)",
       "Bash(C:/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import torch, yaml; print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
-      "Bash(C:/Users/niels/anaconda3/envs/venv_Aerial_Robotics/python.exe -c \"import torch, yaml; print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")"
+      "Bash(C:/Users/niels/anaconda3/envs/venv_Aerial_Robotics/python.exe -c \"import torch, yaml; print\\('torch', torch.__version__, 'cuda', torch.cuda.is_available\\(\\)\\)\")",
+      "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python run_dynamics_comparison.py)",
+      "Bash(where pdflatex *)",
+      "Bash(pdflatex --version)",
+      "Bash(latexmk -pdf -interaction=nonstopmode -halt-on-error main.tex)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(grep -ivE \"hyperref|microtype|font|\\\\\\\\\\\\\\\\openinout\")"
     ]
   }
 }
