@@ -28,7 +28,7 @@
 \usepackage{needspace}
 
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta, positioning, calc}
+\usetikzlibrary{arrows.meta, positioning, calc, fit}
 
 \usepackage{cellspace}
 \setlength\cellspacetoplimit{6pt}    % Espace vide au-dessus
@@ -1783,6 +1783,144 @@ training, which markedly improved convergence and transfer
 \newpage
 \section{Learning Classic Regulation}
 \subsection{NN-PID Hybrid Architecture}\label{sec:nn_pid_arch}
+
+The regulation controller realises the hybrid neural-network/PID interface
+established in the background: the network substitutes for the position and
+velocity loops of the cascade and emits, at $100\,\mathrm{Hz}$, the
+velocity-loop setpoint $\mathbf{a}_k = (T, \phi^{\mathrm{sp}}, \theta^{\mathrm{sp}},
+r^{\mathrm{sp}})$ that the on-board attitude and attitude-rate loops then track at
+$500\,\mathrm{Hz}$ (Sections~\ref{sec:cascade_pid} and~\ref{sec:nn_policy}). We do
+not repeat the rationale for this choice --- the CRTP protocol exposes no
+per-motor or rate-loop command, and the inner loop must run far faster than a
+network can be queried over radio (Section~\ref{sec:cascade_pid}). This section
+fixes instead the two points left open there: the concrete network that realises
+the policy~\eqref{eq:policy}, and the mechanism that aims a single trained policy
+at an arbitrary setpoint. The complete loop is shown in
+Figure~\ref{fig:nn_pid_arch}.
+
+\begin{figure}[H]
+    \centering
+    \resizebox{\textwidth}{!}{%
+    \begin{tikzpicture}[
+        >=Latex,
+        block/.style={draw, rounded corners, align=center, minimum height=12mm,
+                      minimum width=20mm, inner sep=4pt},
+        nn/.style={block, fill=red!12, very thick},
+        pid/.style={block, fill=blue!8},
+        plant/.style={block, fill=gray!12},
+        font=\small
+    ]
+        \node[nn]    (nn)   {MLP $\pi_\theta$\\$15\!\to\!64\!\to\!64\!\to\!4$};
+        \node[pid]   (att)  [right=20mm of nn]  {Attitude\\PID};
+        \node[pid]   (rate) [right=12mm of att] {Rate\\PID};
+        \node[plant] (mot)  [right=12mm of rate] {Power dist.\\$+$ motors};
+        \node[plant] (dyn)  [right=12mm of mot]  {Drone\\dynamics};
+
+        % input
+        \draw[<-] (nn.west) -- ++(-22mm,0)
+            node[left, align=center] {state $\mathbf{o}_k$\\$+\,(\mathbf{p}^{\mathrm{sp}}-\hat{\mathbf{p}})$};
+
+        % forward path
+        \draw[->] (nn)   -- node[above, align=center]{$\phi^{\mathrm{sp}},\theta^{\mathrm{sp}}$\\$r^{\mathrm{sp}}$} (att);
+        \draw[->] (att)  -- node[above]{$\boldsymbol{\omega}_B^{\mathrm{sp}}$} (rate);
+        \draw[->] (rate) -- node[above]{$u_\phi,u_\theta,u_\psi$} (mot);
+        \draw[->] (mot)  -- node[above]{$\omega_i$} (dyn);
+
+        % thrust bypass (NN -> power distribution)
+        \draw[->] (nn.south) |- ($(mot.south)-(0,9mm)$) -| (mot.south)
+            node[pos=0.07, below]{$T$};
+
+        % dashed box around the on-board inner loops
+        \node[draw, dashed, rounded corners, fit=(att)(rate)(mot),
+              inner sep=5mm, label={[align=center]above:on-board firmware\\$500\,\mathrm{Hz}$}] {};
+
+        % state feedback
+        \draw[->] (dyn.north) |- ($(nn.north)+(0,8mm)$) -- (nn.north)
+            node[pos=0.93, left]{$\hat{\mathbf{x}}$};
+    \end{tikzpicture}}
+    \caption{Hybrid NN--PID control loop. The learned MLP (red) replaces the
+    outer position and velocity loops and is queried at $100\,\mathrm{Hz}$ on the
+    state $\mathbf{o}_k$ and the relative position target. Its four outputs are a
+    thrust $T$, forwarded directly to the power distribution, and the roll, pitch
+    and yaw-rate setpoints, which feed the on-board attitude and attitude-rate
+    PID loops (blue, $500\,\mathrm{Hz}$); these are left exactly as in the
+    firmware (Section~\ref{sec:cascade_pid}) and close their own attitude and
+    gyroscope feedback internally. Only the network is trained.}
+    \label{fig:nn_pid_arch}
+\end{figure}
+
+\subsubsection*{Network}
+
+The policy is a small multilayer perceptron. Its input is the $15$-dimensional
+vector formed by concatenating the $12$-dimensional state~\eqref{eq:observation}
+with the $3$-dimensional relative position target $\mathbf{p}^{\mathrm{sp}} -
+\hat{\mathbf{p}}$; two fully connected hidden layers of width $64$ with
+$\tanh$ activations follow, and a linear layer produces four raw outputs. Each
+input channel is normalised by a fixed per-channel scale before the first layer
+(positions and velocities are already of order one in metres and
+$\mathrm{m/s}$; the angles are divided by $30^\circ$--$45^\circ$ and the body
+rates by $120$--$200^\circ/\mathrm{s}$) so that every input is of order one, which
+conditions the optimisation. The four raw outputs are mapped to the physical
+command ranges by bounded activations, summarised in
+Table~\ref{tab:nn_outputs}; the saturating activations guarantee \emph{by
+construction} that the commands never leave the firmware limits of
+Section~\ref{sec:cascade_pid}. The bias of the thrust output is moreover
+initialised so that the untrained network already emits the hover thrust with
+zero attitude command --- the policy therefore starts from a hovering behaviour
+rather than a free fall, which markedly stabilises the first training epochs
+(Section~\ref{sec:nn_training}). The whole network has fewer than $5\,500$
+trainable parameters, small enough to be evaluated comfortably within the
+$100\,\mathrm{Hz}$ budget and to be differentiated through thousands of times
+during training.
+
+\begin{table}[h]
+    \centering
+    \caption{Output head of the policy: each raw output is squashed by a bounded
+    activation and scaled to a physical command range, guaranteeing that the
+    setpoint stays within the firmware saturation limits.}
+    \label{tab:nn_outputs}
+    \small
+    \begin{tabular}{l l l}
+        \toprule
+        Output & Activation & Command range \\
+        \midrule
+        Thrust $T$            & sigmoid & $[0,\,65535]$ (16-bit), biased at hover $\approx 36\,000$ \\
+        Roll $\phi^{\mathrm{sp}}$    & $\tanh$ & $\pm 20^\circ$ \\
+        Pitch $\theta^{\mathrm{sp}}$ & $\tanh$ & $\pm 20^\circ$ \\
+        Yaw rate $r^{\mathrm{sp}}$   & $\tanh$ & $\pm 200^\circ/\mathrm{s}$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{Aiming the policy: regulation by coordinate shift}
+
+The network is trained exclusively to \emph{regulate to the origin}: throughout
+training the relative target in the input is the displacement from the current
+position to the origin. To make the same fixed policy fly to an arbitrary
+setpoint $\mathbf{p}^{\mathrm{sp}}$, the world frame is simply translated so that
+$\mathbf{p}^{\mathrm{sp}}$ becomes the origin. Concretely, both the position part
+of the state and the relative-target input are expressed as the offset
+$\hat{\mathbf{p}} - \mathbf{p}^{\mathrm{sp}}$, and the policy then drives this
+shifted state to zero. The controller thus always ``sees'' itself regulating to
+the origin; only the coordinate origin moves. This is precisely the retargeting
+anticipated in Section~\ref{sec:nn_policy}, and it is what lets the real-world
+pipeline hand the drone over to the network at an arbitrary point: the cascade
+PID takes off and hovers, the network then brings the drone from the hover point
+to the commanded setpoint, and the cascade PID lands it
+(Section~\ref{sec:nn_results}).
+
+\subsubsection*{Autoregressive realisation}
+
+The deployed controller uses a single-step query ($T = 1$ in the notation of
+Section~\ref{sec:bptt}): the network is re-evaluated on fresh state feedback at
+every $100\,\mathrm{Hz}$ tick and its output is held for the five $500\,\mathrm{Hz}$
+iterations of the inner cascade, exactly the zero-order hold of the firmware
+schedule (Section~\ref{sec:cascade_pid}). This is the autoregressive limit of the
+concurrent analytic-policy-gradient scheme of Section~\ref{sec:bptt}, which gave
+the best regulation performance and is therefore the architecture retained here;
+the general $(12 + 3T)$-input, $4T$-output form collapses to the
+$15 \to 4$ network described above.
+
 \subsection{Training}\label{sec:nn_training}
 \subsection{Simulation Results}
 \subsection{Real-World Results}\label{sec:nn_results}
