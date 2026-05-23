@@ -1535,11 +1535,13 @@ between simulation and reality on a circular trajectory
 
 The hardware is a Bitcraze Crazyflie~2.1+, an open-source nano-quadcopter of about
 $29\,\mathrm{g}$ in the X-configuration, driven by four brushed coreless DC motors.
-Its physical parameters --- mass, arm length, and the thrust and drag coefficients
---- are the ones introduced in Section~\ref{sec:dynamics}, and the simulation uses
-the matching rigid-body model, so that the simulated and the real drone share the
-same nominal dynamics by construction. The drone carries, on top or below, the positioning
-deck described below.
+It is described by the same rigid-body model and the same physical quantities --- the
+mass $m$, the arm length $l$ and the thrust and drag coefficients $k_t$, $k_m$ --- that
+parameterise the dynamics of Section~\ref{sec:dynamics}, and the simulation is configured
+with the manufacturer's values for these quantities, so that the simulated and the real
+drone share the same nominal dynamics by construction. The drone additionally carries a
+positioning deck, mounted on top of or below the frame, of one of the two types compared
+in Section~\ref{sec:flowdeck_lighthouse}.
 
 \subsubsection*{On-board control and state estimation}
 
@@ -1547,12 +1549,15 @@ All low-level control runs on the drone's microcontroller: the cascade-PID firmw
 of Sections~\ref{sec:cascade_pid} and~\ref{sec:firmware_integration}, with its
 position and velocity loops at $100\,\mathrm{Hz}$, its attitude and attitude-rate
 loops at $500\,\mathrm{Hz}$, and a $1\,\mathrm{kHz}$ main loop. A MEMS inertial
-measurement unit supplies three-axis gyroscope readings --- the body rates
-$\omega_B$ of Section~\ref{sec:dynamics} --- and accelerometer readings, which an
-on-board extended Kalman filter fuses with the external positioning measurements
-(below) into the full state estimate (position, velocity, attitude) used both by
-the controller and for logging. The drone accepts setpoints at any level of the
-cascade through its radio protocol.
+measurement unit supplies three-axis gyroscope and accelerometer readings. The
+gyroscope measures the body rates $\omega_B = (p,q,r)^\top$ of
+Section~\ref{sec:dynamics} directly, so they feed the attitude-rate loop without any
+further estimation; the accelerometer, together with the external positioning
+measurements (Section~\ref{sec:flowdeck_lighthouse}), is fused by an on-board extended
+Kalman filter into the remaining states (position, velocity and attitude). The measured
+body rates and this filtered estimate together form the full state used by the controller
+and recorded for logging. The drone accepts setpoints at any level of the cascade through
+its radio protocol.
 
 \subsubsection*{Host link and logging}
 
@@ -1564,23 +1569,22 @@ In this chapter no part of the controller runs on the PC --- the drone flies
 entirely under its own firmware --- so the host acts purely as a command-and-
 logging interface.
 
-\subsubsection*{Positioning systems}
+\subsection{Flowdeck vs Lighthouse}\label{sec:flowdeck_lighthouse}
 
-The Kalman filter needs an absolute position reference, which neither the
-accelerometer nor the gyroscope can provide on their own. Two systems were
-evaluated, each feeding the same on-board filter:
+On their own, the accelerometer and gyroscope cannot keep the position and velocity
+estimates from drifting, as integrating inertial measurements accumulates error
+unbounded over time. The on-board Kalman filter therefore relies on an external
+positioning deck to remain accurate. Two were evaluated, each feeding the same filter:
 \begin{itemize}
     \item the \emph{Flowdeck}, a downward-facing deck that combines an optical-flow
     camera --- which senses horizontal velocity from the apparent motion of the
-    ground --- with a time-of-flight laser rangefinder for height;
-    \item the \emph{Lighthouse}, which recovers an absolute six-degree-of-freedom
+    ground --- with a time-of-flight laser rangefinder for height. It provides only a
+    \emph{relative} reference: it constrains velocity and height but lets the absolute
+    horizontal position drift over time;
+    \item the \emph{Lighthouse}, which recovers an \emph{absolute} six-degree-of-freedom
     pose from the infrared sweeps of three Lighthouse~V2 base stations, picked up by
     an on-board receiver deck, at sub-millimetre and sub-degree accuracy.
 \end{itemize}
-Their relative reliability, and the reason the Lighthouse was retained for the
-flight experiments, are the subject of Section~\ref{sec:flowdeck_lighthouse}.
-
-\subsection{Flowdeck vs Lighthouse}\label{sec:flowdeck_lighthouse}
 \subsection{Circle Trajectory: Simulation vs Reality}\label{sec:circle_simreal}
 
 % =====================================================
