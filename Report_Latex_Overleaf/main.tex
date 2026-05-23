@@ -2071,8 +2071,147 @@ the yaw rate, never required by the task, stays within a few degrees per second.
     \label{fig:nn_regulation_outputs}
 \end{figure}
 
-\subsection{Simulation Results}
+\subsection{Simulation Results}\label{sec:nn_sim_results}
+
+Before flying the learned controller on hardware it is evaluated in the
+closed-loop simulator validated in Section~\ref{sec:circle_simreal} --- the
+\texttt{DYN} dynamics driven by the Python port of the firmware attitude and
+rate loops. The point of this section is twofold: to describe the deployment
+\emph{pipeline} that wraps the learned policy, and to produce the simulated
+reference against which the real flight is compared in
+Section~\ref{sec:nn_results}.
+
+\subsubsection*{From regulation-to-origin to a usable flight}
+
+The policy was trained purely to regulate to the origin
+(Section~\ref{sec:nn_training}), and the coordinate shift of
+Section~\ref{sec:nn_pid_arch} lets it be aimed at any setpoint
+$\mathbf{p}^{\mathrm{sp}}$. This is not by itself a complete flight: in
+training the ``origin'' is a point in free space, whereas a real flight must
+start and end on the ground, where neither the task (regulate around a
+free-space point) nor the dynamics (ground effect, the need to touch down at
+rest) match what the network ever saw. The learned controller is therefore
+\emph{bracketed} by the cascade PID, which is robust near the ground, in a
+four-phase pipeline:
+\begin{enumerate}
+    \item \textbf{PID takeoff} --- the cascade PID climbs from the floor to a
+    takeoff point following a gentle vertical ramp;
+    \item \textbf{hover} --- the cascade PID holds that point for two seconds,
+    so the handover starts from a settled state;
+    \item \textbf{NN regulation} --- the learned policy takes over and drives
+    the drone to the commanded setpoint $\mathbf{p}^{\mathrm{sp}}$, the network
+    input being the state expressed relative to that setpoint;
+    \item \textbf{PID landing} --- the cascade PID brings the drone down along a
+    smooth descent and cuts the motors near the ground.
+\end{enumerate}
+The firmware attitude and attitude-rate loops run continuously at
+$500\,\mathrm{Hz}$ throughout, so the handover between the cascade PID and the
+network changes only which outer controller produces the
+roll/pitch/thrust/yaw-rate setpoint, never the inner stabilisation --- which
+keeps the transitions smooth.
+
+\subsubsection*{Simulated pipeline}
+
+Figure~\ref{fig:nn_sim_pipeline} shows one such pipeline in simulation, with the
+network commanded to the setpoint $(0.5, -0.5, 1.5)\,\mathrm{m}$. The four
+phases are clearly delimited: the cascade PID climbs to and holds the takeoff
+point; the network then moves the drone simultaneously in $x$, $y$ and $z$ onto
+the setpoint and holds it there with a small steady-state error; and the cascade
+PID finally lands it. The same controller, schedule and setpoint are then sent
+to the real drone, which is what makes the two trajectories directly comparable
+in Section~\ref{sec:nn_results}. The learned policy evaluates in well under a
+millisecond per query on the host CPU, comfortably within the $10\,\mathrm{ms}$
+budget of the $100\,\mathrm{Hz}$ outer loop, so running it on the PC and
+streaming its setpoints to the drone over the radio is unproblematic.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/nn_sim_pipeline.png}
+    \caption{Simulated deployment pipeline: position of the drone over time,
+    with the four phases shaded. The cascade PID takes off and hovers (blue,
+    olive); the learned network then regulates the drone to the commanded
+    setpoint $(0.5,-0.5,1.5)\,\mathrm{m}$ (green, dashed reference lines per
+    axis); the cascade PID lands it (grey). The inner attitude and rate loops
+    run continuously across all phases.}
+    \label{fig:nn_sim_pipeline}
+\end{figure}
+
 \subsection{Real-World Results}\label{sec:nn_results}
+
+The learned controller is finally flown on the real Crazyflie, with Lighthouse
+positioning (Section~\ref{sec:flowdeck_lighthouse}), using \emph{exactly} the
+pipeline, schedule and setpoint of the simulation: the network runs on the host
+PC at $100\,\mathrm{Hz}$ and streams its roll/pitch/thrust/yaw-rate setpoints to
+the drone, whose firmware attitude and rate loops close the inner loop on board.
+Because the commands are identical, the simulated and the real flights can be
+overlaid directly. Figure~\ref{fig:nn_real_state} compares the two states
+against the setpoint, and Figure~\ref{fig:nn_real_nnout} compares the network
+outputs.
+
+\subsubsection*{State tracking}
+
+The transfer is successful: the real drone reaches the commanded setpoint
+$(0.5,-0.5,1.5)\,\mathrm{m}$ and holds it, and its trajectory follows the
+simulated one closely throughout takeoff, regulation and landing
+(Figure~\ref{fig:nn_real_state}). Quantitatively, over the NN regulation phase
+the real and simulated positions agree to a root-mean-square distance of
+$5.3\,\mathrm{cm}$ (maximum $7.4\,\mathrm{cm}$) --- the same order as the
+$4\,\mathrm{cm}$ sim-to-real discrepancy measured on the cascade-PID circle in
+Section~\ref{sec:circle_simreal}, which confirms that adding the learned outer
+loop has not degraded the fidelity of the simulator. The real drone holds the
+setpoint with a steady-state error of about $4\,\mathrm{cm}$, against
+$1.4\,\mathrm{cm}$ in simulation, the difference being largest on the vertical
+axis.
+
+Two systematic differences stand out. First, the real velocity and attitude
+traces are visibly noisier than their simulated counterparts, reflecting the
+sensor and estimation noise of the on-board state estimate that the deterministic
+simulator does not reproduce. Second, the yaw, which is never commanded, drifts
+slowly to about $8^\circ$ on the real drone (against $\sim 1^\circ$ in
+simulation); this uncommanded drift is consistent with the estimator drift and
+small airframe asymmetries already noted in Section~\ref{sec:circle_simreal} and
+does not affect the position regulation.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/nn_sim_real_state.png}
+    \caption{NN regulation, simulation (blue) versus real drone (red), with the
+    NN setpoint (grey, dashed). Rows: position, velocity and attitude; columns:
+    the three axes. The real trajectory follows the simulated one closely; the
+    real signals are noisier and the (uncommanded) yaw drifts by a few degrees.
+    Vertical dotted lines mark the NN-takeover and landing instants.}
+    \label{fig:nn_real_state}
+\end{figure}
+
+\subsubsection*{Network outputs and the role of training noise}
+
+The network outputs (Figure~\ref{fig:nn_real_nnout}) follow the same overall
+profile in reality as in simulation --- a thrust transient settling onto hover,
+roll and pitch setpoints that briefly saturate at $\pm 20^\circ$ and relax, and
+a near-zero yaw rate --- but the real commands are markedly more oscillatory.
+This is expected and, in fact, intended: on the real drone the policy is reacting
+to a \emph{noisy} state estimate at every query, exactly the regime it was
+trained to cope with through the observation-noise injection of
+Section~\ref{sec:nn_training}. A policy trained without that noise, while
+equivalent in clean simulation, regulates from the noisy real estimate far less
+gracefully; the noisy policy is what makes the transfer in
+Figure~\ref{fig:nn_real_state} possible. The real flight thus closes the loop on
+the central argument of this chapter: a controller whose two outer loops are
+\emph{learned} and whose inner loops remain the firmware cascade can be trained
+entirely in simulation and transferred to the real Crazyflie, provided the
+training is made robust to the estimation noise that the sim-to-real validation
+of Section~\ref{sec:circle_simreal} identified as the dominant residual gap.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/nn_sim_real_nnout.png}
+    \caption{The four network outputs during the NN phase, simulation (blue)
+    versus real drone (red): thrust (with the hover level), roll and pitch
+    setpoints (with the $\pm 20^\circ$ firmware band) and yaw rate. The profiles
+    match; the real commands are noisier because the policy reacts to a noisy
+    on-board state estimate --- the very condition it was trained for.}
+    \label{fig:nn_real_nnout}
+\end{figure}
 
 % =====================================================
 \newpage

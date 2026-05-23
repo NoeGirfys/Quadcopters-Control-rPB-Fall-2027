@@ -66,7 +66,12 @@
       "Bash(pdflatex -interaction=nonstopmode -halt-on-error -draftmode main.tex)",
       "Read(//tmp/**)",
       "Bash(pdflatex -interaction=nonstopmode main.tex)",
-      "Bash(pdflatex -interaction=nonstopmode -draftmode main.tex)"
+      "Bash(pdflatex -interaction=nonstopmode -draftmode main.tex)",
+      "Bash(rm -f flights/flight_sim_*.npz)",
+      "Bash(git checkout *)",
+      "Bash(cp training_regulation_simu_and_real/nn_sim_real_pipeline.png Report_Latex_Overleaf/images/nn_sim_pipeline.png)",
+      "Bash(cp training_regulation_simu_and_real/nn_sim_real_state.png Report_Latex_Overleaf/images/nn_sim_real_state.png)",
+      "Bash(cp training_regulation_simu_and_real/nn_sim_real_nnout.png Report_Latex_Overleaf/images/nn_sim_real_nnout.png)"
     ]
   }
 }

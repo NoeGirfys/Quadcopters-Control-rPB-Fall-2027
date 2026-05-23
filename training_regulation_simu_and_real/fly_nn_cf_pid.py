@@ -232,6 +232,27 @@ def landing_ramp_z(start_z: float, elapsed: float, duration: float) -> float:
 
 
 # ===================================================================
+#  Raw-log persistence (so figures can be regenerated without re-flying)
+# ===================================================================
+
+FLIGHTS_DIR = os.path.join(SCRIPT_DIR, "flights")
+
+
+def _save_flight_npz(arrays: dict, prefix: str) -> str:
+    """Persist a flight's full log to flights/<prefix>_<timestamp>.npz.
+
+    Every value must be array-like or a scalar (np.savez handles both).
+    """
+    from datetime import datetime
+    os.makedirs(FLIGHTS_DIR, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(FLIGHTS_DIR, f"{prefix}_{ts}.npz")
+    np.savez_compressed(path, **arrays)
+    print(f"[SAVE] Flight log -> {path}")
+    return path
+
+
+# ===================================================================
 #  SIM mode
 # ===================================================================
 
@@ -506,6 +527,10 @@ def run_sim_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                 phase=log_phase, pid_target=pid_target, nn_target=nn_target,
                 PHASE_PID=PHASE_PID, PHASE_HOVER=PHASE_HOVER,
                 PHASE_NN=PHASE_NN, PHASE_LAND=PHASE_LAND)
+
+    # Persist the full log so the report figures can be regenerated offline.
+    _save_flight_npz({**data, "inference_ms": np.asarray(inference_times) * 1000.0},
+                     "flight_sim")
     if plot:
         _plot_nn_sim(data)
     return data
@@ -629,8 +654,9 @@ def _plot_nn_sim(data: dict):
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('nn_sim_results.png', dpi=150)
-    print("[PLOT] Saved to nn_sim_results.png")
+    save_path = os.path.join(SCRIPT_DIR, 'nn_sim_results.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"[PLOT] Saved to {save_path}")
 
 
 # ===================================================================
@@ -913,6 +939,26 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
             log_att.stop()
             print("[REAL] Landed.")
 
+        # ---- Persist the full flight log (state + NN commands) -----
+        if real_log:
+            real_arr = dict(
+                t=np.array([e['t'] for e in real_log]),
+                pos=np.array([[e['x'], e['y'], e['z']] for e in real_log]),
+                vel=np.array([[e['vx'], e['vy'], e['vz']] for e in real_log]),
+                rpy=np.array([[e['roll'], e['pitch'], e['yaw']] for e in real_log]),
+                gyro=np.array([[e['gyro_x'], e['gyro_y'], e['gyro_z']] for e in real_log]),
+                pid_target=pid_target, nn_target=nn_target,
+                elapsed_phase0=elapsed_phase0, elapsed_phases01=elapsed_phases01,
+            )
+            if nn_cmd_log:
+                real_arr['nn_cmd_t'] = np.array([e['t'] for e in nn_cmd_log])
+                real_arr['nn_cmd'] = np.array(
+                    [[e['thrust'], e['roll'], e['pitch'], e['yaw_rate']]
+                     for e in nn_cmd_log])
+                real_arr['nn_cmd_twall'] = np.array(
+                    [e.get('t_wall', 0.0) for e in nn_cmd_log])
+            _save_flight_npz(real_arr, "flight_real")
+
         # ---- Post-flight plot -----
         if real_log:
             _plot_real_nn(real_log, pid_target, nn_target,
@@ -1016,8 +1062,9 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('nn_real_results.png', dpi=150)
-    print("[PLOT] Saved to nn_real_results.png")
+    save_path = os.path.join(SCRIPT_DIR, 'nn_real_results.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"[PLOT] Saved to {save_path}")
 
     # ---- Timing plot ------------------------------------------------
     if nn_cmd_log and 't_wall' in nn_cmd_log[0]:
@@ -1050,8 +1097,9 @@ def _plot_real_nn(real_log: list, pid_target: np.ndarray, nn_target: np.ndarray,
         ax.grid(True, alpha=0.3)
 
         fig2.tight_layout()
-        fig2.savefig('nn_real_timing.png', dpi=150)
-        print("[PLOT] Saved to nn_real_timing.png")
+        timing_path = os.path.join(SCRIPT_DIR, 'nn_real_timing.png')
+        fig2.savefig(timing_path, dpi=150)
+        print(f"[PLOT] Saved to {timing_path}")
         print(f"[TIMING] n={len(intervals_ms)}  "
               f"mean={np.mean(intervals_ms):.2f} ms  "
               f"std={np.std(intervals_ms):.2f} ms  "
