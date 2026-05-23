@@ -65,7 +65,8 @@
       "Bash(echo \"exit:$?\")",
       "Bash(pdflatex -interaction=nonstopmode -halt-on-error -draftmode main.tex)",
       "Read(//tmp/**)",
-      "Bash(pdflatex -interaction=nonstopmode main.tex)"
+      "Bash(pdflatex -interaction=nonstopmode main.tex)",
+      "Bash(pdflatex -interaction=nonstopmode -draftmode main.tex)"
     ]
   }
 }

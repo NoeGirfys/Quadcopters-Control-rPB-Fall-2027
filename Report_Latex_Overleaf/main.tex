@@ -1922,6 +1922,155 @@ the general $(12 + 3T)$-input, $4T$-output form collapses to the
 $15 \to 4$ network described above.
 
 \subsection{Training}\label{sec:nn_training}
+
+The policy of Section~\ref{sec:nn_pid_arch} is trained by analytic policy
+gradient: the cumulative cost~\eqref{eq:cumulative_cost} of a simulated
+roll-out is minimised by back-propagation through the unrolled
+network--PID--dynamics chain (Section~\ref{sec:bptt}). This section fixes the
+three remaining ingredients that were deliberately left open earlier: the task,
+the concrete stage cost $\ell(\cdot)$, and the optimisation set-up --- including
+the observation noise that turned out to matter most for the transfer to
+hardware.
+
+\subsubsection*{Task and roll-out}
+
+The task is pure \emph{regulation to the origin}. A batch of $B = 27$ initial
+states is used at every epoch: the vertices, edge midpoints, face centres and
+centre of a cube of half-side $0.5\,\mathrm{m}$, so that the policy is exposed
+simultaneously to displacements along, across and diagonal to every axis. Each
+initial state has zero velocity and level attitude. From each, a
+$2\,\mathrm{s}$ roll-out is simulated: the network is queried at
+$100\,\mathrm{Hz}$ ($N = 200$ steps) and each query drives five
+$500\,\mathrm{Hz}$ steps of the firmware attitude and rate loops on the
+differentiable \texttt{DYN} dynamics (Section~\ref{sec:dynamics}), for a total
+of $1000$ integration steps per roll-out.
+
+\subsubsection*{Cost function}
+
+The per-step stage cost $\ell(\cdot)$ of~\eqref{eq:cumulative_cost} is a weighted
+quadratic in the state, and a terminal term penalises the final position more
+strongly. Writing $\mathbf{x}_k$ for the state at step $k$ and
+$\mathbf{p}_k = (x_k, y_k, z_k)$ for its position part, the training loss
+averaged over the batch is
+\begin{equation}
+J(\theta) = \frac{1}{B}\sum_{b=1}^{B}\left[
+\sum_{k=1}^{N} \mathbf{x}_{k,b}^\top Q\, \mathbf{x}_{k,b}
+\;+\; w_T \,\big\|\mathbf{p}_{N,b}\big\|^2 \right],
+\label{eq:reg_cost}
+\end{equation}
+with $Q = \mathrm{diag}(q)$ diagonal and $w_T = 50$ the terminal weight. Each
+channel of $q$ normalises the corresponding state by a representative magnitude,
+$q_i = 1/\bar{x}_i^2$, with $\bar{x} = 1\,\mathrm{m}$ for position and
+$1\,\mathrm{m/s}$ for velocity, $30^\circ$ for roll/pitch and $45^\circ$ for yaw,
+and $200^\circ/\mathrm{s}$ / $120^\circ/\mathrm{s}$ for the body rates. The
+position channels are then multiplied by an additional weight $w_p = 10$ so that
+the cost is position-dominant, the attitude and rate terms acting only as mild
+regularisers that discourage violent manoeuvres. The terminal term, applied to
+the position at the last step, drives the steady-state error to zero.
+
+\subsubsection*{Optimisation and curriculum}
+
+The network weights are optimised with Adam (learning rate $10^{-2}$, cosine
+annealing to zero over the run) for $50$ epochs, the gradient being back-propagated
+through the entire roll-out. The gradient norm is clipped to $5$ and a guard
+skips any optimiser step whose gradient contains a \texttt{NaN}, both of which
+stabilise the early epochs when the half-trained policy still lets some drones
+diverge. As described in Section~\ref{sec:nn_pid_arch}, the output bias is
+initialised so that the policy starts from a hovering behaviour. The curriculum
+reset of Section~\ref{sec:bptt} is active throughout, with the divergence
+threshold increased linearly from $\tau_{\mathrm{start}} = 0.8\,\mathrm{m}$ to
+$\tau_{\mathrm{end}} = 2.0\,\mathrm{m}$ following~\eqref{eq:tau_curriculum}. The
+hyper-parameters are collected in Table~\ref{tab:nn_hyperparams}.
+
+\begin{table}[h]
+    \centering
+    \caption{Training hyper-parameters for the regulation policy.}
+    \label{tab:nn_hyperparams}
+    \small
+    \begin{tabular}{ll}
+        \toprule
+        Parameter & Value \\
+        \midrule
+        Optimiser            & Adam, lr $10^{-2}$, cosine annealing \\
+        Epochs               & $50$ \\
+        Batch (initial states) & $27$ (cube, half-side $0.5\,\mathrm{m}$) \\
+        Roll-out horizon     & $2\,\mathrm{s}$ ($N=200$ steps at $100\,\mathrm{Hz}$) \\
+        Gradient clip (norm) & $5$ \\
+        Terminal weight $w_T$ & $50$ \\
+        Position weight $w_p$ & $10$ \\
+        Curriculum $\tau_{\mathrm{div}}$ & $0.8 \to 2.0\,\mathrm{m}$ (linear) \\
+        Observation-noise scale & $2.0$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{Observation noise: domain randomisation}
+
+A single addition to the roll-out proved decisive for the transfer to hardware:
+\emph{observation noise}. At every query the network is fed the state corrupted
+by zero-mean Gaussian noise, while the dynamics keep integrating the
+\emph{true} state; the policy must therefore learn to regulate from a noisy,
+imperfect estimate rather than from the exact state. The per-channel standard
+deviations are $1\,\mathrm{cm}$ on position, $5\,\mathrm{cm/s}$ on velocity,
+$2^\circ$ on attitude and $10^\circ/\mathrm{s}$ on the body rates, all scaled by
+a factor of $2$ for the reported model. This is a deliberate, if deliberately
+crude, model of the on-board state estimate that the policy will face on the
+real drone: as quantified in Section~\ref{sec:circle_simreal}, the dominant
+unmodelled part of the sim-to-real gap is exactly this stochastic estimation
+noise. Training the policy to be insensitive to it markedly improved both the
+convergence of the optimisation and, more importantly, the behaviour observed on
+the real platform; the noiseless variant, while reaching a comparable simulated
+cost, transferred visibly worse and is not used. The penalty in nominal
+(noise-free) simulated accuracy is negligible, which is why the noisy policy is
+adopted as \emph{the} regulation controller for the rest of this chapter.
+
+\subsubsection*{Results}
+
+Figure~\ref{fig:nn_train_loss} shows the training loss settling to a low
+plateau --- after an early transient in which the still-untrained policy
+briefly lets some drones diverge before the curriculum reins them in --- with
+the mean terminal position error following it down to the centimetre level. Evaluated open-loop on the $27$ training initial states, the
+converged policy brings every drone to the origin in about $1.5\,\mathrm{s}$
+with a mean terminal position error of $1.4\,\mathrm{cm}$
+(Figure~\ref{fig:nn_regulation_3d}). The corresponding network outputs
+(Figure~\ref{fig:nn_regulation_outputs}) are physically sensible: the thrust
+saturates briefly to climb or descend and then settles onto the hover value;
+the roll and pitch setpoints reach the firmware $\pm 20^\circ$ limit during the
+initial, most aggressive part of the manoeuvre and decay smoothly to zero; and
+the yaw rate, never required by the task, stays within a few degrees per second.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\textwidth]{images/nn_train_loss.png}
+    \caption{Training convergence of the regulation policy (with observation
+    noise). Blue: cumulative training loss~\eqref{eq:reg_cost} (log scale). Red:
+    mean terminal position error over the $27$-state batch. Both decrease
+    together as the curriculum threshold is relaxed.}
+    \label{fig:nn_train_loss}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{images/nn_regulation_3d.png}
+    \caption{Regulation trajectories of the trained policy from the $27$
+    initial states of the training cube, evaluated open-loop in simulation. The
+    colour encodes elapsed time (dark to bright); all trajectories converge to
+    the origin target (red star) in about $1.5\,\mathrm{s}$.}
+    \label{fig:nn_regulation_3d}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/nn_regulation_outputs.png}
+    \caption{The four network outputs along the $27$ regulation trajectories of
+    Figure~\ref{fig:nn_regulation_3d}: thrust (with the hover level marked),
+    roll and pitch setpoints (with the firmware $\pm 20^\circ$ saturation band,
+    red dashed) and yaw rate. The thrust settles onto hover, roll and pitch
+    saturate during the aggressive phase and relax to zero, and the yaw rate
+    remains negligible.}
+    \label{fig:nn_regulation_outputs}
+\end{figure}
+
 \subsection{Simulation Results}
 \subsection{Real-World Results}\label{sec:nn_results}
 
