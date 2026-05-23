@@ -1587,6 +1587,198 @@ positioning deck to remain accurate. Two were evaluated, each feeding the same f
 \end{itemize}
 \subsection{Circle Trajectory: Simulation vs Reality}\label{sec:circle_simreal}
 
+Having validated the \emph{dynamics} in open loop (Section~\ref{sec:dyn_comparison})
+and ported the on-board controller to Python
+(Section~\ref{sec:firmware_integration}), we now close the loop and ask the
+decisive question for the rest of this work: does the simulator reproduce a real
+flight faithfully enough to be trusted as a training ground? To answer it we fly
+the same non-trivial manoeuvre --- a vertical takeoff, one full circle, and a
+landing --- on the real Crazyflie and on its simulated twin, and compare the two
+states. In both cases the drone is flown entirely by its own cascade-PID firmware
+(the Python port for the simulation, the native firmware for the real platform);
+no learned policy is involved yet, so any disagreement is attributable to the
+fidelity of the simulator, not to a controller.
+
+\subsubsection*{Protocol and two error measures}
+
+The reference trajectory is generated identically on both sides: a
+$2\,\mathrm{s}$ climb to a hover height of $1\,\mathrm{m}$, a
+circle of radius $0.5\,\mathrm{m}$ traced over $6\,\mathrm{s}$, and a
+$2\,\mathrm{s}$ descent, the whole path being rigidly recentred on the drone's
+measured start position. Position setpoints are streamed at $100\,\mathrm{Hz}$
+and the on-board state estimate is logged at $20\,\mathrm{Hz}$. The simulation
+runs the same firmware cascade on the \texttt{PYB\_GND\_DRAG\_DW} physics
+back-end (Section~\ref{sec:gym_pybullet}), with a first-order motor-lag filter
+($\tau \approx 20\,\mathrm{ms}$) restoring the finite bandwidth of the real
+brushed motors. All metrics are computed over the circle phase only
+($2$--$8\,\mathrm{s}$), excluding the takeoff and landing transients.
+
+It is essential to separate two quantities that are easily conflated:
+\begin{itemize}
+    \item the \emph{tracking error}, between the drone and its commanded
+    setpoint. This measures how well the cascade PID follows the moving target;
+    \item the \emph{sim-to-real discrepancy}, between the real state and the
+    simulated state. This measures how faithfully the simulator reproduces the
+    real platform, and is the actual object of this section.
+\end{itemize}
+The two are reported in Tables~\ref{tab:circle_tracking}
+and~\ref{tab:circle_discrepancy} respectively. As will become clear, the
+tracking error is dominated by an effect common to both simulation and reality,
+whereas the discrepancy is small --- so a large tracking error and a faithful
+simulator are perfectly compatible.
+
+\subsubsection*{Flow deck (the originally available system)}
+
+The laboratory was first equipped only with the optical-flow \emph{Flow deck},
+so the experiment was initially run with it. The top view of the resulting flight
+(Figure~\ref{fig:topview_flow}) already reveals its limitations: the logged
+trajectory is a visibly distorted, jittery circle rather than the clean ring of
+the setpoint. The time series (Figure~\ref{fig:ts_flowdeck}) confirms that, while
+the position is broadly tracked, the estimated velocity and attitude are
+markedly noisy. The effect is most violent during the takeoff and landing phases
+(outside the green markers): there the estimate diverges into large spurious
+spikes in horizontal velocity and yaw, because optical flow is ill-conditioned
+close to the ground --- the apparent ground motion scales with altitude, and the
+time-of-flight rangefinder operates near its lower limit. This near-ground
+failure is precisely why, in the learning experiments (Section~\ref{sec:nn_results}),
+takeoff and landing are always delegated to the cascade PID and the learned
+manoeuvre is confined to a safe altitude.
+
+The sim-to-real discrepancy for the Flow deck flight is correspondingly large:
+$7.2\,\mathrm{cm}$ in position and $13.3\,\mathrm{cm/s}$ in velocity over the
+circle (Table~\ref{tab:circle_discrepancy}), the velocity figure being roughly
+twice the Lighthouse value. One caveat must be stated plainly: with the Flow
+deck the logged ``real'' state \emph{is} the optical-flow estimate itself, for
+which no independent ground truth is available. Part of the $7.2\,\mathrm{cm}$
+therefore reflects the Flow deck mis-estimating its own position, not the drone
+genuinely departing from the simulated path. Either way, the conclusion is the
+same: the Flow deck is too unreliable to serve as a reference, which motivated
+the acquisition of the Lighthouse system. The detailed reliability comparison is
+deferred to Section~\ref{sec:flowdeck_lighthouse}.
+
+\subsubsection*{Lighthouse (the system adopted for validation)}
+
+With the Lighthouse system the picture changes completely. Its sub-millimetre,
+sub-degree pose can be treated as ground truth, so the comparison is meaningful.
+The top view (Figure~\ref{fig:topview_lh}) shows the real circle and its
+simulated twin almost superimposed on the commanded ring, and the time series
+(Figure~\ref{fig:ts_lighthouse}) agree closely across position, velocity and
+attitude. Quantitatively, the sim-to-real discrepancy over the circle is only
+$4.0\,\mathrm{cm}$ in position --- about $8\,\%$ of the circle radius --- with a
+$5.3\,\mathrm{cm}$ maximum, $6.3\,\mathrm{cm/s}$ in velocity and below
+$0.75^\circ$ in roll and pitch (Table~\ref{tab:circle_discrepancy}). The
+simulator is, to this accuracy, a faithful twin of the real platform.
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/circle_topview_flowdeck.png}
+        \caption{Flow deck}
+        \label{fig:topview_flow}
+    \end{subfigure}\hfill
+    \begin{subfigure}{0.49\textwidth}
+        \centering
+        \includegraphics[width=\textwidth]{images/circle_topview_lighthouse.png}
+        \caption{Lighthouse}
+        \label{fig:topview_lh}
+    \end{subfigure}
+    \caption{Top view ($x$--$y$) of the circle phase: commanded setpoint (grey,
+    dashed), simulation (blue) and real drone (red). With the Flow deck~(a) the
+    logged trajectory is a distorted, jittery circle; with the Lighthouse~(b) the
+    real and simulated circles nearly coincide with the setpoint. Both circles
+    do not quite close at the start point because, at the end of the circle
+    window, the controller is still lagging the target (see text).}
+    \label{fig:circle_topview}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/circle_timeseries_flowdeck.png}
+    \caption{Full-flight state comparison for the \textbf{Flow deck} flight:
+    simulation (blue) versus real (red), with the position setpoint (grey,
+    dashed). Green dash-dot lines bound the circle phase. The takeoff and landing
+    segments (outside the markers) show the near-ground failure of the optical
+    flow, with large spurious spikes in the estimated velocity and yaw.}
+    \label{fig:ts_flowdeck}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/circle_timeseries_lighthouse.png}
+    \caption{Full-flight state comparison for the \textbf{Lighthouse} flight,
+    same conventions as Figure~\ref{fig:ts_flowdeck}. Simulation and reality
+    agree closely throughout position, velocity and attitude; the real attitude
+    is slightly noisier and the yaw drifts by a few degrees although it is never
+    commanded.}
+    \label{fig:ts_lighthouse}
+\end{figure}
+
+\begin{table}[h]
+    \centering
+    \caption{Tracking error (real drone versus commanded setpoint) over the
+    circle phase. The error is comparable for both positioning systems and is
+    dominated by the controller's phase lag, not by the sensor.}
+    \label{tab:circle_tracking}
+    \small
+    \begin{tabular}{l rr rr}
+        \toprule
+        System & Pos.\ RMSE (cm) & Pos.\ max (cm) & Vel.\ RMSE (cm/s) & Att.\ roll/pitch RMSE ($^\circ$) \\
+        \midrule
+        Flow deck  & 24.4 & 30.3 & 14.5 & 1.02 / 0.62 \\
+        Lighthouse & 29.1 & 31.2 & 18.6 & 1.00 / 0.69 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Sim-to-real discrepancy (real state versus simulated state) over the
+    circle phase. The Lighthouse flight, whose pose can be treated as ground
+    truth, agrees with the simulator to $4\,\mathrm{cm}$.}
+    \label{tab:circle_discrepancy}
+    \small
+    \begin{tabular}{l rr rr}
+        \toprule
+        System & Pos.\ RMSE (cm) & Pos.\ max (cm) & Vel.\ RMSE (cm/s) & Att.\ roll/pitch RMSE ($^\circ$) \\
+        \midrule
+        Flow deck  & 7.2 & 12.2 & 13.3 & 0.95 / 0.79 \\
+        Lighthouse & 4.0 & \phantom{0}5.3 & \phantom{0}6.3 & 0.74 / 0.50 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{Reading the numbers, and what they imply for training}
+
+The tracking error deserves a word, because at $24$--$29\,\mathrm{cm}$ it looks
+alarmingly large next to a $0.5\,\mathrm{m}$ radius. It is, however, almost
+entirely an \emph{along-track} (phase) lag rather than a radial deviation: the
+drone follows essentially the right circle but trails the moving target by some
+$30^\circ$ of arc (about half a second at the circle's angular rate), which is
+why the top views still show well-formed rings. Crucially this lag is a property
+of the soft default position gains, not of the sensor, so it appears almost
+identically in simulation and in reality --- and is therefore subtracted out in
+the sim-to-real discrepancy. This is exactly the regime one hopes for: a
+controller that lags its setpoint, but a simulator that reproduces that lag, so
+that the discrepancy ($4\,\mathrm{cm}$) is an order of magnitude below the
+tracking error ($29\,\mathrm{cm}$).
+
+The residual sim-to-real discrepancy on the Lighthouse flight is small and
+structured. The dominant contributions are a slightly noisier real attitude ---
+unmodelled IMU and vibration noise, since the simulator carries only the
+deterministic motor-lag filter --- and a slow, uncommanded drift of the yaw by a
+few degrees, attributable to estimator drift and small airframe asymmetries.
+
+Two consequences follow for the learning experiments. First, a sim-to-real
+fidelity of $4\,\mathrm{cm}$ on a dynamic manoeuvre justifies training the neural
+controller in simulation and expecting it to transfer, since the dominant flight
+behaviour --- including the controller lag --- is reproduced. Second, the part of
+the gap that the simulator does \emph{not} capture, namely the stochastic
+sensor and attitude noise, is precisely the kind of perturbation against which a
+policy must be made robust; this is the rationale for injecting noise during
+training, which markedly improved convergence and transfer
+(Section~\ref{sec:nn_training}).
+
 % =====================================================
 \newpage
 \section{Learning Classic Regulation}

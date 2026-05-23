@@ -621,21 +621,46 @@ def _plot_sim(t, sp, pos, vel, rpy, rpms, thrust):
     plt.show()
 
 
-def _plot_comparison(real, sim):
+def _plot_comparison(real, sim, positioning_system='unknown', timestamp='',
+                     output_dir=None, duration_sec=None):
     """3×3 grid comparing simulation vs real drone: position (with setpoints),
     velocity, and attitude (roll/pitch/yaw).
+
+    The full flight (takeoff → circle → landing) is shown so the climb and
+    descent dynamics remain visible; the circle phase actually used for the
+    metrics is delimited by two dashed vertical lines.
 
     Parameters
     ----------
     real : dict with keys t, pos, vel, rpy  (Nx3 arrays, time in seconds)
                           sp_t, sp           (setpoint times and positions)
     sim  : dict returned by run_sim(plot=False) — keys t, pos, vel, rpy, sp
+    positioning_system, timestamp : labels used in the output filename so that
+                          successive flights do not overwrite each other.
+    output_dir : directory for the PNG (defaults to SCRIPT_DIR).
+    duration_sec : total flight duration, used to mark the circle phase; if None
+                          it is inferred from sim['t'].
     """
     try:
         import matplotlib.pyplot as plt
     except ImportError:
         print("[PLOT] matplotlib not found — skipping comparison plot.")
         return
+
+    if duration_sec is None:
+        duration_sec = round(float(sim['t'][-1]))
+    circle_start = float(_TAKEOFF_DURATION)
+    circle_end   = float(duration_sec - _TAKEOFF_DURATION)
+
+    def _mark_circle(ax):
+        """Vertical lines bounding the circle phase used for the metrics.
+
+        Deliberately green dash-dot so they cannot be confused with the gray
+        dashed setpoint curve; labelled once so the legend stays unambiguous.
+        """
+        ax.axvline(circle_start, color='green', ls='-.', lw=1.2, alpha=0.8,
+                   label='circle phase')
+        ax.axvline(circle_end, color='green', ls='-.', lw=1.2, alpha=0.8)
 
     fig, axes = plt.subplots(3, 3, figsize=(16, 10))
     fig.suptitle('Simulation vs Real Drone — State Comparison', fontsize=14)
@@ -654,6 +679,7 @@ def _plot_comparison(real, sim):
                     where='post', linestyle='--', alpha=0.7)
         ax.set_ylabel(pos_labels[col])
         ax.set_title(f'Position {["x","y","z"][col]}')
+        _mark_circle(ax)
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
@@ -663,6 +689,7 @@ def _plot_comparison(real, sim):
         ax.plot(real['t'], real['vel'][:, col], color='tomato',    label='real', lw=1.5, alpha=0.85)
         ax.set_ylabel(vel_labels[col])
         ax.set_title(f'Velocity {["vx","vy","vz"][col]}')
+        _mark_circle(ax)
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
@@ -673,12 +700,94 @@ def _plot_comparison(real, sim):
         ax.set_ylabel(att_labels[col])
         ax.set_xlabel('Time [s]')
         ax.set_title(['Roll', 'Pitch', 'Yaw'][col])
+        _mark_circle(ax)
         ax.legend(fontsize=7)
         ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(SCRIPT_DIR, 'comparison_results.png'), dpi=150)
-    print("[PLOT] Saved to comparison_results.png")
+    out_dir = output_dir or SCRIPT_DIR
+    save_path = os.path.join(out_dir, f'comparison_results{_label_suffix(positioning_system, timestamp)}.png')
+    plt.savefig(save_path, dpi=150)
+    print(f"[PLOT] Saved to {save_path}")
+    plt.show()
+
+
+def _label_suffix(positioning_system: str, timestamp: str) -> str:
+    """Build a filesystem-safe '_<system>_<timestamp>' filename suffix."""
+    label = (positioning_system or 'unknown').replace('+', '_')
+    return f'_{label}_{timestamp}' if timestamp else f'_{label}'
+
+
+def _circle_mask(t, duration_sec):
+    """Boolean mask selecting the circle phase [_TAKEOFF_DURATION, dur−_TAKEOFF_DURATION]."""
+    t = np.asarray(t)
+    return (t >= float(_TAKEOFF_DURATION)) & (t <= float(duration_sec - _TAKEOFF_DURATION))
+
+
+def _plot_topview_comparison(real, sim, positioning_system='unknown', timestamp='',
+                             output_dir=None, discrepancy=None,
+                             duration_sec=None) -> None:
+    """Top-view (X-Y) overlay of the circle: simulation vs real vs setpoint.
+
+    This is the single most legible figure for the circle experiment — it shows
+    at a glance how closely the real drone and the simulation trace the
+    commanded circle, free of the phase-lag ambiguity of the time-series plots.
+
+    Only the circle phase is drawn: the takeoff climb and the landing descent
+    (both nominally stationary at the start point in X-Y) are excluded so the
+    overlay is not cluttered by the approach/return near the origin.
+
+    Parameters
+    ----------
+    real, sim     : dicts as produced by run_real / run_sim (keys t, pos, sp).
+    discrepancy   : optional dict from compute_sim_real_discrepancy(); if given,
+                    the sim↔real position RMSE is annotated in the title.
+    duration_sec  : total flight duration; if None it is inferred from sim['t']
+                    so the circle window can be isolated.
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[PLOT] matplotlib not found — skipping top-view plot.")
+        return
+
+    if duration_sec is None:
+        duration_sec = round(float(sim['t'][-1]))
+
+    m_sim  = _circle_mask(sim['t'],  duration_sec)
+    m_real = _circle_mask(real['t'], duration_sec)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # Commanded circle (smooth waypoint trajectory from the sim side), circle phase only.
+    ax.plot(sim['sp'][m_sim, 0], sim['sp'][m_sim, 1], color='gray', ls='--', lw=1.2,
+            label='setpoint', zorder=1)
+    ax.plot(sim['pos'][m_sim, 0], sim['pos'][m_sim, 1], color='steelblue', lw=1.6,
+            label='simulation', zorder=2)
+    ax.plot(real['pos'][m_real, 0], real['pos'][m_real, 1], color='tomato', lw=1.6,
+            alpha=0.85, label='real', zorder=3)
+
+    # Mark the circle start point (= takeoff/landing point in X-Y).
+    ax.scatter([sim['sp'][m_sim, 0][0]], [sim['sp'][m_sim, 1][0]], c='black', s=30,
+               marker='o', zorder=4, label='circle start')
+
+    ax.set_xlabel('x [m]')
+    ax.set_ylabel('y [m]')
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+
+    title = f'Circle top-view — {positioning_system.upper()}'
+    if discrepancy is not None:
+        title += (f"\nsim↔real pos RMSE {discrepancy['position']['rmse_3d_m']*100:.1f} cm "
+                  f"(circle phase)")
+    ax.set_title(title)
+
+    fig.tight_layout()
+    out_dir = output_dir or SCRIPT_DIR
+    save_path = os.path.join(out_dir, f'topview_comparison{_label_suffix(positioning_system, timestamp)}.png')
+    fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"[PLOT] Saved to {save_path}")
     plt.show()
 
 
@@ -815,7 +924,7 @@ _TAKEOFF_DURATION = 2  # seconds — must match generate_trajectory
 
 
 def compute_and_save_metrics(resampled, duration_sec,
-                              positioning_system, output_dir):
+                              positioning_system, output_dir, timestamp=None):
     """Compute and persist tracking metrics for the circle phase.
 
     Accepts the output of resample_logs() — all streams are already aligned
@@ -839,7 +948,10 @@ def compute_and_save_metrics(resampled, duration_sec,
     import json
     from datetime import datetime
 
-    timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Allow callers to share a single timestamp across all artefacts of one
+    # flight (metrics, comparison plots, raw-data archive) so they line up.
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     circle_start = float(_TAKEOFF_DURATION)
     circle_end   = float(duration_sec - _TAKEOFF_DURATION)
 
@@ -1620,6 +1732,10 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                 resampled = None
 
             if resampled is not None:
+                from datetime import datetime
+                # One timestamp shared by every artefact of this flight.
+                flight_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
                 # Rebuild real_pos / real_vel / real_rpy from resampled state for
                 # the comparison plot (same format expected by _plot_comparison).
                 real_t   = resampled['t']
@@ -1647,17 +1763,225 @@ def run_real(uri="radio://0/80/2M/E7E7E7E7E7",
                 # ── Flight-quality metrics (circle phase only) ─────────────
                 metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
                 compute_and_save_metrics(resampled, duration_sec,
-                                         positioning_system, metrics_dir)
+                                         positioning_system, metrics_dir,
+                                         timestamp=flight_ts)
                 # -----------------------------------------------------------
+
+                meta = dict(positioning_system=positioning_system,
+                            duration_sec=duration_sec, hover_height=hover_height,
+                            radius=radius, start_xy=start_xy)
+                flights_dir = os.path.join(SCRIPT_DIR, 'flights')
 
                 print("[REAL] Running headless simulation for comparison...")
                 if HAS_PYBULLET_DRONES:
                     sim_data = run_sim(duration_sec=duration_sec, gui=False,
                                        hover_height=hover_height, radius=radius, plot=False,
                                        simulate_flow_deck=False)
-                    _plot_comparison(real_data, sim_data)
+                    # Persist everything so figures can be regenerated offline.
+                    save_flight_data(real_data, sim_data, resampled, meta,
+                                     flights_dir, flight_ts)
+                    disc = compute_sim_real_discrepancy(
+                        real_data, sim_data, duration_sec,
+                        positioning_system, flight_ts, metrics_dir)
+                    _plot_comparison(real_data, sim_data,
+                                     positioning_system, flight_ts,
+                                     duration_sec=duration_sec)
+                    _plot_topview_comparison(real_data, sim_data,
+                                             positioning_system, flight_ts,
+                                             SCRIPT_DIR, disc,
+                                             duration_sec=duration_sec)
                 else:
                     print("[REAL] pybullet-drones not found — skipping comparison plot.")
+                    # Still archive the real-side data for later offline analysis.
+                    save_flight_data(real_data, None, resampled, meta,
+                                     flights_dir, flight_ts)
+
+
+# ===================================================================
+#  Sim ↔ real discrepancy (the key number for the sim-to-real section)
+# ===================================================================
+
+def _interp_columns(t_target, t_src, arr_src):
+    """Linearly interpolate every column of arr_src (N_src, C) onto t_target."""
+    return np.column_stack([
+        np.interp(t_target, t_src, arr_src[:, c])
+        for c in range(arr_src.shape[1])
+    ])
+
+
+def compute_sim_real_discrepancy(real, sim, duration_sec,
+                                 positioning_system='unknown', timestamp='',
+                                 output_dir=None):
+    """Quantify how far the real flight is from its simulated twin.
+
+    The metrics functions elsewhere measure *real-vs-setpoint* tracking; this
+    one measures *real-vs-simulation* agreement, which is what the sim-to-real
+    section is actually about.  The simulation is resampled onto the real time
+    grid (both share the same trajectory timeline and world frame, with the
+    world-frame start offset already removed on the real side), and errors are
+    reported over the circle phase.
+
+    Returns
+    -------
+    dict with 'position', 'velocity', 'attitude' sub-dicts of RMSE/MAE/max,
+    or None if the streams do not overlap.
+    """
+    import json
+
+    t_real = real['t']
+    circle_start = float(_TAKEOFF_DURATION)
+    circle_end   = float(duration_sec - _TAKEOFF_DURATION)
+
+    # Only compare where both streams exist AND inside the circle phase.
+    lo = max(circle_start, sim['t'][0], t_real[0])
+    hi = min(circle_end,   sim['t'][-1], t_real[-1])
+    mask = (t_real >= lo) & (t_real <= hi)
+    if mask.sum() < 2:
+        print("[SIM-REAL] No common circle-phase window — skipping discrepancy.")
+        return None
+
+    t = t_real[mask]
+    real_pos, real_vel, real_rpy = real['pos'][mask], real['vel'][mask], real['rpy'][mask]
+    sim_pos = _interp_columns(t, sim['t'], sim['pos'])
+    sim_vel = _interp_columns(t, sim['t'], sim['vel'])
+    sim_rpy = _interp_columns(t, sim['t'], sim['rpy'])
+
+    pos_err = real_pos - sim_pos
+    vel_err = real_vel - sim_vel
+    att_err = real_rpy - sim_rpy
+    att_err[:, 2] = ((att_err[:, 2] + 180) % 360) - 180   # wrap yaw
+
+    pos_err_3d = np.linalg.norm(pos_err, axis=1)
+    vel_err_3d = np.linalg.norm(vel_err, axis=1)
+
+    def _rmse(e): return float(np.sqrt(np.mean(e ** 2)))
+    def _mae(e):  return float(np.mean(np.abs(e)))
+    def _max(e):  return float(np.max(np.abs(e)))
+
+    disc = {
+        'positioning_system': positioning_system,
+        'timestamp':          timestamp,
+        'circle_phase_s':     [lo, hi],
+        'n_samples':          int(mask.sum()),
+        'position': {
+            'rmse_3d_m': float(np.sqrt(np.mean(pos_err_3d ** 2))),
+            'rmse_x_m':  _rmse(pos_err[:, 0]),
+            'rmse_y_m':  _rmse(pos_err[:, 1]),
+            'rmse_z_m':  _rmse(pos_err[:, 2]),
+            'mae_3d_m':  float(np.mean(pos_err_3d)),
+            'max_3d_m':  float(np.max(pos_err_3d)),
+        },
+        'velocity': {
+            'rmse_3d_m_s': float(np.sqrt(np.mean(vel_err_3d ** 2))),
+            'mae_3d_m_s':  float(np.mean(vel_err_3d)),
+        },
+        'attitude': {
+            'rmse_roll_deg':  _rmse(att_err[:, 0]),
+            'rmse_pitch_deg': _rmse(att_err[:, 1]),
+            'rmse_yaw_deg':   _rmse(att_err[:, 2]),
+            'max_roll_deg':   _max(att_err[:, 0]),
+            'max_pitch_deg':  _max(att_err[:, 1]),
+        },
+    }
+
+    p, v, a = disc['position'], disc['velocity'], disc['attitude']
+    print("\n" + "=" * 62)
+    print(f" SIM ↔ REAL DISCREPANCY  [{positioning_system.upper()}]  "
+          f"circle {lo:.0f}–{hi:.0f} s  ({disc['n_samples']} samples)")
+    print("=" * 62)
+    print(f"  [Position]  RMSE 3-D : {p['rmse_3d_m']*100:6.2f} cm   "
+          f"(x/y/z {p['rmse_x_m']*100:.1f}/{p['rmse_y_m']*100:.1f}/{p['rmse_z_m']*100:.1f})   "
+          f"max {p['max_3d_m']*100:.1f} cm")
+    print(f"  [Velocity]  RMSE 3-D : {v['rmse_3d_m_s']*100:6.2f} cm/s")
+    print(f"  [Attitude]  RMSE r/p : {a['rmse_roll_deg']:.2f} / {a['rmse_pitch_deg']:.2f} °")
+    print("=" * 62 + "\n")
+
+    if output_dir is not None:
+        os.makedirs(output_dir, exist_ok=True)
+        json_path = os.path.join(
+            output_dir, f'discrepancy{_label_suffix(positioning_system, timestamp)}.json')
+        with open(json_path, 'w') as fh:
+            json.dump(disc, fh, indent=2)
+        print(f"[SIM-REAL] JSON → {json_path}")
+
+    return disc
+
+
+# ===================================================================
+#  Raw-data persistence + offline replot
+# ===================================================================
+
+def save_flight_data(real, sim, resampled, meta, output_dir, timestamp):
+    """Persist a full flight (real + sim + resampled streams + metadata) so the
+    figures and metrics can be regenerated offline, without re-flying.
+
+    sim may be None (e.g. pybullet unavailable) — only the real-side arrays and
+    metadata are stored in that case.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    payload = {
+        'real_t':   real['t'],   'real_pos': real['pos'],
+        'real_vel': real['vel'], 'real_rpy': real['rpy'],
+        'real_sp_t': real['sp_t'], 'real_sp': real['sp'],
+        'res_t':      resampled['t'],    'res_state': resampled['state'],
+        'res_att':    resampled['att'],  'res_rate':  resampled['rate'],
+        'res_vel_sp': resampled['vel_sp'],
+        'positioning_system': str(meta.get('positioning_system', 'unknown')),
+        'duration_sec':       float(meta.get('duration_sec', 0.0)),
+        'hover_height':       float(meta.get('hover_height', 0.0)),
+        'radius':             float(meta.get('radius', 0.0)),
+        'start_xy':           np.asarray(meta.get('start_xy', [0.0, 0.0])),
+        'has_sim':            sim is not None,
+    }
+    if sim is not None:
+        payload.update({
+            'sim_t':   sim['t'],   'sim_pos': sim['pos'],
+            'sim_vel': sim['vel'], 'sim_rpy': sim['rpy'], 'sim_sp': sim['sp'],
+        })
+
+    path = os.path.join(output_dir, f'flight{_label_suffix(meta.get("positioning_system","unknown"), timestamp)}.npz')
+    np.savez_compressed(path, **payload)
+    print(f"[SAVE]  Flight archive → {path}")
+    return path
+
+
+def replot_from_file(npz_path):
+    """Regenerate every figure/metric of a saved flight without the drone.
+
+    Recomputes the cascade-tracking metrics, the sim↔real discrepancy, the 3×3
+    state comparison and the X-Y top-view from a *.npz produced by
+    save_flight_data().  Requires no Crazyflie and no PyBullet.
+    """
+    import re
+    d = np.load(npz_path, allow_pickle=True)
+    positioning_system = str(d['positioning_system'])
+    duration_sec       = float(d['duration_sec'])
+    # Reuse the file's own timestamp (trailing YYYYMMDD_HHMMSS) so the
+    # regenerated artefacts line up with the original flight.
+    m = re.search(r'(\d{8}_\d{6})', os.path.basename(npz_path))
+    timestamp = m.group(1) if m else 'replot'
+
+    real = dict(t=d['real_t'], pos=d['real_pos'], vel=d['real_vel'],
+                rpy=d['real_rpy'], sp_t=d['real_sp_t'], sp=d['real_sp'])
+    resampled = dict(t=d['res_t'], state=d['res_state'], att=d['res_att'],
+                     rate=d['res_rate'], vel_sp=d['res_vel_sp'])
+
+    metrics_dir = os.path.join(SCRIPT_DIR, 'metrics')
+    compute_and_save_metrics(resampled, duration_sec, positioning_system,
+                             metrics_dir, timestamp=timestamp)
+
+    if not bool(d['has_sim']):
+        print("[REPLOT] No simulation arrays in archive — sim↔real plots skipped.")
+        return
+
+    sim = dict(t=d['sim_t'], pos=d['sim_pos'], vel=d['sim_vel'],
+               rpy=d['sim_rpy'], sp=d['sim_sp'])
+    disc = compute_sim_real_discrepancy(real, sim, duration_sec,
+                                        positioning_system, timestamp, metrics_dir)
+    _plot_comparison(real, sim, positioning_system, timestamp,
+                     duration_sec=duration_sec)
+    _plot_topview_comparison(real, sim, positioning_system, timestamp,
+                             SCRIPT_DIR, disc, duration_sec=duration_sec)
 
 
 # ===================================================================
@@ -1693,7 +2017,14 @@ MODES:
     parser.add_argument('--positioning', default='unknown',
                         choices=['flowdeck', 'lighthouse', 'loco', 'mocap', 'unknown'],
                         help='Positioning system used — labels output files (default: unknown)')
+    parser.add_argument('--replot', default=None, metavar='FLIGHT.npz',
+                        help='Regenerate all figures/metrics from a saved flight archive '
+                             '(no drone, no PyBullet needed) and exit')
     args = parser.parse_args()
+
+    if args.replot is not None:
+        replot_from_file(args.replot)
+        return
 
     if args.mode == 'sim':
         run_sim(duration_sec=args.duration, gui=args.gui,
