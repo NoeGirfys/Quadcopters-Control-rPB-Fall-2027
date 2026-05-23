@@ -23,7 +23,7 @@ POSITION_UPDATE_DT = 1.0 / POSITION_RATE   # 0.01  s
 # ===================================================================
 # [FW] src/platform/interface/platform_defaults_cf2.h:47,56
 ARM_LENGTH = 0.046       # m
-CF_MASS    = 0.027       # kg  (CF2X URDF uses 0.027)
+CF_MASS    = 0.029       # kg  (CF2X URDF uses 0.029)
 UINT16_MAX = 65535
 
 # ===================================================================

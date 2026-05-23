@@ -32,7 +32,7 @@ from crazyflie_firmware.constants import (  # noqa: E402
 )
 
 # ---- Physical (CF2X URDF, baseline drone) ----
-M_BASE = 0.027        # baseline mass [kg]
+M_BASE = 0.029        # baseline mass [kg]
 G      = 9.8          # gravity [m/s^2]
 I_X    = 1.4e-5       # Ixx [kg*m^2]
 I_Y    = 1.4e-5

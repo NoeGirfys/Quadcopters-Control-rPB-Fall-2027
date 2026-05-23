@@ -40,7 +40,7 @@ if PARENT_DIR not in sys.path:
 # 1. Physical Constants  (CF2X — from gym-pybullet-drones URDF)
 # =====================================================================
 
-M   = 0.027        # mass [kg]
+M   = 0.029        # mass [kg]
 G   = 9.8          # gravity [m/s^2]
 I_X = 1.4e-5       # Ixx [kg*m^2]
 I_Y = 1.4e-5       # Iyy

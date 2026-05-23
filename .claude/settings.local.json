@@ -46,7 +46,17 @@
       "Bash(sort -t: -k2)",
       "Bash(awk -F: '{print $1\": \"$2}')",
       "Bash(sort -u -t: -k2)",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(echo \"report exit=$?\")",
+      "Bash(rm -f /tmp/c.txt)",
+      "Bash(conda run *)",
+      "Bash(MPLBACKEND=Agg conda run -n venv_cf_313 --no-capture-output python _diag_all.py)",
+      "Bash(cp compare_models_openloop/results_comparison/cross_DYN_traj.png Report_Latex_Overleaf/images/openloop_cross_dyn_traj.png)",
+      "Bash(cp compare_models_openloop/results_comparison/cross_DYN_singlestep_err.png Report_Latex_Overleaf/images/openloop_cross_dyn_singlestep.png)",
+      "Bash(cp compare_models_openloop/results_comparison/cross_PYB_singlestep_err.png Report_Latex_Overleaf/images/openloop_cross_pyb_singlestep.png)",
+      "Bash(cp compare_models_openloop/results_comparison/global_singlestep_rms.png Report_Latex_Overleaf/images/openloop_global_rms.png)",
+      "Bash(grep -nE \"0\\\\.42|0\\\\.13|5\\\\.36|2\\\\.01|1\\\\.96|5\\\\.38|2\\\\.07.*10\\\\^|3\\\\.4.*10\\\\^\\\\{-18\\\\}|6\\\\.48|sub-\\\\$10|millimetre|three to four orders|barely.*1.*mm|27\\\\\\\\\\\\\\\\,\\\\\\\\\\\\\\\\mathrm\\\\{g\\\\}|0\\\\.4\\\\\\\\\\\\\\\\,\\\\\\\\\\\\\\\\mathrm\\\\{m\\\\}\" main.tex)",
+      "Bash(grep -n \"29\\\\\\\\\\\\\\\\,\\\\\\\\\\\\\\\\mathrm{g}\" main.tex)"
     ]
   }
 }

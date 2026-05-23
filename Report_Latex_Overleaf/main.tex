@@ -1180,10 +1180,10 @@ $10\,\mathrm{s}$ circle and overlays the result on the reference
 (Figure~\ref{fig:openloop_traj}, X-configuration, \texttt{DYN} mode). Two
 features stand out and, at first sight, seem contradictory: the roll and pitch
 angles of the nonlinear model stay glued to the reference for the entire flight,
-yet its horizontal position tracks well only for about the first half of the
-circle and then visibly decouples, drifting by $\sim 0.4\,\mathrm{m}$ by
-$t = 10\,\mathrm{s}$; the altitude, by contrast, drifts by barely
-$\sim 1\,\mathrm{mm}$. The linearized model follows the reference for roughly the
+yet its horizontal position tracks well only for about the first fourth of the
+circle and then visibly decouples, drifting by more than a metre by
+$t = 10\,\mathrm{s}$; the altitude, by contrast, drifts by only about a
+centimetre. The linearized model follows the reference for roughly the
 first two seconds and then spirals away entirely, as expected from the
 small-angle approximation once the integrated error leaves the hover
 neighbourhood.
@@ -1214,18 +1214,18 @@ therefore acts as a horizontal-acceleration error $g\,\delta\theta$ -- to
 \emph{first order} in the attitude error -- which is then integrated twice into
 the position.
 
-The attitude error between the two models stays below $\sim 10^{-2}\,\mathrm{rad}$
-for the whole flight, a few percent of the plotted range and hence invisible on
-the $\phi$/$\theta$ panels; yet the double time integral turns this almost
-invisible error into a horizontal drift of order $0.4\,\mathrm{m}$ by
+The attitude error between the two models stays of order $10^{-2}\,\mathrm{rad}$
+for the whole flight, a few percent of the plotted range and hence barely visible
+on the $\phi$/$\theta$ panels; yet the double time integral turns this almost
+invisible error into a horizontal drift of order one metre by
 $t = 10\,\mathrm{s}$, concentrated in the second half of the circle simply
 because a double integral grows steeply with time. To check that this is the
 \emph{entire} story, one can take the attitude error \emph{actually measured
 along the run}, convert it into the implied horizontal-acceleration error by
 multiplying by $g$, and integrate it twice in time; the result reproduces the
-observed position drift to within a few percent ($x$: $0.42\,\mathrm{m}$ from this
-double integral vs $0.42\,\mathrm{m}$ observed; $y$: $0.13$ vs
-$0.13\,\mathrm{m}$). The horizontal drift is thus, quantitatively, nothing but the
+observed position drift to within a few percent ($x$: $0.95\,\mathrm{m}$ from this
+double integral vs $0.95\,\mathrm{m}$ observed; $y$: $1.22$ vs
+$1.22\,\mathrm{m}$). The horizontal drift is thus, quantitatively, nothing but the
 twice-integrated attitude error.
 
 The altitude is spared because the attitude does not enter the vertical
@@ -1233,8 +1233,8 @@ acceleration at first order: $\ddot{z} = (F/m)\cos\phi\cos\theta - g$ depends on
 the tilt only through $\cos\phi\cos\theta \simeq 1 - \tfrac{1}{2}(\phi^2+\theta^2)$,
 so the same small attitude error perturbs $\ddot{z}$ only at \emph{second} order
 in the angles -- a far weaker effect than the first-order horizontal coupling
-$g\,\delta\theta$. Its double integral consequently stays at the millimetre level,
-more than two orders of magnitude below the horizontal drift, as
+$g\,\delta\theta$. Its double integral consequently stays at the centimetre level,
+about two orders of magnitude below the horizontal drift, as
 Figure~\ref{fig:openloop_traj} shows. This is precisely the regime in which an
 open-loop trajectory comparison is misleading: it conflates the per-step dynamics
 mismatch with its double-integrated accumulation, and the latter -- amplified by
@@ -1270,7 +1270,7 @@ trajectory for the three physics back-ends.
     \caption{Single-step prediction error~\eqref{eq:single_step_err} for the
     X-configuration in \texttt{DYN} mode, grouped by state type and shown on a
     logarithmic scale. The velocity error of the \emph{nonlinear} model (blue)
-    sits at the level of floating-point round-off ($\sim 10^{-17}$), proving that
+    sits at the level of floating-point round-off ($\sim 10^{-18}$), proving that
     the translational equations of the simulator and of Goffin's model are
     identical; the linearized model (red) incurs a $\sim 10^{-4}\,\mathrm{m/s}$
     error from the small-angle approximation. Position, attitude and body-rate
@@ -1295,7 +1295,7 @@ maps onto a modelling choice discussed in Section~\ref{sec:dynamics}.
     (forward Euler). Since the velocity itself agrees to machine precision (next
     item), the single-step position error solely depends on the integration scheme.
     \item \textbf{Velocity.} For the nonlinear model in \texttt{DYN} mode the
-    error is at machine precision ($3.4\times10^{-18}\,\mathrm{m/s}$,
+    error is at machine precision ($3.8\times10^{-18}\,\mathrm{m/s}$,
     Table~\ref{tab:singlestep_rms}). The translational acceleration
     $\tfrac{F}{m}\,R(\phi,\theta,\psi)\hat{z} - g\hat{z}$ depends on the attitude
     \emph{angles} and the thrust, not on the angular rates -- so the
@@ -1335,12 +1335,12 @@ maps onto a modelling choice discussed in Section~\ref{sec:dynamics}.
         \toprule
         Physics & Model & Pos.\ (m) & Vel.\ (m/s) & Att.\ (rad) & Rate (rad/s) \\
         \midrule
-        \texttt{DYN} & nonlin. & $2.07\!\times\!10^{-6}$ & $3.4\!\times\!10^{-18}$ & $5.36\!\times\!10^{-4}$ & $2.01\!\times\!10^{-3}$ \\
-        \texttt{DYN} & linear. & $2.07\!\times\!10^{-6}$ & $6.48\!\times\!10^{-4}$ & $5.36\!\times\!10^{-4}$ & $1.96\!\times\!10^{-3}$ \\
-        \texttt{PYB} & nonlin. & $2.19\!\times\!10^{-6}$ & $5.52\!\times\!10^{-5}$ & $5.38\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
-        \texttt{PYB} & linear. & $2.19\!\times\!10^{-6}$ & $6.82\!\times\!10^{-4}$ & $5.38\!\times\!10^{-4}$ & $2.07\!\times\!10^{-3}$ \\
-        \texttt{PYB+aero} & nonlin. & $2.12\!\times\!10^{-6}$ & $1.25\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.17\!\times\!10^{-3}$ \\
-        \texttt{PYB+aero} & linear. & $2.12\!\times\!10^{-6}$ & $6.98\!\times\!10^{-4}$ & $5.40\!\times\!10^{-4}$ & $2.12\!\times\!10^{-3}$ \\
+        \texttt{DYN} & nonlin. & $2.22\!\times\!10^{-6}$ & $3.8\!\times\!10^{-18}$ & $5.62\!\times\!10^{-4}$ & $2.29\!\times\!10^{-3}$ \\
+        \texttt{DYN} & linear. & $2.22\!\times\!10^{-6}$ & $6.82\!\times\!10^{-4}$ & $5.62\!\times\!10^{-4}$ & $2.25\!\times\!10^{-3}$ \\
+        \texttt{PYB} & nonlin. & $2.17\!\times\!10^{-6}$ & $5.67\!\times\!10^{-5}$ & $5.62\!\times\!10^{-4}$ & $2.28\!\times\!10^{-3}$ \\
+        \texttt{PYB} & linear. & $2.17\!\times\!10^{-6}$ & $6.85\!\times\!10^{-4}$ & $5.62\!\times\!10^{-4}$ & $2.22\!\times\!10^{-3}$ \\
+        \texttt{PYB+aero} & nonlin. & $2.17\!\times\!10^{-6}$ & $1.23\!\times\!10^{-4}$ & $5.56\!\times\!10^{-4}$ & $2.29\!\times\!10^{-3}$ \\
+        \texttt{PYB+aero} & linear. & $2.17\!\times\!10^{-6}$ & $7.27\!\times\!10^{-4}$ & $5.56\!\times\!10^{-4}$ & $2.24\!\times\!10^{-3}$ \\
         \bottomrule
     \end{tabular}
 \end{table}
@@ -1351,11 +1351,11 @@ Table~\ref{tab:singlestep_rms} also quantifies the effect of the physics
 back-end. In \texttt{PYB} mode the nonlinear velocity error rises from machine
 precision to $\sim 5\times10^{-5}\,\mathrm{m/s}$ per step, and adding the
 empirical aerodynamic corrections (\texttt{PYB\_GND\_DRAG\_DW}, labelled
-\texttt{PYB+aero}) raises it further to $\sim 1.3\times10^{-4}\,\mathrm{m/s}$.
+\texttt{PYB+aero}) raises it further to $\sim 1.2\times10^{-4}\,\mathrm{m/s}$.
 This is expected: unlike \texttt{DYN}, the general-purpose Bullet constraint
 solver does not integrate exactly the same equations, and the aerodynamic models
 add genuine physics that Goffin's model omits. The discrepancy nonetheless
-remains three to four orders of magnitude below the linearization error, so even
+stays below the per-step error already incurred by the linearization, so even
 \texttt{PYB} stays close to the analytical model. The position, attitude and
 body-rate errors are insensitive to the physics mode, as they are governed by the
 integration scheme and the angle representation rather than by the force model.
@@ -1519,9 +1519,69 @@ real-world experiments (Section~\ref{sec:nn_results}).
 % =====================================================
 \newpage
 \section{Sim-to-Real Validation}\label{sec:simreal}
-\subsection{Experimental Setup}
-\subsection{Flowdeck vs Lighthouse}
-\subsection{Circle Trajectory: Simulation vs Reality}
+
+Having built a closed-loop simulator that pairs the faithful \texttt{DYN} dynamics
+with a Python port of the on-board controller
+(Section~\ref{sec:firmware_integration}), we now confront it with the physical
+platform. This chapter describes the experimental hardware
+(Section~\ref{sec:exp_setup}), compares the two positioning systems that were
+available (Section~\ref{sec:flowdeck_lighthouse}), and quantifies the agreement
+between simulation and reality on a circular trajectory
+(Section~\ref{sec:circle_simreal}).
+
+\subsection{Experimental Setup}\label{sec:exp_setup}
+
+\subsubsection*{Platform}
+
+The hardware is a Bitcraze Crazyflie~2.1+, an open-source nano-quadcopter of about
+$29\,\mathrm{g}$ in the X-configuration, driven by four brushed coreless DC motors.
+Its physical parameters --- mass, arm length, and the thrust and drag coefficients
+--- are the ones introduced in Section~\ref{sec:dynamics}, and the simulation uses
+the matching rigid-body model, so that the simulated and the real drone share the
+same nominal dynamics by construction. The drone carries, on top or below, the positioning
+deck described below.
+
+\subsubsection*{On-board control and state estimation}
+
+All low-level control runs on the drone's microcontroller: the cascade-PID firmware
+of Sections~\ref{sec:cascade_pid} and~\ref{sec:firmware_integration}, with its
+position and velocity loops at $100\,\mathrm{Hz}$, its attitude and attitude-rate
+loops at $500\,\mathrm{Hz}$, and a $1\,\mathrm{kHz}$ main loop. A MEMS inertial
+measurement unit supplies three-axis gyroscope readings --- the body rates
+$\omega_B$ of Section~\ref{sec:dynamics} --- and accelerometer readings, which an
+on-board extended Kalman filter fuses with the external positioning measurements
+(below) into the full state estimate (position, velocity, attitude) used both by
+the controller and for logging. The drone accepts setpoints at any level of the
+cascade through its radio protocol.
+
+\subsubsection*{Host link and logging}
+
+Each experiment is commanded from a host PC over a $2.4\,\mathrm{GHz}$
+Crazyradio~2.0 USB link using the Bitcraze Python library: the PC streams setpoints
+to the drone, and the drone streams its on-board state estimate (together with the
+raw gyroscope) back, which is recorded for the offline comparison with simulation.
+In this chapter no part of the controller runs on the PC --- the drone flies
+entirely under its own firmware --- so the host acts purely as a command-and-
+logging interface.
+
+\subsubsection*{Positioning systems}
+
+The Kalman filter needs an absolute position reference, which neither the
+accelerometer nor the gyroscope can provide on their own. Two systems were
+evaluated, each feeding the same on-board filter:
+\begin{itemize}
+    \item the \emph{Flowdeck}, a downward-facing deck that combines an optical-flow
+    camera --- which senses horizontal velocity from the apparent motion of the
+    ground --- with a time-of-flight laser rangefinder for height;
+    \item the \emph{Lighthouse}, which recovers an absolute six-degree-of-freedom
+    pose from the infrared sweeps of three Lighthouse~V2 base stations, picked up by
+    an on-board receiver deck, at sub-millimetre and sub-degree accuracy.
+\end{itemize}
+Their relative reliability, and the reason the Lighthouse was retained for the
+flight experiments, are the subject of Section~\ref{sec:flowdeck_lighthouse}.
+
+\subsection{Flowdeck vs Lighthouse}\label{sec:flowdeck_lighthouse}
+\subsection{Circle Trajectory: Simulation vs Reality}\label{sec:circle_simreal}
 
 % =====================================================
 \newpage
