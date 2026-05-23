@@ -654,9 +654,10 @@ class GracefulKiller:
             print("\n[Arrêt Forcé] Double Ctrl+C détecté. Arrêt immédiat !")
             sys.exit(1)
 
-def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
-          half_side=0.3, terminal_weight=10.0, z_weight=1.0,
-          tau_start=0.5, tau_end=2.0, obs_noise_scale=1.0, device="cpu"):
+def train(epochs=100, lr=1e-2, hidden=64, t_chunk=0.01, t_sim=2.0,
+          half_side=0.5, terminal_weight=50.0, z_weight=1.0,
+          tau_start=0.8, tau_end=2.0, obs_noise_scale=2.0,
+          eval_plot_every=1, device="cpu"):
     """Train the concurrent NN controller with curriculum learning."""
 
     killer = GracefulKiller()
@@ -711,6 +712,10 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
               f"roll={test_out[0,0,1]:.2f}°, pitch={test_out[0,0,2]:.2f}°, "
               f"yaw_r={test_out[0,0,3]:.2f}°/s")
 
+    # Per-epoch training history (for the loss curve and offline comparison)
+    history = {"epoch": [], "loss": [], "pos_T_mean": [], "pos_T_max": [],
+               "tau": [], "obs_noise_scale": obs_noise_scale}
+
     for ep in range(epochs):
         # Curriculum: tau_div linearly increases over epochs
         progress = ep / max(epochs - 1, 1)
@@ -737,22 +742,31 @@ def train(epochs=500, lr=1e-2, hidden=128, t_chunk=0.01, t_sim=2.0,
                     f"|pos_T|={pos_end.mean():.4f} (max {pos_end.max():.4f})  "
                     f"|pos_mid|={pos_mid.mean():.4f}  tau={tau_div:.3f}")
 
+        # Record the epoch's metrics for the loss curve.
+        history["epoch"].append(ep + 1)
+        history["loss"].append(float(loss.item()))
+        history["pos_T_mean"].append(float(pos_end.mean()))
+        history["pos_T_max"].append(float(pos_end.max()))
+        history["tau"].append(float(tau_div))
+
         # ==========================================================
         # ÉVALUATION ET SAUVEGARDE DU PLOT
         # ==========================================================
-        
-        with torch.no_grad():
-            X_eval, A_eval, R_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=False)
+        # Per-epoch state plots are useful locally but expensive (one 300-dpi
+        # figure per epoch); eval_plot_every=0 disables them, e.g. on SCITAS.
+        if eval_plot_every and (ep + 1) % eval_plot_every == 0:
+            with torch.no_grad():
+                X_eval, A_eval, R_eval = evaluate(policy, test_pts, n_chunks, device=device, verbose=False)
 
-            # Nom du fichier : epoch_0001.png, epoch_0002.png...
-            plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
-            save_plots(X_eval, A_eval, R_eval, eval_labels, plot_file, verbose=False)
-        
+                # Nom du fichier : epoch_0001.png, epoch_0002.png...
+                plot_file = os.path.join(plot_dir, f"epoch_{ep+1:04d}.png")
+                save_plots(X_eval, A_eval, R_eval, eval_labels, plot_file, verbose=False)
+
         if killer.kill_now:
             print(f"\n[Arrêt Propre] Fin prématurée demandée à l'epoch {ep+1}.")
             break  # On sort de la boucle for
 
-    return policy
+    return policy, history
 
 
 # =====================================================================
@@ -906,6 +920,46 @@ def save_plots(X, A, R, labels, filename="training_result.png", verbose=True):
         print(f"[Saved] {filename}")
 
 
+def save_loss_plot(history, filename, verbose=True):
+    """Plot the per-epoch training loss (log scale) and terminal position error.
+
+    history: dict produced by train() with keys 'epoch', 'loss', 'pos_T_mean'.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[WARN] matplotlib not available, skipping loss plot.")
+        return
+
+    epochs = history.get("epoch", [])
+    if not epochs:
+        print("[WARN] empty history — skipping loss plot.")
+        return
+
+    fig, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.semilogy(epochs, history["loss"], color="C0", lw=1.4, label="training loss")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss (log scale)", color="C0")
+    ax1.tick_params(axis="y", labelcolor="C0")
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(epochs, history["pos_T_mean"], color="C3", lw=1.2,
+             label="terminal $|pos_T|$ (mean)")
+    ax2.set_ylabel("Terminal position error [m]", color="C3")
+    ax2.tick_params(axis="y", labelcolor="C3")
+
+    scale = history.get("obs_noise_scale", "?")
+    ax1.set_title(f"Training convergence (obs_noise_scale={scale})")
+    fig.tight_layout()
+    fig.savefig(filename, dpi=200)
+    plt.close(fig)
+    if verbose:
+        print(f"[Saved] {filename}")
+
+
 # =====================================================================
 # 11. Main
 # =====================================================================
@@ -932,6 +986,9 @@ if __name__ == "__main__":
                         help="Scale factor for observation noise (0=off, 1=default, 2=double)")
     parser.add_argument("--z_weight", type=float, default=1.0,
                         help="Extra cost multiplier on z position (running + terminal)")
+    parser.add_argument("--eval_plot_every", type=int, default=1,
+                        help="Save a per-epoch state plot every N epochs (0=never; "
+                             "use 0 on headless clusters to speed up training)")
     parser.add_argument("--tag", type=str, default="")
     args = parser.parse_args()
 
@@ -940,13 +997,14 @@ if __name__ == "__main__":
     print(f"[Hover thrust] {HOVER_THRUST_U16:.0f} / {UINT16_MAX:.0f} "
           f"({HOVER_THRUST_U16/UINT16_MAX*100:.1f}%)")
 
-    policy = train(
+    policy, history = train(
         epochs=args.epochs, lr=args.lr, hidden=args.hidden,
         t_chunk=args.t_chunk, t_sim=args.t_sim,
         half_side=args.half_side, terminal_weight=args.terminal_weight,
         z_weight=args.z_weight,
         tau_start=args.tau_start, tau_end=args.tau_end,
         obs_noise_scale=args.obs_noise_scale,
+        eval_plot_every=args.eval_plot_every,
         device=device)
 
     # Evaluate on random test points
@@ -964,6 +1022,11 @@ if __name__ == "__main__":
     plot_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              f"train_cf_pid_result{tag}.png")
     save_plots(X_eval, A_eval, R_eval, labels, plot_file, verbose=True)
+
+    # Loss curve (per-run); use plot_loss_comparison.py to overlay several runs.
+    loss_plot_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  f"train_cf_pid_result{tag}_loss.png")
+    save_loss_plot(history, loss_plot_file, verbose=True)
 
     # Save checkpoint
     out_dir = os.path.dirname(os.path.abspath(__file__))
@@ -985,6 +1048,10 @@ if __name__ == "__main__":
         "lr": args.lr,
         "KF": KF, "KM": KM, "L": L, "M": M, "G": G,
         "MAX_RPM": MAX_RPM,
+        "history": history,
+        "obs_noise_scale": args.obs_noise_scale,
+        "terminal_weight": args.terminal_weight,
+        "z_weight": args.z_weight,
     }, ckpt_path)
     print(f"[Saved] {ckpt_path}")
     print("\nDone!")
