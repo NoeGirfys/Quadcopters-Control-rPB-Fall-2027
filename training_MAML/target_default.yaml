@@ -1,9 +1,13 @@
-# Target (held-out) task for the composite MAML run.
+# Target (held-out) task for the offset-mass MAML experiment.
 #
-# Same schema as tasks_default.yaml. This default picks distributions
-# the training set never uses — gaussian 4 (motor M4, front-left) and
-# octant 8 (-,-,-) — so the target loss is a genuine OOD test.
+# Same schema as tasks_default.yaml. The mass is pinned to motor M4
+# (front-left, +x+y) — a direction never used during training, but
+# reachable by interpolating M1/M2/M3, so it is a genuine OOD few-shot
+# generalisation test. The start region (all 8 octants) and the mass
+# magnitude are identical to training, so the ONLY held-out factor is the
+# offset direction. Its loss after K-shot adaptation is logged every epoch
+# but never feeds the optimiser.
 tasks:
-  - name: target_O5678
-    mass_gaussians: [1, 2, 3, 4]
-    octants:        [5, 6, 7, 8]
+  - name: target_M4
+    mass_gaussians: [4]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]

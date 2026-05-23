@@ -1,47 +1,45 @@
-# Example training task set for the composite MAML run.
+# Training task set for the offset-mass MAML experiment.
+#
+# Design rationale — why this gives MAML a genuine edge over the joint
+# baseline (it did NOT with the previous no-mass / octant-only set):
+#   * The ONLY axis that varies across tasks is the DIRECTION of the
+#     attached offset mass. Each task pins the mass to a single motor
+#     corner, so each task has a different steady-state compensation
+#     torque -> a different optimal policy.
+#   * The mass magnitude is FIXED and heavy (set --mass-min == --mass-max
+#     on the CLI, e.g. 10 g ~ 34% of the 29 g body).
+#   * The start region is COMMON to every task (all 8 octants, small
+#     --half-side), so the initial condition does NOT identify the task —
+#     only the (unobservable) offset does.
+#   * The per-task mass position is tight (small --mass-pos-sigma) so each
+#     task has a crisp, well-separated optimum.
+# A single memoryless policy cannot null opposite-corner torques at once,
+# so the baseline must compromise (steady-state droop on every task);
+# MAML adapts the per-task bias few-shot and wins.
 #
 # Encoding:
-#   mass_gaussians : list of motor indices 1..4
+#   mass_gaussians : motor indices 1..4
 #                      M1 = front-right (+x, -y)
 #                      M2 = rear-right  (-x, -y)
 #                      M3 = rear-left   (-x, +y)
 #                      M4 = front-left  (+x, +y)
-#                    Each selected motor contributes an isotropic 3-D
-#                    Gaussian around its position (std = --mass-pos-sigma).
+#                    A selected motor contributes an isotropic 3-D Gaussian
+#                    around its position (std = --mass-pos-sigma).
+#   octants        : drone-start octants 1..8, indexed by the sign of
+#                    (x, y, z); same list for every task here so the start
+#                    distribution is shared.
 #
-#   octants        : list of drone-start octants 1..8 in the cube of
-#                    half-side --half-side, indexed by the sign of (x, y, z):
-#                      1: (+,+,+)   2: (-,+,+)   3: (+,-,+)   4: (-,-,+)
-#                      5: (+,+,-)   6: (-,+,-)   7: (+,-,-)   8: (-,-,-)
-#
-# A point of a task is drawn by picking one selected gaussian and one
-# selected octant uniformly at random; the mass magnitude is the shared
-# 1-D uniform [mass_min, mass_max].
-#
-# This default holds out gaussian 4 (motor M4) AND octant 8 (-,-,-) for
-# the target task (see target_default.yaml).
+# Holds out motor M4 (front-left, +x+y) for the target task
+# (see target_default.yaml): an OOD offset direction that is still
+# interpolable from M1/M2/M3, so few-shot adaptation can reach it.
+# M1 and M3 are opposite corners -> maximal conflict for the baseline.
 tasks:
-  - name: O1
-    mass_gaussians: [1, 2, 3, 4]
-    octants:        [1]
-  - name: O2
-    mass_gaussians: [1, 2, 3, 4]
-    octants:        [2]
-  - name: O3
-    mass_gaussians: [1, 2, 3, 4]
-    octants:        [3]
-  - name: O4
-    mass_gaussians: [1, 2, 3, 4]
-    octants:        [4]
-#  - name: G12_oddO
-#    mass_gaussians: [1, 2]
-#    octants:        [1, 3, 5, 7]
-#  - name: G23_evenO
-#    mass_gaussians: [2, 3]
-#    octants:        [2, 4, 6]
-#  - name: G13_diag
-#    mass_gaussians: [1, 3]
-#    octants:        [1, 4, 7]
-#  - name: G123_all
-#    mass_gaussians: [1, 2, 3]
-#    octants:        [1, 2, 3, 4, 5, 6, 7]
+  - name: M1
+    mass_gaussians: [1]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+  - name: M2
+    mass_gaussians: [2]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+  - name: M3
+    mass_gaussians: [3]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
