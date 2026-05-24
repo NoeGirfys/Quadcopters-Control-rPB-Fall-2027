@@ -59,8 +59,9 @@ srun python -u training_MAML/train_baseline.py \
     --n-inner-steps 1 \
     --lr-inner 0.05 \
     --inner-grad-clip 1.0 \
-    --obs-noise-scale 1.0 \
-    --tau-div 1.0 \
+    --obs-noise-scale 2.0 \
+    --tau-start 0.8 \
+    --tau-end 2.0 \
     --t-sim 2.0 \
     --terminal-weight 50.0 \
     --pos-weight 10.0 \

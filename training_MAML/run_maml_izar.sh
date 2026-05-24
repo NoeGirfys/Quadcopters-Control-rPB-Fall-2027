@@ -58,8 +58,9 @@ srun python -u training_MAML/train_maml.py \
     --n-points-train 100 \
     --n-points-eval  50 \
     --k-samples 5 \
-    --obs-noise-scale 1.0 \
-    --tau-div 1.0 \
+    --obs-noise-scale 2.0 \
+    --tau-start 0.8 \
+    --tau-end 2.0 \
     --t-sim 2.0 \
     --seed 42 \
     --tag izar_offset10g \

@@ -239,6 +239,8 @@ def meta_train(
     lr_inner: float,
     maml_order: int = 2,
     tau_div: float = None,
+    tau_start: float = None,
+    tau_end: float = None,
     obs_noise_std: torch.Tensor = None,
     terminal_weight: float = 50.0,
     pos_weight: float = 10.0,
@@ -255,6 +257,15 @@ def meta_train(
     k_samples: Optional[int] = None,
 ):
     """Meta-train ``policy`` with MAML over a CompositeTaskSet.
+
+    Curriculum reset (ported from ``train_nn_cf_pid.py``): if both
+    ``tau_start`` and ``tau_end`` are given, the divergence threshold grows
+    linearly ``tau_start -> tau_end`` over the run, so early epochs reset
+    often (short effective BPTT horizon -> clean gradients to learn the
+    base regulation, including the precise hover thrust on z). The training
+    rollouts use this per-epoch ``tau``; the held-out target metric uses a
+    *fixed* ``tau_end`` so it stays comparable across epochs. If the pair is
+    not given, the fixed ``tau_div`` is used everywhere (legacy behavior).
 
     ``target_set`` (optional) is held strictly out of the optimiser: its
     loss after few-shot adaptation is computed every epoch with
@@ -315,8 +326,22 @@ def meta_train(
             torch.cuda.synchronize()
         return time.perf_counter()
 
+    # ── Curriculum on the divergence threshold ──────────────────────────
+    _curriculum = (tau_start is not None and tau_end is not None)
+
+    def _tau_for_epoch(ep: int):
+        if not _curriculum:
+            return tau_div
+        progress = ep / max(epochs - 1, 1)
+        return tau_start + (tau_end - tau_start) * progress
+
+    # Held-out metric uses a fixed threshold so it stays comparable epoch
+    # to epoch (and matches the test-time adaptation in test_maml_pybullet).
+    tau_eval = tau_end if _curriculum else tau_div
+
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
+        tau_cur = _tau_for_epoch(ep)
         t0 = _now()
 
         # ── Step 1 inner loop: one big batched forward pass ─────────────
@@ -325,7 +350,7 @@ def meta_train(
         X_inner_big = rollout(
             _make_fn(policy, theta), x0_inner_big, n_steps,
             mass_inner_big, dynamics_step,
-            tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
+            tau_div=tau_cur, obs_noise_std=obs_noise_std, gen=torch_gen,
         )                                                # (N*B_train, n_steps, 12)
 
         costs_0 = (trajectory_cost(
@@ -367,7 +392,7 @@ def meta_train(
                         _make_fn(policy, theta_i),
                         x0_train_dev[i], n_steps,
                         masses_train_dev[i], dynamics_step,
-                        tau_div=tau_div, obs_noise_std=obs_noise_std,
+                        tau_div=tau_cur, obs_noise_std=obs_noise_std,
                         gen=torch_gen,
                     )
                     L_in = trajectory_cost(
@@ -392,7 +417,7 @@ def meta_train(
         X_out = rollout(
             _make_batched_fn(policy, stacked_theta, N, B_eval),
             x0_outer_big, n_steps, mass_outer_big, dynamics_step,
-            tau_div=tau_div, obs_noise_std=obs_noise_std, gen=torch_gen,
+            tau_div=tau_cur, obs_noise_std=obs_noise_std, gen=torch_gen,
         )                                                # (N*B_eval, n_steps, 12)
         meta_loss = trajectory_cost(
             X_out, terminal_weight,
@@ -419,7 +444,7 @@ def meta_train(
                 lr_inner=lr_inner,
                 terminal_weight=terminal_weight,
                 pos_weight=pos_weight, z_weight=z_weight,
-                obs_noise_std=obs_noise_std, tau_div=tau_div,
+                obs_noise_std=obs_noise_std, tau_div=tau_eval,
                 inner_grad_clip=inner_grad_clip,
                 device=device, seed=seed,
                 k_samples=k_samples)
@@ -481,6 +506,8 @@ def baseline_train(
     epochs: int,
     lr_outer: float,
     tau_div: float = None,
+    tau_start: float = None,
+    tau_end: float = None,
     obs_noise_std: torch.Tensor = None,
     terminal_weight: float = 50.0,
     pos_weight: float = 10.0,
@@ -544,12 +571,24 @@ def baseline_train(
     x0_train_big = task_set.x0_train.reshape(N * B_train, 12).to(device)
     x0_eval_big  = task_set.x0_eval.reshape(N * B_eval, 12).to(device)
 
+    # ── Curriculum on the divergence threshold (mirrors meta_train) ─────
+    _curriculum = (tau_start is not None and tau_end is not None)
+
+    def _tau_for_epoch(ep: int):
+        if not _curriculum:
+            return tau_div
+        progress = ep / max(epochs - 1, 1)
+        return tau_start + (tau_end - tau_start) * progress
+
+    tau_eval = tau_end if _curriculum else tau_div
+
     for ep in range(start_epoch, epochs):
         opt.zero_grad()
+        tau_cur = _tau_for_epoch(ep)
 
         X_tr = rollout(policy, x0_train_big, n_steps,
                        mass_train_big, dynamics_step,
-                       tau_div=tau_div, obs_noise_std=obs_noise_std,
+                       tau_div=tau_cur, obs_noise_std=obs_noise_std,
                        gen=torch_gen)
         L_tr = trajectory_cost(
             X_tr, terminal_weight,
@@ -567,7 +606,7 @@ def baseline_train(
         with torch.no_grad():
             X_ev = rollout(policy, x0_eval_big, n_steps,
                            mass_eval_big, dynamics_step,
-                           tau_div=tau_div, obs_noise_std=obs_noise_std,
+                           tau_div=tau_eval, obs_noise_std=obs_noise_std,
                            gen=torch_gen)
             L_ev = trajectory_cost(
                 X_ev, terminal_weight,
@@ -586,7 +625,7 @@ def baseline_train(
                     lr_inner=lr_inner,
                     terminal_weight=terminal_weight,
                     pos_weight=pos_weight, z_weight=z_weight,
-                    obs_noise_std=obs_noise_std, tau_div=tau_div,
+                    obs_noise_std=obs_noise_std, tau_div=tau_eval,
                     inner_grad_clip=inner_grad_clip,
                     device=device, seed=seed,
                     k_samples=k_samples)
@@ -596,7 +635,7 @@ def baseline_train(
                     dynamics_step=dynamics_step, n_steps=n_steps,
                     terminal_weight=terminal_weight,
                     pos_weight=pos_weight, z_weight=z_weight,
-                    tau_div=tau_div, device=device)
+                    tau_div=tau_eval, device=device)
 
         history["epoch"].append(ep + 1)
         history["train_loss"].append(float(L_tr.item()))

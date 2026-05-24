@@ -72,6 +72,8 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "mass_max":        float(saved.get("mass_max", 0.014)),
         "t_sim":           float(saved.get("t_sim", 2.0)),
         "tau_div":         float(saved.get("tau_div", 1.0)),
+        "tau_start":       float(saved.get("tau_start", 0.0) or 0.0),
+        "tau_end":         float(saved.get("tau_end", 0.0) or 0.0),
         "obs_noise_scale": float(saved.get("obs_noise_scale", 1.0)),
         "terminal_weight": float(saved.get("terminal_weight", 50.0)),
         "pos_weight":      float(saved.get("pos_weight", 10.0)),
@@ -164,7 +166,14 @@ def parse_args():
     # Rollout
     p.add_argument("--t-sim",           type=float, default=d.get("t_sim",           2.0))
     p.add_argument("--tau-div",         type=float, default=d.get("tau_div",         1.0),
-                   help="divergence threshold [m]; <=0 to disable")
+                   help="fixed divergence threshold [m]; <=0 to disable. "
+                        "Ignored if --tau-start/--tau-end are both > 0.")
+    p.add_argument("--tau-start",       type=float, default=d.get("tau_start",       0.0),
+                   help="curriculum: initial divergence threshold [m] "
+                        "(grows linearly to --tau-end). Inherited from "
+                        "--from-maml-ckpt so the baseline matches MAML.")
+    p.add_argument("--tau-end",         type=float, default=d.get("tau_end",         0.0),
+                   help="curriculum: final divergence threshold [m].")
     p.add_argument("--obs-noise-scale", type=float, default=d.get("obs_noise_scale", 1.0))
     p.add_argument("--terminal-weight", type=float, default=d.get("terminal_weight", 50.0))
     p.add_argument("--pos-weight",      type=float, default=d.get("pos_weight",      10.0))
@@ -271,6 +280,17 @@ def main():
     obs_noise = (C.OBS_NOISE_STD * args.obs_noise_scale).to(device) \
                 if args.obs_noise_scale > 0 else None
     tau_div = args.tau_div if args.tau_div > 0 else None
+    tau_start = args.tau_start if args.tau_start > 0 else None
+    tau_end   = args.tau_end   if args.tau_end   > 0 else None
+    if (tau_start is None) != (tau_end is None):
+        raise SystemExit("--tau-start and --tau-end must both be > 0 to "
+                         "enable the curriculum (or both omitted/<=0 to use "
+                         "the fixed --tau-div).")
+    if tau_start is not None:
+        print(f"[Config] tau curriculum: {tau_start} -> {tau_end} m "
+              f"(fixed tau_div ignored; eval/target use tau={tau_end})")
+    else:
+        print(f"[Config] tau fixed: {tau_div} m (no curriculum)")
 
     # ── Output paths ──────────────────────────────────────────────────
     out_dir = os.path.dirname(os.path.abspath(__file__))
@@ -348,6 +368,8 @@ def main():
         epochs=args.epochs,
         lr_outer=args.lr_outer,
         tau_div=tau_div,
+        tau_start=tau_start,
+        tau_end=tau_end,
         obs_noise_std=obs_noise,
         terminal_weight=args.terminal_weight,
         pos_weight=args.pos_weight,
