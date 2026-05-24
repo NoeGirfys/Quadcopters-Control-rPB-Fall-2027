@@ -33,15 +33,12 @@ srun python -u training_MAML/train_maml.py \
     --lr-outer 3e-4 \
     --lr-inner 0.05 \
     --n-inner-steps 1 \
-    --mass-min 0.002 \
-    --mass-max 0.014 \
-    --mass-pos-sigma 0.01 \
-    --half-side 0.3 \
     --n-points-train 100 \
     --n-points-eval  50 \
-    --obs-noise-scale 1.0 \
-    --tau-div 1.0 \
-    --t-sim 2.0 \
+    --obs-noise-scale 2.0 \
+    --tau-start 0.8 \
+    --tau-end 2.0 \
+    --t-sim 3.0 \
     --seed 42 \
     --tag izar_dbg \
     --profile

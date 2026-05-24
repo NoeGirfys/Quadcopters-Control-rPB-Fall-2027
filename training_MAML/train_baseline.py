@@ -66,10 +66,6 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "hidden":          int(saved.get("hidden", 64)),
         "n_points_train":  int(saved.get("n_points_train", 100)),
         "n_points_eval":   int(saved.get("n_points_eval",  50)),
-        "half_side":       float(saved.get("half_side", 0.3)),
-        "mass_pos_sigma":  float(saved.get("mass_pos_sigma", 0.01)),
-        "mass_min":        float(saved.get("mass_min", 0.002)),
-        "mass_max":        float(saved.get("mass_max", 0.014)),
         "t_sim":           float(saved.get("t_sim", 2.0)),
         "tau_div":         float(saved.get("tau_div", 1.0)),
         "tau_start":       float(saved.get("tau_start", 0.0) or 0.0),
@@ -82,6 +78,8 @@ def _load_maml_defaults(ckpt_path: str) -> dict:
         "seed":            int(saved.get("seed", 42)),
         "verbose_every":   int(saved.get("verbose_every", 1)),
         "k_samples":       saved.get("k_samples", None),
+        # Task-distribution params (mass pool, σ, half-side) are NOT inherited
+        # here — they live in the YAML, which both runs point at.
         # Adaptation hyperparameters: inherited so the baseline's per-epoch
         # target_loss uses the EXACT same K-shot protocol as the MAML run
         # and as the test-time protocol in test_maml_pybullet.py.
@@ -134,10 +132,9 @@ def parse_args():
                         "using --from-maml-ckpt)")
     p.add_argument("--target-config", type=str,   default=d.get("target_config", None),
                    help="optional held-out target task YAML/JSON")
-    p.add_argument("--mass-min",      type=float, default=d.get("mass_min", 0.002))
-    p.add_argument("--mass-max",      type=float, default=d.get("mass_max", 0.014))
-    p.add_argument("--mass-pos-sigma", type=float, default=d.get("mass_pos_sigma", 0.01))
-    p.add_argument("--half-side",     type=float, default=d.get("half_side", 0.3))
+    # Task-distribution parameters (mass magnitude pool, position σ, start
+    # cube half-side) live in the YAML config (single source of truth). Only
+    # the sampling counts and seed stay on the CLI.
     p.add_argument("--n-points-train", type=int,  default=d.get("n_points_train", 100))
     p.add_argument("--n-points-eval",  type=int,  default=d.get("n_points_eval",  50))
     p.add_argument("--k-samples",      type=int,  default=d.get("k_samples", None),
@@ -243,10 +240,11 @@ def main():
         task_set = CompositeTaskSet.from_config(
             args.tasks_config,
             M_train=args.n_points_train, M_eval=args.n_points_eval,
-            mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
-            mass_min=args.mass_min, mass_max=args.mass_max,
             rng=rng_tasks)
-        print(f"[Tasks]  {len(task_set)} tasks from {args.tasks_config}")
+        print(f"[Tasks]  {len(task_set)} tasks from {args.tasks_config}  "
+              f"σ={task_set.mass_pos_sigma*100:.1f}cm  "
+              f"half_side={task_set.half_side}m  "
+              f"m∈[{task_set.mass_min*1e3:.1f},{task_set.mass_max*1e3:.1f}]g")
         if args.target_config is not None:
             rng_target = np.random.default_rng(args.seed + 1)
             # Mirror train_maml.py: size target support to K if set, so the
@@ -258,8 +256,6 @@ def main():
             target_set = CompositeTaskSet.from_config(
                 args.target_config,
                 M_train=target_M_train, M_eval=args.n_points_eval,
-                mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
-                mass_min=args.mass_min, mass_max=args.mass_max,
                 rng=rng_target)
             print(f"[Target] {len(target_set)} target task(s) from "
                   f"{args.target_config}  M_train={target_M_train}")

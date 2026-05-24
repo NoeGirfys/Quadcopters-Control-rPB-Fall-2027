@@ -1,45 +1,46 @@
-# Training task set for the offset-mass MAML experiment.
+# Training task set — "payload magnitude" MAML experiment (option 1).
 #
-# Design rationale — why this gives MAML a genuine edge over the joint
-# baseline (it did NOT with the previous no-mass / octant-only set):
-#   * The ONLY axis that varies across tasks is the DIRECTION of the
-#     attached offset mass. Each task pins the mass to a single motor
-#     corner, so each task has a different steady-state compensation
-#     torque -> a different optimal policy.
-#   * The mass magnitude is FIXED and heavy (set --mass-min == --mass-max
-#     on the CLI, e.g. 10 g ~ 34% of the 29 g body).
-#   * The start region is COMMON to every task (all 8 octants, small
-#     --half-side), so the initial condition does NOT identify the task —
-#     only the (unobservable) offset does.
-#   * The per-task mass position is tight (small --mass-pos-sigma) so each
-#     task has a crisp, well-separated optimum.
-# A single memoryless policy cannot null opposite-corner torques at once,
-# so the baseline must compromise (steady-state droop on every task);
-# MAML adapts the per-task bias few-shot and wins.
+# Why this gives MAML a genuine edge over the joint baseline:
+#   The per-task axis is the MASS MAGNITUDE (a CENTERED payload). The NN
+#   replaced the firmware's integral velocity-Z loop, so the collective
+#   thrust it must output to hold a given weight has NO integrator: a single
+#   memoryless policy cannot hold tasks of different weight without a
+#   per-task steady-state z error. MAML adapts the thrust bias per task; the
+#   baseline must compromise on one bias -> residual droop spread = the gap.
+#   (Offset *direction* is a poor axis: the inner attitude/rate PIDs, KI>0,
+#   already integrate away a static CoM-offset torque — that is what made
+#   the previous direction-only dataset give baseline == MAML.)
 #
-# Encoding:
-#   mass_gaussians : motor indices 1..4
-#                      M1 = front-right (+x, -y)
-#                      M2 = rear-right  (-x, -y)
-#                      M3 = rear-left   (-x, +y)
-#                      M4 = front-left  (+x, +y)
-#                    A selected motor contributes an isotropic 3-D Gaussian
-#                    around its position (std = --mass-pos-sigma).
-#   octants        : drone-start octants 1..8, indexed by the sign of
-#                    (x, y, z); same list for every task here so the start
-#                    distribution is shared.
+# Schema (single source of truth for the task distribution):
+#   mass_pos_sigma : std [m] of the position Gaussians (≈0 -> exactly centered)
+#   half_side      : half-side [m] of the start cube (small -> start near the
+#                    setpoint, so the cost is dominated by the HOLDING phase
+#                    where the per-task thrust difference shows up)
+#   mass_value_gaussians : pool of 1-D magnitude Gaussians {mean, std} [kg],
+#                    clamped >= 0; tasks pick into it via `mass_values`
+#   tasks[*].mass_gaussians : position-Gaussian indices 1..5
+#                    (1..4 = motors M1..M4, 5 = drone centre)
+#   tasks[*].octants        : start octants 1..8 (sign of x,y,z)
+#   tasks[*].mass_values    : 1-based indices into mass_value_gaussians
 #
-# Holds out motor M4 (front-left, +x+y) for the target task
-# (see target_default.yaml): an OOD offset direction that is still
-# interpolable from M1/M2/M3, so few-shot adaptation can reach it.
-# M1 and M3 are opposite corners -> maximal conflict for the baseline.
+# Here: 3 distinct centered payloads (~3 / 8 / 13 g), each its own crisp
+# (low-std) magnitude Gaussian; held-out target = 11 g (interpolable).
+mass_pos_sigma: 0.001
+half_side:      0.1
+mass_value_gaussians:
+  - {mean: 0.003, std: 0.0005}   # 1: light
+  - {mean: 0.008, std: 0.0005}   # 2: medium
+  - {mean: 0.013, std: 0.0005}   # 3: heavy
 tasks:
-  - name: M1
-    mass_gaussians: [1]
+  - name: light
+    mass_gaussians: [5]
     octants:        [1, 2, 3, 4, 5, 6, 7, 8]
-  - name: M2
-    mass_gaussians: [2]
+    mass_values:    [1]
+  - name: medium
+    mass_gaussians: [5]
     octants:        [1, 2, 3, 4, 5, 6, 7, 8]
-  - name: M3
-    mass_gaussians: [3]
+    mass_values:    [2]
+  - name: heavy
+    mass_gaussians: [5]
     octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [3]

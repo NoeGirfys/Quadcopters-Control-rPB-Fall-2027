@@ -74,7 +74,10 @@
       "Bash(cp training_regulation_simu_and_real/nn_sim_real_nnout.png Report_Latex_Overleaf/images/nn_sim_real_nnout.png)",
       "Bash(findstr /v \"pkg_resources pybullet\")",
       "Bash(findstr /v \"pkg_resources Warning import pybullet\")",
-      "Bash(findstr /v \"UserWarning pkg_resources\")"
+      "Bash(findstr /v \"UserWarning pkg_resources\")",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(echo \"train EXIT=$?\")",
+      "Bash(echo \"plot EXIT=$?\")"
     ]
   }
 }

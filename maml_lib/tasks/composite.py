@@ -1,23 +1,37 @@
 """Composite task set: tasks defined as mixtures of atomic distributions.
 
-A *task* is a row in a YAML/JSON configuration file. Each task selects:
+A *task* is a row in a YAML/JSON configuration file. Each task selects, on
+three independent axes:
 
-  * one or more **mass-position Gaussians** (one isotropic 3-D Gaussian per
-    motor of the CF2X; indices 1..4 in the config map to motors M1..M4),
-  * one or more **drone-start octants** of a cube ``[-half_side, half_side]^3``
+  * **mass-position Gaussians** (``mass_gaussians``): isotropic 3-D Gaussians;
+    indices 1..4 map to motors M1..M4, index 5 to the drone centre (0,0,0).
+    Shared std ``mass_pos_sigma``.
+  * **drone-start octants** (``octants``) of a cube ``[-half_side, half_side]^3``
     (indices 1..8, see ``OCTANT_SIGNS``),
-  * the shared 1-D uniform distribution on the extra mass magnitude
-    ``[mass_min, mass_max]``.
+  * **mass-magnitude Gaussians** (``mass_values``): 1-D Gaussians selected from
+    a top-level ``mass_value_gaussians`` pool (each ``{mean, std}`` in kg),
+    clamped to >= 0. This is the per-task axis that makes MAML meaningful: the
+    collective thrust the NN must output (to hold a given weight) has no
+    integrator in the firmware cascade — the NN replaced it — so different
+    per-task weights cannot all be held by one fixed policy without steady
+    state error, whereas the inner attitude/rate PIDs already integrate away a
+    *static* CoM-offset torque (hence offset *direction* is a poor task axis).
 
-At startup we draw ``M_train + M_eval`` 7-D points per task — each point is
-``(mass_x, mass_y, mass_z, m_extra, drone_x, drone_y, drone_z)`` — by
-picking uniformly among the selected Gaussians and octants on a per-point
-basis. The first ``M_train`` points are the support (inner-loop) set, the
-last ``M_eval`` the query (outer-loop) set. These points are *fixed* for
-the lifetime of the run: every epoch sees the same support and query.
+All distribution parameters (``mass_pos_sigma``, ``half_side``, the magnitude
+pool) live in the YAML — it is the single source of truth for the task
+distribution, so MAML and the standalone baseline only need to point at the
+same file. Sampling counts (``M_train``/``M_eval``) and the seed stay on the
+CLI.
 
-The class also serves as the *target* task set (held out from training)
-when loaded from a separate config file — same shape, typically one task.
+At startup we draw ``M_train + M_eval`` points per task — each point is
+``(mass_x, mass_y, mass_z, m_extra, drone_x, drone_y, drone_z)`` — by picking
+uniformly among the selected Gaussians/octants on a per-point basis. The
+first ``M_train`` points are the support (inner-loop) set, the last
+``M_eval`` the query (outer-loop) set. These points are *fixed* for the
+lifetime of the run.
+
+The class also serves as the *target* task set (held out from training) when
+loaded from a separate config file — same schema, typically one task.
 """
 from __future__ import annotations
 
@@ -48,13 +62,27 @@ OCTANT_SIGNS = np.array([
 ], dtype=np.float32)
 
 
+def _mass_centers() -> np.ndarray:
+    """Centres of the mass-position Gaussians: 4 motors + drone centre.
+
+    Index (0-based) 0..3 -> motors M1..M4 (``C.MOTOR_POS``), 4 -> (0,0,0).
+    Externally these are 1-based (1..5, with 5 = centre).
+    """
+    return np.vstack([np.asarray(C.MOTOR_POS, dtype=np.float32),
+                      np.zeros((1, 3), dtype=np.float32)])
+
+
 # ---------------------------------------------------------------------------
 # Config loader
 # ---------------------------------------------------------------------------
 
-def _load_task_file(path: str) -> List[dict]:
-    """Load a task config file. Accepts ``.yaml``/``.yml`` (requires
-    ``pyyaml``) and ``.json`` (built-in). Returns the ``tasks:`` list."""
+def _load_task_file(path: str) -> dict:
+    """Load a task config file and return the full top-level mapping.
+
+    Accepts ``.yaml``/``.yml`` (requires ``pyyaml``) and ``.json`` (built-in).
+    The returned dict holds the ``tasks`` list plus the distribution
+    parameters (``mass_pos_sigma``, ``half_side``, ``mass_value_gaussians``).
+    """
     ext = os.path.splitext(path)[1].lower()
     with open(path, "r", encoding="utf-8") as f:
         if ext in (".yaml", ".yml"):
@@ -79,21 +107,47 @@ def _load_task_file(path: str) -> List[dict]:
     tasks = data["tasks"]
     if not isinstance(tasks, list) or not tasks:
         raise ValueError(f"{path}: 'tasks' must be a non-empty list.")
-    return tasks
+    return data
 
 
-def _validate_task(entry: dict, idx: int) -> tuple:
-    """Validate one task entry; return (name, gauss_0idx, oct_0idx)."""
+def _validate_mass_pool(data: dict) -> np.ndarray:
+    """Validate the top-level ``mass_value_gaussians`` pool.
+
+    Returns an ``(P, 2)`` float32 array of ``(mean, std)`` per 1-D Gaussian.
+    """
+    pool = data.get("mass_value_gaussians")
+    if not isinstance(pool, list) or not pool:
+        raise ValueError(
+            "config: top-level 'mass_value_gaussians' must be a non-empty "
+            "list of {mean, std} mappings (extra-mass magnitude pool, kg).")
+    out = np.zeros((len(pool), 2), dtype=np.float32)
+    for j, g in enumerate(pool):
+        if not isinstance(g, dict) or "mean" not in g:
+            raise ValueError(
+                f"mass_value_gaussians[{j}]: must be a mapping with at least "
+                f"a 'mean' (kg); 'std' optional (got {g!r}).")
+        mean = float(g["mean"])
+        std = float(g.get("std", 0.0))
+        if mean < 0 or std < 0:
+            raise ValueError(
+                f"mass_value_gaussians[{j}]: 'mean' and 'std' must be >= 0 "
+                f"(got mean={mean}, std={std}).")
+        out[j] = (mean, std)
+    return out
+
+
+def _validate_task(entry: dict, idx: int, n_mass_pool: int) -> tuple:
+    """Validate one task entry; return (name, gauss_0idx, oct_0idx, mval_0idx)."""
     if not isinstance(entry, dict):
         raise ValueError(f"task #{idx+1}: must be a mapping, got {type(entry).__name__}")
     name = entry.get("name", f"task_{idx+1}")
 
     gauss = entry.get("mass_gaussians")
     if (not isinstance(gauss, list) or not gauss
-            or not all(isinstance(x, int) and 1 <= x <= 4 for x in gauss)):
+            or not all(isinstance(x, int) and 1 <= x <= 5 for x in gauss)):
         raise ValueError(
             f"task '{name}': 'mass_gaussians' must be a non-empty list of "
-            f"ints in 1..4 (got {gauss!r}).")
+            f"ints in 1..5 (1..4 = motors M1..M4, 5 = centre; got {gauss!r}).")
 
     oct_ = entry.get("octants")
     if (not isinstance(oct_, list) or not oct_
@@ -102,11 +156,21 @@ def _validate_task(entry: dict, idx: int) -> tuple:
             f"task '{name}': 'octants' must be a non-empty list of ints in "
             f"1..8 (got {oct_!r}).")
 
+    mvals = entry.get("mass_values")
+    if (not isinstance(mvals, list) or not mvals
+            or not all(isinstance(x, int) and 1 <= x <= n_mass_pool for x in mvals)):
+        raise ValueError(
+            f"task '{name}': 'mass_values' must be a non-empty list of ints "
+            f"in 1..{n_mass_pool} (indices into 'mass_value_gaussians'); "
+            f"got {mvals!r}.")
+
     # Deduplicate while preserving order.
     gauss = list(dict.fromkeys(gauss))
     oct_ = list(dict.fromkeys(oct_))
+    mvals = list(dict.fromkeys(mvals))
 
-    return name, [g - 1 for g in gauss], [o - 1 for o in oct_]
+    return (name, [g - 1 for g in gauss], [o - 1 for o in oct_],
+            [m - 1 for m in mvals])
 
 
 # ---------------------------------------------------------------------------
@@ -116,25 +180,32 @@ def _validate_task(entry: dict, idx: int) -> tuple:
 def _sample_points(rng: np.random.Generator, n: int,
                    gauss_indices: List[int],
                    octant_indices: List[int],
-                   motor_pos: np.ndarray,
+                   mval_indices: List[int],
+                   mass_centers: np.ndarray,
                    mass_pos_sigma: float,
-                   mass_min: float, mass_max: float,
+                   mass_pool: np.ndarray,
                    half_side: float):
     """Sample ``n`` points for one task.
 
     Returns three arrays: ``mass_positions (n, 3)``, ``m_extras (n,)``,
     ``drone_positions (n, 3)``, all float32.
     """
-    # Mass attachment position: pick uniformly among selected motors, then
-    # add isotropic 3-D Gaussian noise around that motor's position.
+    # Mass attachment position: pick uniformly among the selected position
+    # Gaussians (motors / centre), then add isotropic 3-D Gaussian noise.
     gauss_pick = rng.integers(0, len(gauss_indices), n)
-    chosen_motors = np.asarray(gauss_indices, dtype=np.int64)[gauss_pick]
-    centers = motor_pos[chosen_motors]                                # (n, 3)
+    chosen_centers = np.asarray(gauss_indices, dtype=np.int64)[gauss_pick]
+    centers = mass_centers[chosen_centers]                            # (n, 3)
     noise = rng.normal(0.0, mass_pos_sigma, (n, 3)).astype(np.float32)
     mass_positions = (centers + noise).astype(np.float32)
 
-    # Extra mass magnitude: shared 1-D uniform.
-    m_extras = rng.uniform(mass_min, mass_max, n).astype(np.float32)
+    # Extra mass magnitude: pick uniformly among the selected 1-D Gaussians,
+    # draw from it, and clamp to >= 0 (no negative payload).
+    mv_pick = rng.integers(0, len(mval_indices), n)
+    chosen_mv = np.asarray(mval_indices, dtype=np.int64)[mv_pick]
+    means = mass_pool[chosen_mv, 0]
+    stds = mass_pool[chosen_mv, 1]
+    m_extras = rng.normal(means, stds).astype(np.float32)
+    m_extras = np.clip(m_extras, 0.0, None).astype(np.float32)
 
     # Drone start: pick uniformly among selected octants, then a uniform
     # point inside that octant's slice of the cube.
@@ -229,39 +300,51 @@ class CompositeTaskSet:
     @classmethod
     def from_config(cls, config_path: str, *,
                     M_train: int, M_eval: int,
-                    mass_pos_sigma: float,
-                    half_side: float,
-                    mass_min: float, mass_max: float,
                     rng: np.random.Generator) -> "CompositeTaskSet":
-        """Sample a fresh task set from a YAML/JSON config."""
+        """Sample a fresh task set from a YAML/JSON config.
+
+        The distribution parameters (``mass_pos_sigma``, ``half_side`` and the
+        ``mass_value_gaussians`` magnitude pool) are read from the config file
+        itself — it is the single source of truth for the task distribution.
+        Only the sampling counts and ``rng`` come from the caller.
+        """
         if M_train < 1 or M_eval < 1:
             raise ValueError(
                 f"M_train and M_eval must be >= 1 (got {M_train}, {M_eval}).")
-        if mass_min > mass_max:
-            raise ValueError(
-                f"mass_min ({mass_min}) must be <= mass_max ({mass_max}).")
 
-        entries = _load_task_file(config_path)
+        data = _load_task_file(config_path)
+        entries = data["tasks"]
+        mass_pos_sigma = float(data.get("mass_pos_sigma", 0.01))
+        half_side = float(data.get("half_side", 0.3))
+        if mass_pos_sigma < 0 or half_side < 0:
+            raise ValueError(
+                f"{config_path}: 'mass_pos_sigma' and 'half_side' must be "
+                f">= 0 (got {mass_pos_sigma}, {half_side}).")
+        mass_pool = _validate_mass_pool(data)                        # (P, 2)
+        P = mass_pool.shape[0]
+
         N = len(entries)
         M_total = M_train + M_eval
-        motor_pos = np.asarray(C.MOTOR_POS, dtype=np.float32)        # (4, 3)
+        mass_centers = _mass_centers()                               # (5, 3)
 
         names: List[str] = []
-        spec = np.zeros((N, 12), dtype=bool)
+        spec = np.zeros((N, 5 + 8 + P), dtype=bool)   # pos(5) | octants(8) | mag(P)
         mp_all = np.zeros((N, M_total, 3), dtype=np.float32)
         me_all = np.zeros((N, M_total),    dtype=np.float32)
         dp_all = np.zeros((N, M_total, 3), dtype=np.float32)
 
         for i, entry in enumerate(entries):
-            name, gauss_idx, oct_idx = _validate_task(entry, i)
+            name, gauss_idx, oct_idx, mval_idx = _validate_task(entry, i, P)
             names.append(name)
             for g in gauss_idx:
                 spec[i, g] = True
             for o in oct_idx:
-                spec[i, 4 + o] = True
+                spec[i, 5 + o] = True
+            for m in mval_idx:
+                spec[i, 13 + m] = True
             mp, me, dp = _sample_points(
-                rng, M_total, gauss_idx, oct_idx,
-                motor_pos, mass_pos_sigma, mass_min, mass_max, half_side)
+                rng, M_total, gauss_idx, oct_idx, mval_idx,
+                mass_centers, mass_pos_sigma, mass_pool, half_side)
             mp_all[i] = mp
             me_all[i] = me
             dp_all[i] = dp
@@ -270,16 +353,20 @@ class CompositeTaskSet:
             names=names, spec=spec,
             mass_positions=mp_all, m_extras=me_all, drone_positions=dp_all,
             M_train=M_train, M_eval=M_eval,
-            mass_pos_sigma=mass_pos_sigma, half_side=half_side,
-            mass_min=mass_min, mass_max=mass_max)
+            mass_pos_sigma=mass_pos_sigma, half_side=half_side)
 
     @classmethod
     def _assemble(cls, *, names, spec,
                   mass_positions, m_extras, drone_positions,
                   M_train, M_eval,
-                  mass_pos_sigma, half_side, mass_min, mass_max
+                  mass_pos_sigma, half_side
                   ) -> "CompositeTaskSet":
-        """Internal: build masses/x0 from raw arrays and split adapt/eval."""
+        """Internal: build masses/x0 from raw arrays and split adapt/eval.
+
+        ``mass_min``/``mass_max`` are *derived* as the min/max sampled extra
+        mass across all points (used only for plotting / provenance now that
+        the magnitude is a per-task Gaussian pool, not a global uniform).
+        """
         N = len(names)
         masses_train, masses_eval = [], []
         x0_train = torch.zeros(N, M_train, 12, dtype=torch.float32)
@@ -292,6 +379,9 @@ class CompositeTaskSet:
             x0_train[i] = _positions_to_x0(drone_positions[i, :M_train])
             x0_eval[i]  = _positions_to_x0(drone_positions[i, M_train:])
 
+        mass_min = float(m_extras.min())
+        mass_max = float(m_extras.max())
+
         return cls(
             names=names, spec=spec,
             mass_positions_train=mass_positions[:, :M_train].copy(),
@@ -302,7 +392,7 @@ class CompositeTaskSet:
             x0_train=x0_train, x0_eval=x0_eval,
             M_train=M_train, M_eval=M_eval,
             mass_pos_sigma=float(mass_pos_sigma), half_side=float(half_side),
-            mass_min=float(mass_min), mass_max=float(mass_max),
+            mass_min=mass_min, mass_max=mass_max,
         )
 
     # --------------------------------------------------------------------

@@ -94,14 +94,10 @@ def parse_args():
     p.add_argument("--target-config", type=str,   default=d.get("target_config", None),
                    help="optional held-out target task YAML/JSON; if given, "
                         "the policy's loss on it is logged every epoch")
-    p.add_argument("--mass-min",      type=float, default=d.get("mass_min", 0.002),
-                   help="lower bound for the shared 1-D mass uniform [kg]")
-    p.add_argument("--mass-max",      type=float, default=d.get("mass_max", 0.014),
-                   help="upper bound for the shared 1-D mass uniform [kg]")
-    p.add_argument("--mass-pos-sigma", type=float, default=d.get("mass_pos_sigma", 0.01),
-                   help="isotropic σ of the 4 motor-centered Gaussians [m]")
-    p.add_argument("--half-side",     type=float, default=d.get("half_side", 0.3),
-                   help="cube half-side for the drone start octants [m]")
+    # Task-distribution parameters (mass magnitude pool, position σ, start
+    # cube half-side) now live in the YAML config — it is the single source
+    # of truth for the task distribution. Only the sampling counts and seed
+    # stay on the CLI.
     p.add_argument("--n-points-train", type=int,  default=d.get("n_points_train", 100),
                    help="number of support points sampled per task")
     p.add_argument("--n-points-eval",  type=int,  default=d.get("n_points_eval", 50),
@@ -189,13 +185,12 @@ def main():
         task_set = CompositeTaskSet.from_config(
             args.tasks_config,
             M_train=args.n_points_train, M_eval=args.n_points_eval,
-            mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
-            mass_min=args.mass_min, mass_max=args.mass_max,
             rng=rng_tasks)
         print(f"[Tasks]  {len(task_set)} tasks from {args.tasks_config}  "
               f"M_train={task_set.M_train}  M_eval={task_set.M_eval}  "
-              f"σ={args.mass_pos_sigma*100:.1f}cm  half_side={args.half_side}m  "
-              f"m=[{args.mass_min*1e3:.1f},{args.mass_max*1e3:.1f}]g")
+              f"σ={task_set.mass_pos_sigma*100:.1f}cm  "
+              f"half_side={task_set.half_side}m  "
+              f"m∈[{task_set.mass_min*1e3:.1f},{task_set.mass_max*1e3:.1f}]g")
         if args.target_config is not None:
             # Independent RNG stream so target sampling does not perturb
             # the training-task sampling stream.
@@ -210,8 +205,6 @@ def main():
             target_set = CompositeTaskSet.from_config(
                 args.target_config,
                 M_train=target_M_train, M_eval=args.n_points_eval,
-                mass_pos_sigma=args.mass_pos_sigma, half_side=args.half_side,
-                mass_min=args.mass_min, mass_max=args.mass_max,
                 rng=rng_target)
             kspec = (f"K={target_M_train} (few-shot)"
                      if args.k_samples and args.k_samples > 0

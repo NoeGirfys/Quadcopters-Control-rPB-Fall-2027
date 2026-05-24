@@ -1,13 +1,17 @@
 """Regenerate diagnostic plots from a saved MAML / baseline checkpoint.
 
 Training (``train_maml.py`` / ``train_baseline.py``) writes the
-checkpoint only; this script rebuilds, for any checkpoint, two figures
+checkpoint only; this script rebuilds, for any checkpoint, three figures
 saved next to the ``.pt`` file:
 
   * ``<base>_map.png``  : the composite task map — mass-attachment
     positions coloured by task with motor positions and σ circles, plus
     the drone start positions in the cube of octants. Optional target
     task is overlaid in red.
+  * ``<base>_mass.png`` : the per-task payload-magnitude strip plot — one
+    lane per task, every sampled extra mass as a dot (same per-task colour
+    as the map), the per-task mean marked. Optional target task overlaid
+    in red. This is the axis that differentiates tasks for MAML.
   * ``<base>_loss.png`` : the per-epoch loss curve. For MAML this shows
     inner (pre-adaptation) and outer (meta) losses; for the baseline,
     train and eval. In both cases, ``target_loss`` is overlaid if
@@ -29,6 +33,63 @@ if PARENT_DIR not in sys.path:
     sys.path.append(PARENT_DIR)
 
 from maml_lib import CompositeTaskSet, plot_fixed_task_map
+from maml_lib import config as C
+
+
+# ---------------------------------------------------------------------------
+# Mass-magnitude strip plot
+# ---------------------------------------------------------------------------
+
+def plot_mass_values(out_path: str, *, task_set, target_set=None) -> None:
+    """Per-task payload-magnitude strip plot (one lane per task).
+
+    Mirrors the task-map conventions: one colour per training task (same
+    ``tab20`` cmap as ``plot_fixed_task_map``), the held-out target task(s)
+    overlaid in red. Each dot is one sampled extra mass (train + eval); the
+    per-task mean is drawn as a short vertical bar and annotated in grams.
+    """
+    import matplotlib.pyplot as plt
+
+    jitter_rng = np.random.default_rng(0)          # visual jitter only
+    cmap = plt.get_cmap("tab20") if task_set.N <= 20 else plt.get_cmap("viridis")
+
+    def _vals_g(ts, i):
+        return np.concatenate([np.asarray(ts.m_extras_train[i]).reshape(-1),
+                               np.asarray(ts.m_extras_eval[i]).reshape(-1)]) * 1e3
+
+    lanes = [(task_set.names[i], _vals_g(task_set, i), cmap(i % cmap.N), False)
+             for i in range(task_set.N)]
+    if target_set is not None:
+        lanes += [(target_set.names[i], _vals_g(target_set, i), "red", True)
+                  for i in range(target_set.N)]
+
+    fig, ax = plt.subplots(figsize=(9, 0.7 * len(lanes) + 2.0))
+    yticks, ylabels = [], []
+    for y, (name, vals, color, is_tgt) in enumerate(lanes):
+        jit = (jitter_rng.random(vals.shape[0]) - 0.5) * 0.5
+        ax.scatter(vals, np.full_like(vals, float(y)) + jit,
+                   s=22, color=color, alpha=0.55,
+                   marker=("x" if is_tgt else "o"),
+                   linewidths=(1.3 if is_tgt else 0),
+                   edgecolors="none")
+        m = float(vals.mean())
+        ax.plot([m, m], [y - 0.42, y + 0.42], color=color, lw=2.2)
+        ax.text(m, y + 0.46, f"{m:.1f} g", ha="center", va="bottom",
+                fontsize=8, color=color)
+        yticks.append(y)
+        ylabels.append(name + (" (target)" if is_tgt else ""))
+
+    ax.set_yticks(yticks)
+    ax.set_yticklabels(ylabels, fontsize=8)
+    ax.set_ylim(-0.7, len(lanes) - 0.3)
+    ax.set_xlabel("Extra (payload) mass [g]")
+    ax.set_title(f"Per-task payload magnitude  "
+                 f"(base drone = {C.M_BASE * 1e3:.0f} g; ○ = train, ✕ = target)")
+    ax.grid(True, axis="x", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"[Saved] {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +174,8 @@ def main():
     print(f"[Type]  {'MAML' if is_maml else 'baseline'} checkpoint  "
           f"({len(history.get('epoch', []))} epochs)")
 
-    # ── Task map ───────────────────────────────────────────────────────
-    map_path = os.path.join(out_dir, base + "_map.png")
+    # ── Rebuild task sets once (shared by the map and mass plots) ──────
+    task_set = target_set = None
     try:
         if "task_set" not in ckpt:
             raise KeyError(
@@ -124,11 +185,26 @@ def main():
         task_set = CompositeTaskSet.from_dict(ckpt["task_set"])
         target_set = (CompositeTaskSet.from_dict(ckpt["target_set"])
                       if ckpt.get("target_set") is not None else None)
-        plot_fixed_task_map(map_path,
-                            task_set=task_set, target_set=target_set)
-        print(f"[Saved] {map_path}")
     except Exception as e:
-        print(f"[Map] failed: {e}")
+        print(f"[Tasks] could not rebuild task set: {e}")
+
+    # ── Task map ───────────────────────────────────────────────────────
+    if task_set is not None:
+        map_path = os.path.join(out_dir, base + "_map.png")
+        try:
+            plot_fixed_task_map(map_path,
+                                task_set=task_set, target_set=target_set)
+            print(f"[Saved] {map_path}")
+        except Exception as e:
+            print(f"[Map] failed: {e}")
+
+        # ── Mass-magnitude strip plot ──────────────────────────────────
+        mass_path = os.path.join(out_dir, base + "_mass.png")
+        try:
+            plot_mass_values(mass_path,
+                             task_set=task_set, target_set=target_set)
+        except Exception as e:
+            print(f"[Mass] failed: {e}")
 
     # ── Loss curve ─────────────────────────────────────────────────────
     loss_path = os.path.join(out_dir, base + "_loss.png")
