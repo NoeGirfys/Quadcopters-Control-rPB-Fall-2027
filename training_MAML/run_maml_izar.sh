@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=04:30:00          # N*M_train est plus petit qu'avant -> à mesurer en debug
+#SBATCH --time=06:30:00          # N*M_train est plus petit qu'avant -> à mesurer en debug
 #SBATCH --output=logs/maml_%j.out
 #SBATCH --error=logs/maml_%j.err
 
