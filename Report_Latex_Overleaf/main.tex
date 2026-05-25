@@ -1580,14 +1580,21 @@ estimates from drifting, as integrating inertial measurements accumulates error
 unbounded over time. The on-board Kalman filter therefore relies on an external
 positioning deck to remain accurate. Two were evaluated, each feeding the same filter:
 \begin{itemize}
-    \item the \emph{Flowdeck}, a downward-facing deck that combines an optical-flow
-    camera --- which senses horizontal velocity from the apparent motion of the
-    ground --- with a time-of-flight laser rangefinder for height. It provides only a
-    \emph{relative} reference: it constrains velocity and height but lets the absolute
-    horizontal position drift over time;
-    \item the \emph{Lighthouse}, which recovers an \emph{absolute} six-degree-of-freedom
-    pose from the infrared sweeps of three Lighthouse~V2 base stations, picked up by
-    an on-board receiver deck, at sub-millimetre and sub-degree accuracy.
+    \item the \emph{Flowdeck},\footnote{\url{https://www.bitcraze.io/tag/flow-deck/}}
+    a downward-facing deck that combines an optical-flow camera with a time-of-flight
+    laser rangefinder for height. The camera images the ground at a high frame rate and
+    measures the pixel displacement between successive frames; scaled by the measured
+    height, this apparent ground motion is converted into a metric horizontal velocity.
+    The deck therefore provides only a \emph{relative} reference: it constrains velocity
+    and height directly, but the absolute horizontal position is recovered by integrating
+    the velocity and so drifts unbounded over time;
+    \item the \emph{Lighthouse},\footnote{\url{https://www.bitcraze.io/documentation/system/positioning/ligthouse-positioning-system/}}
+    which recovers an \emph{absolute} six-degree-of-freedom pose. Lighthouse~V2 base
+    stations sweep the room with infrared light; an on-board receiver deck detects these
+    sweeps and infers the direction to each base station, and from the directions to
+    several stations its full pose is recovered at millimetre and degree accuracy,
+    with no integration and hence no drift. Two base stations are sufficient for a
+    complete pose; three are used here to improve coverage and robustness.
 \end{itemize}
 \subsection{Circle Trajectory: Simulation vs Reality}\label{sec:circle_simreal}
 
