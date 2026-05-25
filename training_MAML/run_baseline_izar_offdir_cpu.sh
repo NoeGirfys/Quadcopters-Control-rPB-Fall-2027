@@ -1,6 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=baseline_offdir_cpu
-#SBATCH --qos=normal
+#SBATCH --account=master          # Ton compte étudiant
+#SBATCH --partition=academic      # Le couloir obligatoire pour les étudiants sur Jed
+#SBATCH --qos=academic            # La règle de temps associée à cette partition
 #SBATCH --cpus-per-task=4       # CPU-only -> on parallélise via les threads BLAS/torch
 #SBATCH --mem=8G
 #SBATCH --time=03:00:00

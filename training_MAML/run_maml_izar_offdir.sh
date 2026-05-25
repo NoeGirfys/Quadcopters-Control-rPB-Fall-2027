@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:1             # 1 GPU
 #SBATCH --cpus-per-task=4        # CPU pour numpy / overhead Python
 #SBATCH --mem=16G                # RAM
-#SBATCH --time=06:30:00          # ~ comme le run payload (3 tâches, t_sim 3s)
+#SBATCH --time=05:30:00          # ~ comme le run payload (3 tâches, t_sim 3s)
 #SBATCH --output=logs/maml_offdir_%j.out
 #SBATCH --error=logs/maml_offdir_%j.err
 
