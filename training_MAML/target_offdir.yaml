@@ -1,0 +1,17 @@
+# Target (held-out) task — "offset DIRECTION" MAML experiment.
+#
+# Same schema and parameters as tasks_offdir.yaml. The held-out factor is the
+# offset DIRECTION: a 6 g payload on motor M4 (+x,+y), a direction never seen
+# in training but reachable by interpolating M1/M2/M3 — a genuine OOD few-shot
+# test. Magnitude (6 g), start region (8 octants, half_side) and σ match
+# training, so direction is the only held-out axis. Its loss after K-shot
+# adaptation is logged every epoch but never feeds the optimiser.
+mass_pos_sigma: 0.003
+half_side:      0.1
+mass_value_gaussians:
+  - {mean: 0.006, std: 0.0005}
+tasks:
+  - name: target_M4
+    mass_gaussians: [4]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]

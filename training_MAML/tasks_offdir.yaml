@@ -1,0 +1,42 @@
+# Training task set — "offset DIRECTION" MAML experiment.
+#
+# Per-task axis = the DIRECTION of an off-centre payload (fixed magnitude).
+# Each task pins a 6 g mass on one motor (M1/M2/M3); the held-out target is
+# the 4th direction (M4). M1=(+x,-y) and M3=(-x,+y) are opposite corners ->
+# maximal conflict for a single policy.
+#
+# Why this can give MAML a real edge (vs the centered-magnitude experiment,
+# where adaptation was useless because the firmware's integral attitude/rate
+# loops already reject a static torque and feedback handles weight):
+# the off-centre payload perturbs the TRANSIENT before the inner integrators
+# wind up, and a controller that KNOWS the offset direction can pre-tilt
+# (feedforward). Empirically, under offset the K-shot-adapted baseline beats
+# the deploy-as-is baseline (it did NOT in the centered case) — i.e. the
+# offset direction is information adaptation can exploit. MAML's meta-init,
+# trained for that adaptation, should beat both.
+#
+# Magnitude is kept at 6 g: above ~8-9 g on the motor arm the weight + gravity
+# torque saturate the motor cap (attitude correction steals collective ->
+# the drone can't hold). 6 g sits in the feasible window where adaptation
+# helps most. half_side small (start near setpoint) so the holding/transient
+# phase dominates the cost; t_sim long is set on the CLI.
+#
+# Schema: mass_gaussians 1..5 (1..4 motors, 5 centre); octants 1..8;
+# mass_values = indices into mass_value_gaussians (here a single 6 g Gaussian).
+mass_pos_sigma: 0.003
+half_side:      0.1
+mass_value_gaussians:
+  - {mean: 0.006, std: 0.0005}   # fixed 6 g payload (feasible, below the cap cliff)
+tasks:
+  - name: M1
+    mass_gaussians: [1]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
+  - name: M2
+    mass_gaussians: [2]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
+  - name: M3
+    mass_gaussians: [3]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
