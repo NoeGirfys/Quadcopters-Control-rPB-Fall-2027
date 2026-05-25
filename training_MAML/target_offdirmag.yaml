@@ -1,0 +1,18 @@
+# Target (held-out) task — "offset DIRECTION x MAGNITUDE" experiment (variant b).
+#
+# Same schema/parameters as tasks_offdirmag.yaml. The held-out task is a 5 g
+# payload on motor M4 (+x,+y): a DIRECTION never seen in training (only
+# M1/M2/M3 were) AND a MAGNITUDE between the two trained ones (3 g / 6 g).
+# So it is out-of-distribution on both axes, but interpolable from the
+# training grid — a genuine OOD few-shot generalisation test. Start region
+# (8 octants, half_side) and sigma match training. Its loss after K-shot
+# adaptation is logged every epoch but never feeds the optimiser.
+mass_pos_sigma: 0.003
+half_side:      0.2
+mass_value_gaussians:
+  - {mean: 0.005, std: 0.0005}   # interpolated magnitude (between 3 g and 6 g)
+tasks:
+  - name: target_M4_5g
+    mass_gaussians: [4]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]

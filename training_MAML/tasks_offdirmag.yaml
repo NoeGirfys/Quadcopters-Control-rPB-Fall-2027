@@ -1,0 +1,51 @@
+# Training task set — "offset DIRECTION x MAGNITUDE" MAML experiment (variant b).
+#
+# Crosses the two axes on which a single joint policy is suboptimal, so its
+# compromise is maximally penalised:
+#   * DIRECTION (M1/M2/M3): the off-centre payload perturbs the TRANSIENT
+#     before the inner attitude/rate integrators wind up; a controller that
+#     knows the direction can pre-tilt (feedforward). The integral rejects the
+#     STEADY torque (any direction), so this benefit lives in the maneuver —
+#     hence a larger half_side here than the centered experiment.
+#   * MAGNITUDE (3 g / 6 g): the collective thrust the NN must output has no
+#     integrator (the NN replaced the Vel-Z loop), so different weights need
+#     different thrust the whole flight.
+# 6 tasks = {M1,M2,M3} x {3 g, 6 g}. Held-out target = M4 @ 5 g (a direction
+# never trained + a magnitude between the two trained ones): OOD on BOTH axes
+# yet interpolable, so few-shot adaptation can reach it.
+#
+# Magnitudes kept <= 6 g: above ~8 g on the motor arm the weight + gravity
+# torque saturate the motor cap (attitude correction steals collective).
+#
+# Schema: mass_gaussians 1..5 (1..4 motors, 5 centre); octants 1..8;
+# mass_values = 1-based indices into mass_value_gaussians.
+mass_pos_sigma: 0.003
+half_side:      0.2
+mass_value_gaussians:
+  - {mean: 0.003, std: 0.0005}   # 1: light offset
+  - {mean: 0.006, std: 0.0005}   # 2: heavy offset (below the cap cliff)
+tasks:
+  - name: M1_3g
+    mass_gaussians: [1]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
+  - name: M1_6g
+    mass_gaussians: [1]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [2]
+  - name: M2_3g
+    mass_gaussians: [2]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
+  - name: M2_6g
+    mass_gaussians: [2]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [2]
+  - name: M3_3g
+    mass_gaussians: [3]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [1]
+  - name: M3_6g
+    mass_gaussians: [3]
+    octants:        [1, 2, 3, 4, 5, 6, 7, 8]
+    mass_values:    [2]
