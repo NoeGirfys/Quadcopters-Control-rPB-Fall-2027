@@ -1524,7 +1524,7 @@ Having built a closed-loop simulator that pairs the faithful \texttt{DYN} dynami
 with a Python port of the on-board controller
 (Section~\ref{sec:firmware_integration}), we now confront it with the physical
 platform. This chapter describes the experimental hardware
-(Section~\ref{sec:exp_setup}), compares the two positioning systems that were
+(Section~\ref{sec:exp_setup}), studies the two positioning systems that were
 available (Section~\ref{sec:flowdeck_lighthouse}), and quantifies the agreement
 between simulation and reality on a circular trajectory
 (Section~\ref{sec:circle_simreal}).
@@ -1540,7 +1540,7 @@ mass $m$, the arm length $l$ and the thrust and drag coefficients $k_t$, $k_m$ -
 parameterise the dynamics of Section~\ref{sec:dynamics}, and the simulation is configured
 with the manufacturer's values for these quantities, so that the simulated and the real
 drone share the same nominal dynamics by construction. The drone additionally carries a
-positioning deck, mounted on top of or below the frame, of one of the two types compared
+positioning deck, mounted on top of or below the frame, of one of the two types studied
 in Section~\ref{sec:flowdeck_lighthouse}.
 
 \subsubsection*{On-board control and state estimation}
@@ -1562,12 +1562,16 @@ its radio protocol.
 \subsubsection*{Host link and logging}
 
 Each experiment is commanded from a host PC over a $2.4\,\mathrm{GHz}$
-Crazyradio~2.0 USB link using the Bitcraze Python library: the PC streams setpoints
-to the drone, and the drone streams its on-board state estimate (together with the
-raw gyroscope) back, which is recorded for the offline comparison with simulation.
-In this chapter no part of the controller runs on the PC --- the drone flies
-entirely under its own firmware --- so the host acts purely as a command-and-
-logging interface.
+Crazyradio~2.0 USB link using the Bitcraze Python library: the PC streams a
+\emph{position setpoint} to the drone, and the drone streams its on-board state
+estimate (together with the raw gyroscope) back, which is recorded for the offline
+comparison with simulation. Because the setpoint is a position reference, it enters
+the cascade at the very top, so the entire firmware runs on board: the full loop of
+Figure~\ref{fig:cascade_pid}, from the position PID down through the velocity,
+attitude and attitude-rate PIDs to the motors, is closed on the microcontroller. In
+this chapter no part of the controller runs on the PC --- the drone flies entirely
+under its own firmware --- so the host acts purely as a command-and-logging
+interface.
 
 \subsection{Flowdeck vs Lighthouse}\label{sec:flowdeck_lighthouse}
 
