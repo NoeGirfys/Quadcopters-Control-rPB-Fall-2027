@@ -20,7 +20,7 @@
 # Schema: mass_gaussians 1..5 (1..4 motors, 5 centre); octants 1..8;
 # mass_values = 1-based indices into mass_value_gaussians.
 mass_pos_sigma: 0.003
-half_side:      0.2
+half_side:      0.5
 mass_value_gaussians:
   - {mean: 0.003, std: 0.0005}   # 1: light offset
   - {mean: 0.006, std: 0.0005}   # 2: heavy offset (below the cap cliff)
