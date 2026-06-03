@@ -108,8 +108,17 @@ def _flatten_target_loss(target_loss):
     return arr.T                                              # (N_target, n_epochs)
 
 
-def plot_loss_curve(history: dict, out_path: str, is_maml: bool) -> None:
-    """Plot the per-epoch loss curve stored in ``history``."""
+def plot_loss_curve(history: dict, out_path: str, is_maml: bool,
+                    show_target: bool = True) -> None:
+    """Plot the per-epoch loss curve stored in ``history``.
+
+    ``show_target=False`` omits the held-out ``target_loss`` overlay. The
+    target metric is evaluated noise-free while the training curves are run
+    with observation noise, so on a convergence plot they sit on different
+    footings; hiding it keeps the convergence figure clean (the held-out
+    comparison is then done separately on the final models, e.g. with
+    ``eval_gap.py --obs-noise-scale``).
+    """
     import matplotlib.pyplot as plt
 
     epochs = history.get("epoch", [])
@@ -129,7 +138,7 @@ def plot_loss_curve(history: dict, out_path: str, is_maml: bool) -> None:
         ax.plot(epochs, history["eval_loss"],  color="C3", label="eval loss")
         title = "Baseline training loss"
 
-    target_curves = _flatten_target_loss(history.get("target_loss", []))
+    target_curves = _flatten_target_loss(history.get("target_loss", [])) if show_target else None
     if target_curves is not None:
         for k in range(target_curves.shape[0]):
             ax.plot(epochs[: target_curves.shape[1]], target_curves[k],
@@ -158,6 +167,13 @@ def main():
         description="Regenerate the task map and loss curve from a checkpoint.")
     p.add_argument("--ckpt", required=True,
                    help="MAML or baseline checkpoint (.pt)")
+    p.add_argument("--no-target-loss", action="store_true",
+                   help="omit the held-out target_loss overlay on the loss "
+                        "curve (it is evaluated noise-free, unlike the noisy "
+                        "training curves; hide it for a clean convergence plot)")
+    p.add_argument("--no-target", action="store_true",
+                   help="omit the held-out target from ALL three plots "
+                        "(map, mass strip, loss curve). Implies --no-target-loss.")
     args = p.parse_args()
 
     # Headless-safe backend; must be set before pyplot is imported anywhere.
@@ -188,12 +204,14 @@ def main():
     except Exception as e:
         print(f"[Tasks] could not rebuild task set: {e}")
 
+    target_for_overlay = None if args.no_target else target_set
+
     # ── Task map ───────────────────────────────────────────────────────
     if task_set is not None:
         map_path = os.path.join(out_dir, base + "_map.png")
         try:
             plot_fixed_task_map(map_path,
-                                task_set=task_set, target_set=target_set)
+                                task_set=task_set, target_set=target_for_overlay)
             print(f"[Saved] {map_path}")
         except Exception as e:
             print(f"[Map] failed: {e}")
@@ -202,13 +220,14 @@ def main():
         mass_path = os.path.join(out_dir, base + "_mass.png")
         try:
             plot_mass_values(mass_path,
-                             task_set=task_set, target_set=target_set)
+                             task_set=task_set, target_set=target_for_overlay)
         except Exception as e:
             print(f"[Mass] failed: {e}")
 
     # ── Loss curve ─────────────────────────────────────────────────────
     loss_path = os.path.join(out_dir, base + "_loss.png")
-    plot_loss_curve(history, loss_path, is_maml)
+    show_target_loss = not (args.no_target_loss or args.no_target)
+    plot_loss_curve(history, loss_path, is_maml, show_target=show_target_loss)
 
     print("Done.")
 

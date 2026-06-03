@@ -1,0 +1,17 @@
+mass_g,controller,steady_state_err_cm,trajectory_loss
+4,firmwarePID,2.8699,484.7918
+4,baseNN,2.9729,487.6793
+4,baseNN-adapt,5.2557,530.1984
+4,MAML-adapt,2.1152,474.0982
+8,firmwarePID,3.9972,520.9771
+8,baseNN,2.9905,492.5424
+8,baseNN-adapt,6.9108,556.3160
+8,MAML-adapt,2.0405,480.1073
+12,firmwarePID,5.0565,572.0574
+12,baseNN,2.7862,514.3597
+12,baseNN-adapt,9.0074,535.8649
+12,MAML-adapt,1.3699,505.6403
+16,firmwarePID,6.0325,714.5209
+16,baseNN,1.9886,588.6432
+16,baseNN-adapt,21.1189,927.7897
+16,MAML-adapt,1.3012,582.0829

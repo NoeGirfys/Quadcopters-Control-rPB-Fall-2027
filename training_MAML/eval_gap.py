@@ -79,6 +79,11 @@ class EvalCfg:
         tg = maml_ckpt.get("target_set")
         self.target_mass_g = (float(np.asarray(tg["m_extras_train"]).mean() * 1e3)
                               if tg is not None else None)
+        # Observation noise for the final-model test (set from the CLI). When
+        # > 0, both the few-shot adaptation and the query eval roll-outs are
+        # run on a noisy state estimate — realistic (= deployment conditions),
+        # and on the same footing as the (noisy) training roll-outs.
+        self.obs_noise = None
 
 
 def _policy(ckpt: dict, hidden: int) -> PolicyMLP:
@@ -105,22 +110,25 @@ def _mass(m_kg: float, n: int, r_offset: np.ndarray):
     return compute_mass_params_batched(me, pos)
 
 
-def _cost(fn, x0, mass, cfg: EvalCfg) -> float:
+def _cost(fn, x0, mass, cfg: EvalCfg, noise_seed=None) -> float:
+    gen = None
+    if cfg.obs_noise is not None and noise_seed is not None:
+        gen = torch.Generator().manual_seed(int(noise_seed))
     with torch.no_grad():
         X = rollout(fn, x0, cfg.n_steps, mass, cfg.dyn,
-                    tau_div=cfg.tau, obs_noise_std=None, gen=None)
+                    tau_div=cfg.tau, obs_noise_std=cfg.obs_noise, gen=gen)
         return float(trajectory_cost(X, cfg.term_w,
                                      pos_weight=cfg.pos_w, z_weight=cfg.z_w).mean())
 
 
-def _adapt(pol, x0K, mK, cfg: EvalCfg):
+def _adapt(pol, x0K, mK, cfg: EvalCfg, seed: int = 0):
     theta, _ = maml_adapt(pol, mK, x0K, dynamics_step=cfg.dyn,
                           n_steps=cfg.n_steps, n_steps_adapt=cfg.n_inner,
                           lr_inner=cfg.lr_inner, terminal_weight=cfg.term_w,
                           pos_weight=cfg.pos_w, z_weight=cfg.z_w,
-                          obs_noise_std=None, tau_div=cfg.tau,
+                          obs_noise_std=cfg.obs_noise, tau_div=cfg.tau,
                           inner_grad_clip=cfg.clip, device="cpu",
-                          seed=0, verbose=False)
+                          seed=seed, verbose=False)
     return theta
 
 
@@ -140,9 +148,12 @@ def run_sweep(pol_m, pol_b, cfg: EvalCfg, masses_g, r_offset, n_draws, n_query):
             mK  = _mass(m, cfg.K, r_offset)
             x0Q = _make_x0(n_query, cfg.half_side, rng)
             mQ  = _mass(m, n_query, r_offset)
-            b0.append(_cost(pol_b, x0Q, mQ, cfg))
-            ba.append(_cost(_make_fn(pol_b, _adapt(pol_b, x0K, mK, cfg)), x0Q, mQ, cfg))
-            ma.append(_cost(_make_fn(pol_m, _adapt(pol_m, x0K, mK, cfg)), x0Q, mQ, cfg))
+            # Same adaptation-noise realisation (seed=s) and same eval-noise
+            # realisation (noise_seed) for all three controllers -> fair.
+            nseed = 9000 + int(round(m_g * 10)) * 17 + s
+            b0.append(_cost(pol_b, x0Q, mQ, cfg, noise_seed=nseed))
+            ba.append(_cost(_make_fn(pol_b, _adapt(pol_b, x0K, mK, cfg, seed=s)), x0Q, mQ, cfg, noise_seed=nseed))
+            ma.append(_cost(_make_fn(pol_m, _adapt(pol_m, x0K, mK, cfg, seed=s)), x0Q, mQ, cfg, noise_seed=nseed))
         b0, ba, ma = map(np.asarray, (b0, ba, ma))
         out[m_g] = {
             "base_0shot": (b0.mean(), b0.std(), b0),
@@ -221,6 +232,19 @@ def parse_args():
     p.add_argument("--n-draws", type=int, default=10,
                    help="independent few-shot support draws to average over")
     p.add_argument("--n-query", type=int, default=40)
+    p.add_argument("--adapt-lr", type=float, default=None,
+                   help="override the few-shot adaptation lr_inner (default: "
+                        "the MAML checkpoint's value). Lower it to check the "
+                        "'pretrain+finetune' baseline's lr sensitivity.")
+    p.add_argument("--adapt-steps", type=int, default=None,
+                   help="override the number of adaptation steps n_inner "
+                        "(default: the MAML checkpoint's value).")
+    p.add_argument("--obs-noise-scale", type=float, default=0.0,
+                   help="observation-noise scale for the final-model test "
+                        "(0 = noise-free, clean structural comparison; e.g. "
+                        "2.0 = same noisy footing as training / deployment). "
+                        "Applied to both adaptation and eval roll-outs, with "
+                        "identical noise realisations across the 3 controllers.")
     p.add_argument("--out", type=str, default=None,
                    help="output figure path (default: next to the MAML ckpt)")
     return p.parse_args()
@@ -231,6 +255,14 @@ def main():
     mck = torch.load(args.maml_ckpt, map_location="cpu", weights_only=False)
     bck = torch.load(args.baseline_ckpt, map_location="cpu", weights_only=False)
     cfg = EvalCfg(mck)
+    if args.adapt_lr is not None:
+        cfg.lr_inner = args.adapt_lr
+    if args.adapt_steps is not None:
+        cfg.n_inner = args.adapt_steps
+    if args.obs_noise_scale > 0:
+        cfg.obs_noise = C.OBS_NOISE_STD * args.obs_noise_scale
+    print(f"[cfg] obs_noise_scale={args.obs_noise_scale} "
+          f"({'NOISY test' if args.obs_noise_scale > 0 else 'noise-free test'})")
     pol_m = _policy(mck, cfg.hidden)
     pol_b = _policy(bck, cfg.hidden)
 

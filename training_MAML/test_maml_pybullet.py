@@ -316,6 +316,7 @@ def run_sim(args, policy, theta_adapt, m_extra, r_offset, device: str):
     log_rpms = np.zeros((n_steps, 4))
     log_thrust = np.zeros(n_steps)
     log_nn_cmd = np.zeros((n_steps, 4))
+    log_state12 = np.zeros((n_steps, 12))   # full NN state (Goffin order) per step
 
     action = np.full((1, 4), HOVER_RPM_TASK)
     START = time.time()
@@ -331,10 +332,11 @@ def run_sim(args, policy, theta_adapt, m_extra, r_offset, device: str):
     for i in range(n_steps):
         obs, _, _, _, _ = env.step(action)
         pos, vel, rpy_deg, gyro_deg = obs_to_firmware_state(obs[0])
+        nn_state = obs_to_nn_state(obs[0])
+        log_state12[i] = nn_state
 
         # ---- NN query at NN_FREQ ----
         if i % nn_divider == 0:
-            nn_state = obs_to_nn_state(obs[0])
             a = query_maml_nn(policy, theta_adapt, nn_state, nn_target, device)
             thrust_cmd = float(a[0])
             roll_des   = float(a[1])
@@ -385,6 +387,7 @@ def run_sim(args, policy, theta_adapt, m_extra, r_offset, device: str):
 
     return dict(t=log_t, pos=log_pos, vel=log_vel, rpy=log_rpy,
                 rpms=log_rpms, thrust=log_thrust, nn_cmd=log_nn_cmd,
+                state12=log_state12,
                 target=nn_target, init_pos=init_pos,
                 m_extra=m_extra, r_offset=np.array(r_offset),
                 hover_thrust_u16=M_total_hover_u16)

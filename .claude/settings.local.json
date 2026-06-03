@@ -79,7 +79,16 @@
       "Bash(echo \"train EXIT=$?\")",
       "Bash(echo \"plot EXIT=$?\")",
       "Bash(echo \"=== CENTERED EXIT=$? ===\")",
-      "Bash(echo \"=== OFFSET EXIT=$? ===\")"
+      "Bash(echo \"=== OFFSET EXIT=$? ===\")",
+      "Bash(cp training_MAML/maml_nonlinear_h64_o1_n6_izar_offdirmag_ep500_map.png Report_Latex_Overleaf/images/maml_offdirmag_map.png)",
+      "Bash(cp training_MAML/maml_nonlinear_h64_o1_n6_izar_offdirmag_ep500_loss.png Report_Latex_Overleaf/images/maml_offdirmag_loss.png)",
+      "Bash(cp training_MAML/baseline_nonlinear_h64_n6_izar_offdirmag_ep500_loss.png Report_Latex_Overleaf/images/baseline_offdirmag_loss.png)",
+      "Bash(cp training_MAML/maml_offdirmag_gap_offset_M4held_noisy.png Report_Latex_Overleaf/images/maml_offdirmag_gap_noisy.png)",
+      "Bash(timeout 180 pdflatex -draftmode -interaction=nonstopmode -file-line-error main.tex)",
+      "Bash(echo \"rc=$?\")",
+      "Bash(timeout 200 pdflatex -draftmode -interaction=nonstopmode -file-line-error main.tex)",
+      "Bash(head -40 report_compare_centered_metrics.csv)",
+      "Bash(grep -rl \"maml_offdirmag_pybullet_centered\\\\|report_compare_centered\\\\|MAML adapted\\\\|tab:maml_sse\" --include=*.py .)"
     ]
   }
 }

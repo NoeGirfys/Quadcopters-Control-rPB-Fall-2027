@@ -2238,9 +2238,351 @@ of Section~\ref{sec:circle_simreal} identified as the dominant residual gap.
 % =====================================================
 \newpage
 \section{MAML for Offset Mass Compensation}\label{sec:maml_offset}
+
+The regulation controller of Section~\ref{sec:nn_pid_arch} was trained for a
+single, nominal vehicle. This section asks whether meta-learning can make that
+hybrid controller \emph{quickly adaptable} to a family of vehicles that differ
+by an attached offset mass, using the Model-Agnostic Meta-Learning algorithm
+recalled in Section~\ref{sec:maml_bg}. The disturbance, the training set-up and
+the comparison against a jointly-trained baseline are described in turn, and the
+section closes with a discussion of why the benefit of meta-learning is real but
+bounded by the integral action of the firmware cascade.
+
 \subsection{Task Definition}\label{sec:maml_task}
+
+\subsubsection*{Disturbance: an offset point mass}
+
+The disturbance is a point mass $m$ rigidly attached to the airframe at a
+body-frame position $\mathbf{r}_o$, on top of the nominal drone of mass $M_b$
+and inertia tensor $\mathbf{I}_0$ taken about the geometric centre
+(Section~\ref{sec:dynamics}). The attachment modifies three rigid-body
+parameters that enter the nonlinear model, all of them obtained analytically
+from the parallel-axis (Steiner) theorem:
+\begin{align}
+    M           \;&=\; M_b + m,
+    \label{eq:offset_mass}\\
+    \mathbf{r}_c \;&=\; \frac{m}{M}\,\mathbf{r}_o,
+    \label{eq:offset_rcom}\\
+    \mathbf{I}  \;&=\; \mathbf{I}_0
+        + M_b\bigl(\|\mathbf{r}_c\|^2 \mathbf{1}_3 - \mathbf{r}_c\mathbf{r}_c^\top\bigr)
+        + m\bigl(\|\mathbf{s}\|^2 \mathbf{1}_3 - \mathbf{s}\mathbf{s}^\top\bigr),
+    \qquad \mathbf{s} = \mathbf{r}_o - \mathbf{r}_c.
+    \label{eq:offset_inertia}
+\end{align}
+Equation~\eqref{eq:offset_mass} is the new total mass;
+\eqref{eq:offset_rcom} is the shift of the centre of mass away from the
+geometric centre to $\mathbf{r}_c$ in the body frame; and
+\eqref{eq:offset_inertia} is the inertia tensor expressed about that new
+centre of mass --- the original body inertia translated to $\mathbf{r}_c$
+plus the point-mass contribution at distance $\mathbf{s}$. The continuous
+equations of motion of Section~\ref{sec:dynamics} retain their form, but
+with the three substitutions $M_b\!\to\!M$, $\mathbf{I}_0\!\to\!\mathbf{I}$
+and the motor lever arms $\mathbf{p}_i\!\to\!\mathbf{p}_i-\mathbf{r}_c$, so
+that the contribution of motor $i$ to the body torque becomes
+$(\mathbf{p}_i-\mathbf{r}_c)\times F_i\,\hat{\mathbf{z}}_B$. The crucial
+consequence appears in the rotational equation: four equal motor thrusts no
+longer cancel but sum to $-4F\,(\mathbf{r}_c \times \hat{\mathbf{z}}_B)$, a
+constant moment --- physically, the displaced centre of mass that the
+attitude/rate cascade must permanently counter with differential thrust.
+
+These modified equations are used \emph{everywhere} an offset mass appears
+in this work. They are integrated through the differentiable roll-out used
+for training (Section~\ref{sec:bptt}), so that the BPTT gradient sees the
+Steiner-corrected inertia and the shifted lever arms at every step; and they
+drive the closed-loop simulator on which the trained controllers are
+evaluated. The latter was obtained by \emph{extending}
+\texttt{gym-pybullet-drones} (Section~\ref{sec:gym_pybullet}) with a new
+\texttt{DYN\_OFFSET} physics mode: a variant of the existing \texttt{DYN}
+mode patched to integrate equations~\eqref{eq:offset_mass}--\eqref{eq:offset_inertia}
+together with the shifted motor lever arms, paired with a
+\texttt{set\_offset\_mass}$(m,\mathbf{r}_o)$ method that registers the
+attached payload on a drone instance. The MAML controller is therefore
+trained and tested on the \emph{same} offset-mass dynamics.
+
+This differs from the wind disturbance studied by Goffin~\cite{goffin2026};
+an offset mass was chosen because, unlike a controlled airflow, it is a
+\emph{repeatable and physically well-defined} perturbation that can in
+principle be reproduced on the real platform by taping a known mass at a
+known location.
+
+\subsubsection*{A task: a distribution over 7-D data points}
+
+A \emph{task} is a joint distribution over the variables that fully specify
+one offset-mass roll-out. Each sample drawn from a task is a 7-D data point
+\[
+    \bigl(\underbrace{x_0,\, y_0,\, z_0}_{\text{drone start}}\;,\;
+          \underbrace{r_{o,x},\, r_{o,y},\, r_{o,z}}_{\text{mass position}}\;,\;
+          \underbrace{m}_{\text{magnitude}}\bigr),
+\]
+which fixes the offset-mass parameters $(\mathbf{r}_o, m)$ of
+equations~\eqref{eq:offset_mass}--\eqref{eq:offset_inertia} together with the
+initial drone state used to integrate the resulting dynamics. The three
+blocks are drawn independently:
+\begin{itemize}\itemsep1pt
+    \item the \textbf{starting position} $(x_0, y_0, z_0)$ is uniform in a
+    cube of half-side $h$ about the regulation setpoint;
+    \item the \textbf{mass position} $\mathbf{r}_o$ is drawn from an
+    isotropic 3-D Gaussian of standard deviation $\sigma_p$, centred on a
+    mean position $\boldsymbol{\mu}_p$;
+    \item the \textbf{mass magnitude} $m$ is drawn from a 1-D Gaussian
+    $\mathcal{N}(\mu_m, \sigma_m^2)$, clamped to be non-negative.
+\end{itemize}
+
+\textbf{Training task set.} The set used in the rest of this section crosses
+three Gaussians for the mass position --- centred on the motors $M_1$, $M_2$
+and $M_3$, each with a standard deviation $\sigma_p = 3\,\mathrm{mm}$ ---
+with two magnitude Gaussians, $\mathcal{N}(3\,\mathrm{g}, (0.5\,\mathrm{g})^2)$
+and $\mathcal{N}(6\,\mathrm{g}, (0.5\,\mathrm{g})^2)$, giving six tasks. We choose $h = 0.2\,\mathrm{m}$ for all six tasks.
+Figure~\ref{fig:maml_taskmap} shows the
+sampled task set --- the per-task mass attachment positions and the common
+starting-position cube --- drawn once at the beginning of the run and held
+fixed throughout the training. Concretely, this means that the data points of
+Figure~\ref{fig:maml_schematic} are fixed: at every epoch each task is adapted and
+evaluated on exactly the same samples --- $100$ inner (support) points and $50$
+outer (query) points per task --- rather than on a freshly resampled batch. The
+natural held-out task is the
+fourth motor $M_4$ at an intermediate magnitude $\sim\!5\,\mathrm{g}$
+(a direction never trained, a magnitude between the two trained values).
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.95\textwidth]{images/maml_offdirmag_map.png}
+    \caption{Composite training task set, sampled once and held fixed for the
+    run. Left: the body-frame attachment positions of the six tasks, one
+    colour per task; marker size encodes the magnitude ($3$ or
+    $6\,\mathrm{g}$), and the dotted circles around each motor show the
+    $1\sigma$/$3\sigma$ contours of the per-motor Gaussian with $\sigma_p =
+    3\,\mathrm{mm}$. The fourth motor $M_4$ is marked but unused in training.
+    Right: the drone starting positions, drawn uniformly in the eight octants
+    of a cube of half-side $h = 0.2\,\mathrm{m}$ about the setpoint, common
+    to every task.}
+    \label{fig:maml_taskmap}
+\end{figure}
+
+\subsubsection*{Why this axis, and what the inner loop already handles}
+
+The choice of \emph{direction $\times$ magnitude} as the task axis follows
+directly from the structure of the hybrid controller. The firmware attitude and
+attitude-rate loops are integral controllers
+(Section~\ref{sec:cascade_pid}): at the setpoint they integrate away the
+\emph{constant} torque produced by the offset mass, whatever its direction, so a
+static offset is largely rejected by the inner loop without any action from the
+learned outer policy. What a single fixed outer policy \emph{cannot} absorb are
+the two effects that the network alone controls: the transient roll/pitch
+feedforward, which depends on the offset \emph{direction} and matters during the
+manoeuvre before the integrators have wound up, and the collective thrust, which
+has no integrator (the network replaced the velocity loop,
+Section~\ref{sec:nn_pid_arch}) and depends on the payload \emph{magnitude}.
+Crossing the two axes therefore targets precisely the residual that
+meta-learning can exploit. Magnitudes are kept at or below $6\,\mathrm{g}$:
+beyond roughly $8\,\mathrm{g}$ on a motor arm, the weight and gravity torque
+together drive a motor into the power-distribution saturation
+(Section~\ref{sec:cascade_pid}), a regime no outer policy can recover.
+
+\subsubsection*{Deployment task: a centred payload}
+
+As anticipated above, the natural held-out target would have been the fourth
+motor $M_4$; on the real platform, however, it proved far simpler to fix a known
+mass at the geometric centre of the drone than to attach it to a specific motor
+arm. The trained controllers are therefore evaluated --- and would be deployed
+--- on this deliberately different, simpler payload: a mass at the drone's
+geometric centre, of variable magnitude. This is in fact precisely the strength
+of meta-learning: MAML was trained to adapt to \emph{any} task of this family ---
+an offset mass of arbitrary direction and magnitude --- so a centred payload,
+although never seen during training, is just another such task, and a few-shot
+adaptation step suffices to specialise the meta-initialisation to it. A
+centred mass is trivially reproducible (a known weight fixed under the hull at
+the centre of mass) and, lacking a lever arm, it produces no gravity torque, so
+the saturation that caps an off-centre mass near $8\,\mathrm{g}$ no longer
+applies and payloads up to $\sim16\,\mathrm{g}$ ($\sim55\%$ of the bare mass)
+can be flown. It is moreover a genuine out-of-distribution test: the centred
+``direction'' was never trained, and the magnitudes reach well beyond the
+$3$--$6\,\mathrm{g}$ training range. Section~\ref{sec:maml_results} therefore
+asks whether the offset-trained meta-initialisation, adapted few-shot, handles
+this heavier centred payload better than the joint baseline and than the
+firmware cascade itself.
+
 \subsection{Training}\label{sec:maml_training}
+
+Both controllers are trained on the \emph{same} six-task set, with the same
+differentiable roll-out, cost~\eqref{eq:reg_cost}, curriculum reset and
+observation noise as the regulation policy of Section~\ref{sec:nn_training}; the
+only difference is the meta-objective. The task set (attachment positions,
+magnitudes and initial states) is sampled once from a single configuration file
+and is bit-identical between the two runs, so the comparison is exact.
+
+\textbf{MAML.} Meta-training follows Section~\ref{sec:maml_bg}: at every epoch
+each task is adapted by a single inner gradient step (inner learning rate
+$5\!\times\!10^{-2}$) on a $K=5$ support roll-out, and the meta-parameters are
+updated by Adam (outer learning rate $3\!\times\!10^{-4}$) on the post-adaptation
+query loss, for $500$ epochs. \textbf{Joint baseline.} The baseline minimises the
+\emph{average} task loss over the same six tasks (the joint-training reference of
+Section~\ref{sec:maml_bg}); at test time it is given the \emph{identical}
+$K$-shot adaptation as MAML, so that any difference reflects the initialisation
+alone.
+
+Figure~\ref{fig:maml_convergence} overlays the two trainings. For MAML, the
+post-adaptation (outer / meta) loss stays consistently below the pre-adaptation
+(inner) loss at every epoch --- the signature that a single gradient step from
+the meta-initialisation genuinely improves the policy --- and converges to a
+plateau alongside the baseline's train and eval losses. The held-out target
+loss is deliberately \emph{not} overlaid: during training it is evaluated on a
+noise-free roll-out whereas the training losses are computed under observation
+noise, so the two live on different footings; the held-out comparison is instead
+carried out on the final models, under matched noisy conditions, in
+Section~\ref{sec:maml_results}.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{images/maml_offdirmag_convergence.png}
+    \caption{Training convergence (log scale). MAML inner (pre-adaptation, blue)
+    and outer (post-adaptation / meta, red) losses, with the joint baseline's
+    train (green) and eval (dashed) losses. The meta loss lies below the inner
+    loss throughout --- one few-shot step improves the policy --- and MAML and
+    baseline settle to comparable plateaus after the early curriculum transient.}
+    \label{fig:maml_convergence}
+\end{figure}
+
+\subsubsection*{Few-shot adaptation curve}
+
+To make the role of adaptation explicit, Figure~\ref{fig:maml_adaptcurve} plots
+the held-out task loss as a function of the number of $K$-shot gradient updates
+(at the checkpoint's inner learning rate), for both the MAML meta-initialisation
+and the joint baseline, on a centred $10\,\mathrm{g}$ payload. The two starting
+points are telling: the MAML init is a poor \emph{zero-shot} controller (it is
+trained to be a launch-point, not a finished policy) but a single update drops
+its loss far below the baseline's; the joint baseline is a good zero-shot
+controller that the same update \emph{degrades}, because that step --- tuned for
+MAML's single inner iteration --- over-fits the five support points of a policy
+not trained for it. The inner learning rate being calibrated for exactly one
+step, iterating it does not improve monotonically (it oscillates); the operating
+point is thus the single trained step, at which MAML reaches a loss about half
+the baseline's.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{images/maml_offdirmag_adaptation.png}
+    \caption{Held-out task loss versus number of $K$-shot gradient updates
+    (inner learning rate from the checkpoint), centred $10\,\mathrm{g}$ payload.
+    MAML (red) starts high but a single step reaches its minimum, well below the
+    baseline (blue); the baseline starts low (good zero-shot) and is harmed by
+    the MAML-tuned step. The dotted line marks the trained, deployed single-step
+    operating point.}
+    \label{fig:maml_adaptcurve}
+\end{figure}
+
 \subsection{Results}\label{sec:maml_results}
+
+The final controllers are flown in the validated closed-loop simulator (the
+\texttt{DYN\_OFFSET} dynamics driven by the Python firmware cascade,
+Section~\ref{sec:firmware_integration}) on the deployment task of
+Section~\ref{sec:maml_task}: a regulation from $(0.5,-0.5,0.5)\,\mathrm{m}$ to
+the setpoint $(0,0,1)\,\mathrm{m}$, carrying a centred payload swept from $4$ to
+$16\,\mathrm{g}$. Four controllers are compared:
+\begin{itemize}\itemsep1pt
+  \item \textbf{firmware PID} --- the complete four-loop cascade
+    (Section~\ref{sec:cascade_pid}), no network and no adaptation; it keeps the
+    velocity-$z$ integrator that the network replaced, so it rejects the payload
+    weight on its own;
+  \item \textbf{baseline NN} --- the jointly-trained network, deployed as-is;
+  \item \textbf{baseline NN, adapted} --- the same network after the $K$-shot
+    fine-tune;
+  \item \textbf{MAML, adapted} --- the meta-initialisation after the
+    \emph{identical} $K$-shot adaptation.
+\end{itemize}
+The two adapted controllers use the few-shot protocol of
+Section~\ref{sec:maml_training}, with the support roll-outs sampled at the test
+payload (and, for a given payload, on the \emph{same} support points for both,
+so the only difference is the initialisation). All four are scored by two
+measures: the steady-state position error (mean over the last second) and the
+cumulative trajectory cost over the whole flight (the training
+cost~\eqref{eq:reg_cost}, sampled at $\mathrm{NN\_FREQ}$).
+Figure~\ref{fig:maml_pybullet} shows the position traces and
+Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} the two measures.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/maml_offdirmag_pybullet_centered.png}
+    \caption{PyBullet regulation from $(0.5,-0.5,0.5)$ to $(0,0,1)\,\mathrm{m}$
+    with a centred payload (rows: $4$/$8$/$12$/$16\,\mathrm{g}$; columns:
+    $x$/$y$/$z$). Firmware PID (green), baseline NN (grey), baseline NN adapted
+    (blue), MAML adapted (red); dotted lines are the setpoints. MAML tracks the
+    setpoint tightly at every payload; the firmware PID overshoots in the
+    transient and the adapted baseline degrades at $16\,\mathrm{g}$
+    (it overshoots in $z$ to $\sim1.2\,\mathrm{m}$).}
+    \label{fig:maml_pybullet}
+\end{figure}
+
+\begin{table}[h]
+    \centering
+    \caption{Steady-state position error [cm] (mean over the last second of the
+    flight; lower is better). Best per row in bold.}
+    \label{tab:maml_sse}
+    \small
+    \begin{tabular}{r cccc}
+        \toprule
+        Payload [g] & firmware PID & baseline NN & baseline NN adapted & MAML adapted \\
+        \midrule
+        $4$  & $2.87$ & $2.97$ & $5.26$  & $\mathbf{2.12}$ \\
+        $8$  & $4.00$ & $2.99$ & $6.91$  & $\mathbf{2.04}$ \\
+        $12$ & $5.06$ & $2.79$ & $9.01$  & $\mathbf{1.37}$ \\
+        $16$ & $6.03$ & $1.99$ & $21.12$ & $\mathbf{1.30}$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}[h]
+    \centering
+    \caption{Cumulative trajectory cost over the whole flight (training
+    cost~\eqref{eq:reg_cost}, lower is better). Absolute values are not
+    comparable to the training loss (PyBullet physics, different horizon) but
+    \emph{are} comparable across controllers. Best per row in bold.}
+    \label{tab:maml_tloss}
+    \small
+    \begin{tabular}{r cccc}
+        \toprule
+        Payload [g] & firmware PID & baseline NN & baseline NN adapted & MAML adapted \\
+        \midrule
+        $4$  & $484.8$ & $487.7$ & $530.2$ & $\mathbf{474.1}$ \\
+        $8$  & $521.0$ & $492.5$ & $556.3$ & $\mathbf{480.1}$ \\
+        $12$ & $572.1$ & $514.4$ & $535.9$ & $\mathbf{505.6}$ \\
+        $16$ & $714.5$ & $588.6$ & $927.8$ & $\mathbf{582.1}$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\subsubsection*{Reading the comparison}
+
+MAML-adapted is the best controller on both measures at every payload. Its
+steady-state error stays at $1$--$2\,\mathrm{cm}$ while the others grow with the
+load: at $12\,\mathrm{g}$ it holds the setpoint to $1.4\,\mathrm{cm}$, against
+$2.8\,\mathrm{cm}$ for the deployed baseline network (a factor of two) and
+$5\,\mathrm{cm}$ for the firmware cascade; at $16\,\mathrm{g}$,
+$1.3\,\mathrm{cm}$ against $6\,\mathrm{cm}$ for the firmware PID. Two failure
+modes are visible in Figure~\ref{fig:maml_pybullet}: the firmware PID overshoots
+during the transient --- its velocity-$z$ integrator lags the heavier payload
+before winding up --- and the identically fine-tuned baseline degrades sharply
+at $16\,\mathrm{g}$ ($21\,\mathrm{cm}$ error, a visible $z$ overshoot),
+confirming that the inner step tuned for MAML is destructive when applied to the
+joint initialisation. On the cumulative cost the ordering is the same, MAML
+lowest at every payload, but the margins are tighter: the common transport from
+the start to the setpoint dominates the integral, so the steady-state error is
+the more discriminating measure of payload rejection.
+
+\subsubsection*{Why the advantage is bounded, and what it means}
+
+The full firmware cascade is a strong, non-learning reference: at the lightest
+payload it is within a centimetre of the learned controllers, confirming that
+its integral loops already reject a steady centred weight without any
+adaptation. MAML's edge therefore \emph{grows with the payload}, precisely where
+the firmware integrator's transient lag and the fixed network's hover-thrust
+mismatch hurt most, and where a single adaptation step lets the meta-init set the
+right thrust bias. The benefit of meta-learning on this hybrid platform is thus a
+genuine but bounded one --- the cascade's integral action keeps a non-adaptive
+controller competitive in the easy regime --- yet in the heavier,
+out-of-distribution payloads that matter for a real delivery task, the
+meta-learned controller adapts in a single few-shot step to an accuracy that
+neither the jointly-trained network nor the complete firmware cascade attains.
 
 % =====================================================
 \newpage
