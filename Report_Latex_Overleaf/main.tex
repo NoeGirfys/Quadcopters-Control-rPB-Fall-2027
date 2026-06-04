@@ -2404,10 +2404,14 @@ firmware cascade itself.
 
 \subsection{Training}\label{sec:maml_training}
 
-Both controllers are trained on the \emph{same} six-task set, with the same
+To assess what meta-learning actually brings, the MAML controller is compared
+against a jointly-trained baseline: a single policy trained to minimise the
+\emph{average} loss over the same task set, with no meta-objective (the
+joint-training reference of Section~\ref{sec:maml_bg}). The two controllers are
+trained on the \emph{same} six-task set, with the same
 differentiable roll-out, cost~\eqref{eq:reg_cost}, curriculum reset and
 observation noise as the regulation policy of Section~\ref{sec:nn_training}; the
-only difference is the meta-objective. The task set (attachment positions,
+only difference is the training objective. The task set (attachment positions,
 magnitudes and initial states) is sampled once from a single configuration file
 and is bit-identical between the two runs, so the comparison is exact.
 
@@ -2415,21 +2419,19 @@ and is bit-identical between the two runs, so the comparison is exact.
 each task is adapted by a single inner gradient step (inner learning rate
 $5\!\times\!10^{-2}$) on a $K=5$ support roll-out, and the meta-parameters are
 updated by Adam (outer learning rate $3\!\times\!10^{-4}$) on the post-adaptation
-query loss, for $500$ epochs. \textbf{Joint baseline.} The baseline minimises the
-\emph{average} task loss over the same six tasks (the joint-training reference of
-Section~\ref{sec:maml_bg}); at test time it is given the \emph{identical}
-$K$-shot adaptation as MAML, so that any difference reflects the initialisation
-alone.
+query loss, for $500$ epochs. \textbf{Joint baseline.} The baseline instead pools
+the $100$ support points of each of the six tasks into a single set of $600$ data
+points per epoch and minimises their average loss, with no inner/outer split.
+These are the \emph{same} fixed data points MAML trains on, so the comparison
+between the two is fair. At test time the baseline
+is given the \emph{identical} $K$-shot adaptation as MAML, so that any difference
+reflects the initialisation alone.
 
 Figure~\ref{fig:maml_convergence} overlays the two trainings. For MAML, the
 post-adaptation (outer / meta) loss stays consistently below the pre-adaptation
 (inner) loss at every epoch --- the signature that a single gradient step from
 the meta-initialisation genuinely improves the policy --- and converges to a
-plateau alongside the baseline's train and eval losses. The held-out target
-loss is deliberately \emph{not} overlaid: during training it is evaluated on a
-noise-free roll-out whereas the training losses are computed under observation
-noise, so the two live on different footings; the held-out comparison is instead
-carried out on the final models, under matched noisy conditions, in
+plateau alongside the baseline's train and eval losses. The held-out target loss is carried out on the final models, in
 Section~\ref{sec:maml_results}.
 
 \begin{figure}[H]
