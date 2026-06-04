@@ -2498,7 +2498,7 @@ payload (and, for a given payload, on the \emph{same} support points for both,
 so the only difference is the initialisation). All four are scored by two
 measures: the steady-state position error (mean over the last second) and the
 cumulative trajectory cost over the whole flight (the training
-cost~\eqref{eq:reg_cost}, sampled at $\mathrm{NN\_FREQ}$).
+cost~\eqref{eq:reg_cost}, sampled at 100 Hz, the neural network's frequency).
 Figure~\ref{fig:maml_pybullet} shows the position traces and
 Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} the two measures.
 
@@ -2576,7 +2576,17 @@ the more discriminating measure of payload rejection.
 The full firmware cascade is a strong, non-learning reference: at the lightest
 payload it is within a centimetre of the learned controllers, confirming that
 its integral loops already reject a steady centred weight without any
-adaptation. MAML's edge therefore \emph{grows with the payload}, precisely where
+adaptation. Just as telling is the \emph{un-adapted} baseline network, which is
+in fact MAML's nearest rival: deployed as-is it trails by under a centimetre of
+steady-state error at the lighter payloads and by only a few percent of
+cumulative cost throughout, and on the held-out loss of
+Figure~\ref{fig:maml_adaptcurve} its zero-shot value ($\approx\!29$) sits only
+just above MAML's one-shot optimum ($\approx\!26$). The wide gaps in
+Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} are therefore against the
+firmware PID and the \emph{counter-productively} adapted baseline --- not against
+the joint network deployed as it should be: against that well-deployed baseline,
+MAML's few-shot advantage is real but slim in the easy regime. MAML's edge
+therefore \emph{grows with the payload}, precisely where
 the firmware integrator's transient lag and the fixed network's hover-thrust
 mismatch hurt most, and where a single adaptation step lets the meta-init set the
 right thrust bias. The benefit of meta-learning on this hybrid platform is thus a

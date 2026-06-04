@@ -88,7 +88,10 @@
       "Bash(echo \"rc=$?\")",
       "Bash(timeout 200 pdflatex -draftmode -interaction=nonstopmode -file-line-error main.tex)",
       "Bash(head -40 report_compare_centered_metrics.csv)",
-      "Bash(grep -rl \"maml_offdirmag_pybullet_centered\\\\|report_compare_centered\\\\|MAML adapted\\\\|tab:maml_sse\" --include=*.py .)"
+      "Bash(grep -rl \"maml_offdirmag_pybullet_centered\\\\|report_compare_centered\\\\|MAML adapted\\\\|tab:maml_sse\" --include=*.py .)",
+      "Bash(grep -q \"MAML:\" \"C:\\\\Users\\\\niels\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-niels-Desktop-Semester-Project\\\\a2d519c0-789d-4f8a-95e1-4ea397b36edb\\\\tasks\\\\bfi0bo5gu.output\")",
+      "Bash(rm -f _tmp_offdir_convergence.png _tmp_offdir_adaptation.png)",
+      "Bash(ls _tmp_offdir*)"
     ]
   }
 }
