@@ -660,20 +660,15 @@ retargeted to an arbitrary setpoint (Section~\ref{sec:nn_pid_arch}).
 
 \begin{rmk}
 The angular part of the observation~\eqref{eq:observation} consists of the body rates
-$(p, q, r)$, \emph{not} the Euler-angle derivatives $(\dot\phi, \dot\theta, \dot\psi)$.
-This is a deliberate and consistent choice across every regime in which the policy is
-used. In simulation --- both during training and during closed-loop evaluation --- the
-dynamics propagate $(p, q, r)$ as the genuine body-frame angular velocity through the
-rotational equations~\eqref{eq:euler_components}; when the policy is run inside
-\texttt{gym-pybullet-drones}, the world-frame angular velocity returned by the simulator
-is rotated into the body frame by $R^\top$ before being passed to the network. On the
-real Crazyflie, the corresponding three entries are filled directly from the raw
-gyroscope, which natively measures body rates. The policy is therefore always presented
-with the same physical quantity. As shown in Section~\ref{sec:dynamics}, near hover
-$\omega_B \simeq \dot{\Phi}$, so this distinction has no practical effect in the operating
-regime of a regulation task; it is nonetheless essential that training and deployment
-\emph{agree} on it, since any mismatch here would translate directly into a sim-to-real
-discrepancy. The Euler angles $(\phi, \theta, \psi)$ themselves enter the observation
+$(p, q, r)$, \emph{not} the Euler-angle derivatives $(\dot\phi, \dot\theta, \dot\psi)$, for
+a simple reason: the real Crazyflie's gyroscope natively measures body rates, so feeding the
+network $(p, q, r)$ is what makes the simulated and the real observation the \emph{same}
+physical signal. In simulation these body rates come straight from the dynamics of
+Section~\ref{sec:dynamics}. Near hover the distinction is in any case immaterial, since
+$\omega_B \simeq \dot{\Phi}$ there (Section~\ref{sec:dynamics}) --- indeed the approximate
+training model treats the two as one and the same variable --- but it remains essential that
+training and deployment \emph{agree} on the convention, since any mismatch would translate
+directly into a sim-to-real discrepancy. The Euler angles $(\phi, \theta, \psi)$ themselves enter the observation
 unchanged; the only convention adjustment concerns the pitch axis, as the Crazyflie
 firmware reports a positive pitch for a nose-up attitude whereas the simulator adopts the
 opposite sign --- the pitch angle $\theta$ and pitch rate $q$ are therefore negated when
@@ -710,8 +705,8 @@ Section~\ref{sec:cascade_pid} (in particular $|\phi^{\mathrm{sp}}|,
 |\theta^{\mathrm{sp}}| \le 20^\circ$).
 
 This hybrid neural-network/PID interface is shared by both controllers studied in this
-report --- the classic regulation policy of Section~\ref{sec:nn_pid_arch} and the
-meta-learned policy of Section~\ref{sec:maml_bg} --- and is identical in simulation and on
+report --- the classic regulation policy of Section~\ref{sec:regulation} and the
+meta-learned policy of Section~\ref{sec:maml_offset} --- and is identical in simulation and on
 hardware. The detailed network architecture realising the
 mapping~\eqref{eq:policy}--\eqref{eq:action} is presented in
 Section~\ref{sec:nn_pid_arch}.
@@ -1825,7 +1820,7 @@ training.
 
 % =====================================================
 \newpage
-\section{Learning Classic Regulation}
+\section{Learning Classic Regulation}\label{sec:regulation}
 \subsection{NN-PID Hybrid Architecture}\label{sec:nn_pid_arch}
 
 The regulation controller realises the hybrid neural-network/PID interface
