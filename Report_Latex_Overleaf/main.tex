@@ -54,20 +54,23 @@
     \vspace{0.3cm}
     {\LARGE \bfseries ÉCOLE POLYTECHNIQUE\\
     FÉDÉRALE DE LAUSANNE\par}
-    \vspace{1cm}
-    
+    \vspace{0.6cm}
+
     \noindent\rule{\textwidth}{0.4pt}
     {\LARGE \bfseries Meta-Learning NN-control\\on Crazyflie Quadcopter\par}
-    
+
     \noindent\rule{\textwidth}{0.4pt}
-    \vspace{1cm}
-    
+    \vspace{0.6cm}
+
     {\Large \bfseries SEMESTER PROJECT\par}
-    \vspace{0.5cm}
-    
+    \vspace{0.4cm}
+
     {\large \bfseries DECODE \par}
-    \vspace{2 cm}
-    
+    \vspace{0.5cm}
+
+    \includegraphics[width=0.55\textwidth]{images/image_garde_drone.png}
+    \vspace{0.6cm}
+
     \noindent
     \begin{minipage}[t]{0.5\textwidth}
         {\large \textit{Student:}\\
@@ -80,8 +83,8 @@
         {\large \textit{Professor:}\\
         G. Ferrari Trecate \par}
     \end{minipage}
-    \vspace{1.5cm}
-    
+    \vspace{1cm}
+
     {\large \textit{Supervisors:}\\
     Simone Baratto\\Nicolas Kirsch\\Daniele Martinelli}
     \vfill
@@ -154,7 +157,7 @@ on actual hardware. The contributions are as follows.
     \item \textbf{Simulation environment selection and validation.}
     The \texttt{gym-pybullet-drones} library~\cite{panerati2021} is adopted as the
     simulation backend and its physics modes are compared against Goffin's dynamics model
-    in open loop to verify consistency.
+    to verify consistency.
 
     \item \textbf{Crazyflie firmware integration.}
     The default PID controller provided by \texttt{gym-pybullet-drones} does not match
@@ -241,6 +244,23 @@ aligned with the $x_B$ and $y_B$ axes, the X-configuration places the motors at 
 from these axes, which is the standard Bitcraze layout for the Crazyflie. The translational
 dynamics are unaffected by this choice, but the expressions of the body torques in terms of
 the rotor thrusts differ and are derived below.
+
+\subsubsection*{State vector}
+
+Following Goffin~\cite{goffin2026} for consistency, the vehicle is described by the
+$12$-dimensional state vector
+\begin{equation}
+\mathbf{x} = \begin{bmatrix} x & \dot{x} & y & \dot{y} & z & \dot{z} &
+                              \phi & \dot{\phi} & \theta & \dot{\theta} &
+                              \psi & \dot{\psi} \end{bmatrix}^\top,
+\label{eq:state_vector}
+\end{equation}
+which stacks the inertial position and its rate with the ZYX Euler angles and their
+derivatives, and the control input is $\mathbf{u} = (F, \tau_x, \tau_y, \tau_z)^\top$. Note
+that the angular half of~\eqref{eq:state_vector} carries the Euler-angle rates
+$\dot{\Phi} = (\dot\phi, \dot\theta, \dot\psi)$ and \emph{not} the body rates
+$\omega_B = (p, q, r)$; the two coincide only near hover, a distinction made precise in the
+rotational-dynamics paragraph below.
 
 \subsubsection*{Translational dynamics}
 
@@ -357,7 +377,6 @@ I_x \dot{p} &= \tau_{Bx} - (I_z - I_y)\, q r, \label{eq:nl_p}\\
 I_y \dot{q} &= \tau_{By} - (I_x - I_z)\, p r, \label{eq:nl_q}\\
 I_z \dot{r} &= \tau_{Bz} - (I_y - I_x)\, p q, \label{eq:nl_r}
 \end{align}
-NEED TO CHANGE $\tau_{B..}$ because it is used at two places for two different things
 completed by an orientation kinematic relation that closes the system: either
 $\dot{\Phi} = W(\phi, \theta)^{-1} \omega_B$ from~\eqref{eq:kinematic} when the Euler angles
 are kept in the state vector, or the quaternion propagation law
@@ -368,7 +387,7 @@ at $\theta = \pm\pi/2$.
 
 \subsubsection*{Linearisation about hover}
 
-For control design and for comparison with Goffin's model, the system is linearised about
+For control design and for comparison with Goffin's model, the system can be linearised about
 the hovering equilibrium $\phi \simeq \theta \simeq 0$, $\psi = 0$ (without loss of
 generality), $\omega_B \simeq 0$ and $F_i = m g / 4$. Under the small-angle approximation
 $c_\alpha \simeq 1$, $s_\alpha \simeq \alpha$, the gyroscopic terms in~\eqref{eq:nl_p}--%
@@ -387,14 +406,9 @@ then reads
 \end{equation}
 which matches~\cite[Eqs.~(2.13)--(2.18)]{goffin2026} up to the sign of the $\ddot y$ equation
 that flips because of the left-handed vs.\ right-handed convention on the $y_B$ axis. The
-12-dimensional state vector
-\begin{equation}
-\mathbf{x} = \begin{bmatrix} x & \dot{x} & y & \dot{y} & z & \dot{z} &
-                              \phi & \dot{\phi} & \theta & \dot{\theta} &
-                              \psi & \dot{\psi} \end{bmatrix}^\top
-\end{equation}
-and the control input $\mathbf{u} = (F, \tau_x, \tau_y, \tau_z)^\top$ are kept as
-in~\cite{goffin2026} for consistency.
+state vector~\eqref{eq:state_vector} and the control input
+$\mathbf{u} = (F, \tau_x, \tau_y, \tau_z)^\top$ introduced above are those
+of~\cite{goffin2026}, kept for consistency.
 
 \subsubsection*{Discretisation and link to the simulator}
 
@@ -407,7 +421,7 @@ Euler scheme of step $T_s$:
 where $f(\cdot)$ collects~\eqref{eq:nl_x}--\eqref{eq:nl_r} together with the kinematic
 relation. Two important remarks must be made on the implementation:
 \begin{enumerate}
-    \item Goffin's simulator integrates the orientation directly through Euler angles, which
+    \item As seen before, Goffin's simulator integrates the orientation directly through Euler angles, which
     is equivalent to assuming $\omega_B \equiv \dot{\Phi}$. This shortcut is valid in
     near-hover regimes but introduces an error that grows with the magnitude of the
     Euler angles, and degenerates at $\theta = \pm\pi/2$ (gimbal lock).
@@ -438,9 +452,7 @@ relation. Two important remarks must be made on the implementation:
     \qquad \vartheta = \tfrac{T_s}{2}\|\omega_B\|,
     \label{eq:quat_update}
     \end{equation}
-    which is precisely the formula implemented in \texttt{\_integrateQ} (a factor $2$
-    appears explicitly in the source code to cancel the $\tfrac{1}{2}$ absorbed in the
-    local variable \texttt{lambda\_}$\, = \tfrac{1}{2}\Omega(\omega_B)$). The Euler angles
+    which is precisely the formula implemented in \texttt{DYN} dynamics of \texttt{gym-pybullet-drones}. The Euler angles
     are then recovered solely for the state output via \texttt{getEulerFromQuaternion}.
     A close inspection of the source code is required to confirm that this is the chosen
     convention, because the variable holding the angular velocity is misleadingly named
@@ -462,12 +474,20 @@ relation. Two important remarks must be made on the implementation:
     \end{equation*}
     and analogously for $(\omega_B, q)$. This scheme is known to preserve energy on long
     horizons for conservative rigid-body systems much better than the explicit Euler
-    discretisation~\eqref{eq:euler_discretization}. This is the physically correct choice
-    and is the one used throughout the remainder of this report. TODO WHEN BEGINNING SECTIONS
-    USING CODE: CHECK THAT INDEED WE USED THIS AND CHANGE THE SENTENCE IF NOT
+    discretisation~\eqref{eq:euler_discretization}.
 \end{enumerate}
-The quantitative impact of these modelling differences is investigated in the open-loop
-benchmark of Section~\ref{sec:dyn_comparison}.
+Both formulations appear in this work, in different roles. The differentiable roll-outs
+that \emph{train} the controllers (Sections~\ref{sec:nn_training}
+and~\ref{sec:maml_training}) integrate the approximate model of remark~(1): the body-rate
+dynamics~\eqref{eq:euler_components} with the orientation advanced by the near-hover update
+$\Phi_{k+1} = \Phi_k + T_s\,\omega_B$, i.e.\ Goffin's convention, which is light to
+back-propagate through the long unrolled horizon. Every closed-loop \emph{evaluation}, by
+contrast, is carried out in the more faithful \texttt{gym-pybullet-drones} \texttt{DYN}
+backend of remark~(2), with its exact quaternion kinematics
+(Sections~\ref{sec:firmware_integration},~\ref{sec:nn_sim_results}
+and~\ref{sec:maml_results}). The quantitative impact of the difference between the two is
+investigated in the open-loop benchmark of Section~\ref{sec:dyn_comparison}, and is small
+in the flight regime considered here.
 
 \subsection{Crazyflie Cascade PID Architecture}\label{sec:cascade_pid}
 
@@ -1811,8 +1831,8 @@ established in the background: the network substitutes for the position and
 velocity loops of the cascade and emits, at $100\,\mathrm{Hz}$, the
 velocity-loop setpoint $\mathbf{a}_k = (T, \phi^{\mathrm{sp}}, \theta^{\mathrm{sp}},
 r^{\mathrm{sp}})$ that the on-board attitude and attitude-rate loops then track at
-$500\,\mathrm{Hz}$ (Sections~\ref{sec:cascade_pid} and~\ref{sec:nn_policy}). We do
-not repeat the rationale for this choice --- the CRTP protocol exposes no
+$500\,\mathrm{Hz}$ (Sections~\ref{sec:cascade_pid} and~\ref{sec:nn_policy}). It is
+worth recalling the rationale for this choice: the CRTP protocol exposes no
 per-motor or rate-loop command, and the inner loop must run far faster than a
 network can be queried over radio (Section~\ref{sec:cascade_pid}). This section
 fixes instead the two points left open there: the concrete network that realises
@@ -1833,32 +1853,35 @@ Figure~\ref{fig:nn_pid_arch}.
         font=\small
     ]
         \node[nn]    (nn)   {MLP $\pi_\theta$\\$15\!\to\!64\!\to\!64\!\to\!4$};
-        \node[pid]   (att)  [right=20mm of nn]  {Attitude\\PID};
-        \node[pid]   (rate) [right=12mm of att] {Rate\\PID};
-        \node[plant] (mot)  [right=12mm of rate] {Power dist.\\$+$ motors};
-        \node[plant] (dyn)  [right=12mm of mot]  {Drone\\dynamics};
+        \node[pid]   (att)  [right=30mm of nn]  {Attitude\\PID};
+        \node[pid]   (rate) [right=14mm of att] {Rate\\PID};
+        \node[plant] (mot)  [right=24mm of rate] {Power dist.\\$+$ motors};
+        \node[plant] (dyn)  [right=14mm of mot]  {Drone\\dynamics};
 
         % input
-        \draw[<-] (nn.west) -- ++(-22mm,0)
+        \draw[<-] (nn.west) -- ++(-14mm,0)
             node[left, align=center] {state $\mathbf{o}_k$\\$+\,(\mathbf{p}^{\mathrm{sp}}-\hat{\mathbf{p}})$};
 
         % forward path
-        \draw[->] (nn)   -- node[above, align=center]{$\phi^{\mathrm{sp}},\theta^{\mathrm{sp}}$\\$r^{\mathrm{sp}}$} (att);
+        \draw[->] (nn)   -- (att);
+        \node[anchor=south west, inner sep=1.5pt] at ($(nn.east)+(4mm,0.8mm)$)
+            {$\phi^{\mathrm{sp}},\theta^{\mathrm{sp}},r^{\mathrm{sp}}$};
         \draw[->] (att)  -- node[above]{$\boldsymbol{\omega}_B^{\mathrm{sp}}$} (rate);
         \draw[->] (rate) -- node[above]{$u_\phi,u_\theta,u_\psi$} (mot);
-        \draw[->] (mot)  -- node[above]{$\omega_i$} (dyn);
+        \draw[->] (mot)  -- node[above, pos=0.78]{$\omega_i$} (dyn);
 
-        % thrust bypass (NN -> power distribution)
-        \draw[->] (nn.south) |- ($(mot.south)-(0,9mm)$) -| (mot.south)
-            node[pos=0.07, below]{$T$};
+        % thrust bypass: leaves the NN on the right (like the other setpoints),
+        % then routes under the firmware box and up into the power distribution
+        \draw[->] ($(nn.east)+(0,-4mm)$) -- node[below, pos=0.6]{$T$} ++(7mm,0)
+            |- ($(mot.south)-(0,9mm)$) -| (mot.south);
 
         % dashed box around the on-board inner loops
         \node[draw, dashed, rounded corners, fit=(att)(rate)(mot),
-              inner sep=5mm, label={[align=center]above:on-board firmware\\$500\,\mathrm{Hz}$}] {};
+              inner sep=5mm, label={above:on-board firmware, $500\,\mathrm{Hz}$}] {};
 
         % state feedback
-        \draw[->] (dyn.north) |- ($(nn.north)+(0,8mm)$) -- (nn.north)
-            node[pos=0.93, left]{$\hat{\mathbf{x}}$};
+        \draw[->] (dyn.north) |- ($(nn.north)+(0,16mm)$) -- (nn.north);
+        \node[left] at ($(nn.north)+(0,5mm)$) {$\hat{\mathbf{x}}$};
     \end{tikzpicture}}
     \caption{Hybrid NN--PID control loop. The learned MLP (red) replaces the
     outer position and velocity loops and is queried at $100\,\mathrm{Hz}$ on the
@@ -1889,8 +1912,7 @@ construction} that the commands never leave the firmware limits of
 Section~\ref{sec:cascade_pid}. The bias of the thrust output is moreover
 initialised so that the untrained network already emits the hover thrust with
 zero attitude command --- the policy therefore starts from a hovering behaviour
-rather than a free fall, which markedly stabilises the first training epochs
-(Section~\ref{sec:nn_training}). The whole network has fewer than $5\,500$
+rather than a free fall, which markedly stabilises the first training epochs. The whole network has fewer than $5\,500$
 trainable parameters, small enough to be evaluated comfortably within the
 $100\,\mathrm{Hz}$ budget and to be differentiated through thousands of times
 during training.
@@ -1920,9 +1942,10 @@ The network is trained exclusively to \emph{regulate to the origin}: throughout
 training the relative target in the input is the displacement from the current
 position to the origin. To make the same fixed policy fly to an arbitrary
 setpoint $\mathbf{p}^{\mathrm{sp}}$, the world frame is simply translated so that
-$\mathbf{p}^{\mathrm{sp}}$ becomes the origin. Concretely, both the position part
-of the state and the relative-target input are expressed as the offset
-$\hat{\mathbf{p}} - \mathbf{p}^{\mathrm{sp}}$, and the policy then drives this
+$\mathbf{p}^{\mathrm{sp}}$ becomes the origin. Concretely, the position part of
+the state is expressed as the offset $\hat{\mathbf{p}} - \mathbf{p}^{\mathrm{sp}}$
+and the relative-target input as its negation
+$\mathbf{p}^{\mathrm{sp}} - \hat{\mathbf{p}}$, and the policy then drives this
 shifted state to zero. The controller thus always ``sees'' itself regulating to
 the origin; only the coordinate origin moves. This is precisely the retargeting
 anticipated in Section~\ref{sec:nn_policy}, and it is what lets the real-world
@@ -1941,7 +1964,7 @@ schedule (Section~\ref{sec:cascade_pid}). This is the autoregressive limit of th
 concurrent analytic-policy-gradient scheme of Section~\ref{sec:bptt}, which gave
 the best regulation performance and is therefore the architecture retained here;
 the general $(12 + 3T)$-input, $4T$-output form collapses to the
-$15 \to 4$ network described above.
+$15 \to 4$ network described above ($T = 1$).
 
 \subsection{Training}\label{sec:nn_training}
 
@@ -1951,8 +1974,7 @@ roll-out is minimised by back-propagation through the unrolled
 network--PID--dynamics chain (Section~\ref{sec:bptt}). This section fixes the
 three remaining ingredients that were deliberately left open earlier: the task,
 the concrete stage cost $\ell(\cdot)$, and the optimisation set-up --- including
-the observation noise that turned out to matter most for the transfer to
-hardware.
+the observation noise.
 
 \subsubsection*{Task and roll-out}
 
@@ -1964,8 +1986,9 @@ initial state has zero velocity and level attitude. From each, a
 $2\,\mathrm{s}$ roll-out is simulated: the network is queried at
 $100\,\mathrm{Hz}$ ($N = 200$ steps) and each query drives five
 $500\,\mathrm{Hz}$ steps of the firmware attitude and rate loops on the
-differentiable \texttt{DYN} dynamics (Section~\ref{sec:dynamics}), for a total
-of $1000$ integration steps per roll-out.
+differentiable near-hover dynamics of Section~\ref{sec:dynamics} (the approximate
+model, with the orientation advanced as $\Phi_{k+1} = \Phi_k + T_s\,\omega_B$),
+for a total of $1000$ integration steps per roll-out.
 
 \subsubsection*{Cost function}
 
@@ -2028,36 +2051,30 @@ hyper-parameters are collected in Table~\ref{tab:nn_hyperparams}.
 
 \subsubsection*{Observation noise: domain randomisation}
 
-A single addition to the roll-out proved decisive for the transfer to hardware:
-\emph{observation noise}. At every query the network is fed the state corrupted
-by zero-mean Gaussian noise, while the dynamics keep integrating the
-\emph{true} state; the policy must therefore learn to regulate from a noisy,
+A final ingredient is added to the roll-out to bring the training conditions
+closer to the real hardware: \emph{observation noise}. At every query the network
+is fed a copy of the state corrupted by zero-mean Gaussian noise, whereas the
+simulator keeps integrating the dynamics on the \emph{true}, un-noised state ---
+that is, the noise perturbs only what the controller \emph{sees} at its input,
+not the physics itself, exactly as an imperfect on-board state estimate would on
+the real drone. The policy must therefore learn to regulate from a noisy,
 imperfect estimate rather than from the exact state. The per-channel standard
 deviations are $1\,\mathrm{cm}$ on position, $5\,\mathrm{cm/s}$ on velocity,
 $2^\circ$ on attitude and $10^\circ/\mathrm{s}$ on the body rates, all scaled by
-a factor of $2$ for the reported model. This is a deliberate, if deliberately
-crude, model of the on-board state estimate that the policy will face on the
-real drone: as quantified in Section~\ref{sec:circle_simreal}, the dominant
-unmodelled part of the sim-to-real gap is exactly this stochastic estimation
-noise. Training the policy to be insensitive to it markedly improved both the
-convergence of the optimisation and, more importantly, the behaviour observed on
-the real platform; the noiseless variant, while reaching a comparable simulated
-cost, transferred visibly worse and is not used. The penalty in nominal
-(noise-free) simulated accuracy is negligible, which is why the noisy policy is
-adopted as \emph{the} regulation controller for the rest of this chapter.
+a factor of $2$ for the reported model.
 
 \subsubsection*{Results}
 
 Figure~\ref{fig:nn_train_loss} shows the training loss settling to a low
 plateau --- after an early transient in which the still-untrained policy
 briefly lets some drones diverge before the curriculum reins them in --- with
-the mean terminal position error following it down to the centimetre level. Evaluated open-loop on the $27$ training initial states, the
+the mean terminal position error following it down to the centimetre level. Evaluated in simulation on the $27$ training initial states, the
 converged policy brings every drone to the origin in about $1.5\,\mathrm{s}$
 with a mean terminal position error of $1.4\,\mathrm{cm}$
 (Figure~\ref{fig:nn_regulation_3d}). The corresponding network outputs
 (Figure~\ref{fig:nn_regulation_outputs}) are physically sensible: the thrust
 saturates briefly to climb or descend and then settles onto the hover value;
-the roll and pitch setpoints reach the firmware $\pm 20^\circ$ limit during the
+the roll and pitch setpoints almost reach the firmware $\pm 20^\circ$ limit during the
 initial, most aggressive part of the manoeuvre and decay smoothly to zero; and
 the yaw rate, never required by the task, stays within a few degrees per second.
 
@@ -2075,7 +2092,7 @@ the yaw rate, never required by the task, stays within a few degrees per second.
     \centering
     \includegraphics[width=0.7\textwidth]{images/nn_regulation_3d.png}
     \caption{Regulation trajectories of the trained policy from the $27$
-    initial states of the training cube, evaluated open-loop in simulation. The
+    initial states of the training cube, evaluated in simulation. The
     colour encodes elapsed time (dark to bright); all trajectories converge to
     the origin target (red star) in about $1.5\,\mathrm{s}$.}
     \label{fig:nn_regulation_3d}
@@ -2098,10 +2115,13 @@ the yaw rate, never required by the task, stays within a few degrees per second.
 Before flying the learned controller on hardware it is evaluated in the
 closed-loop simulator validated in Section~\ref{sec:circle_simreal} --- the
 \texttt{DYN} dynamics driven by the Python port of the firmware attitude and
-rate loops. The point of this section is twofold: to describe the deployment
-\emph{pipeline} that wraps the learned policy, and to produce the simulated
+rate loops. The point of this section is threefold: to describe the deployment
+\emph{pipeline} that wraps the learned policy, to produce the simulated
 reference against which the real flight is compared in
-Section~\ref{sec:nn_results}.
+Section~\ref{sec:nn_results}, and, not least, to serve as a safety check ---
+verifying in simulation that the controller behaves sensibly before it is flown,
+so that a misbehaving policy is caught here rather than crashing and damaging the
+real drone.
 
 \subsubsection*{From regulation-to-origin to a usable flight}
 
@@ -2137,7 +2157,7 @@ keeps the transitions smooth.
 Figure~\ref{fig:nn_sim_pipeline} shows one such pipeline in simulation, with the
 network commanded to the setpoint $(0.5, -0.5, 1.5)\,\mathrm{m}$. The four
 phases are clearly delimited: the cascade PID climbs to and holds the takeoff
-point; the network then moves the drone simultaneously in $x$, $y$ and $z$ onto
+point $(0,0,1)\,\mathrm{m}$; the network then moves the drone simultaneously in $x$, $y$ and $z$ onto
 the setpoint and holds it there with a small steady-state error; and the cascade
 PID finally lands it. The same controller, schedule and setpoint are then sent
 to the real drone, which is what makes the two trajectories directly comparable
@@ -2150,8 +2170,8 @@ streaming its setpoints to the drone over the radio is unproblematic.
     \centering
     \includegraphics[width=\textwidth]{images/nn_sim_pipeline.png}
     \caption{Simulated deployment pipeline: position of the drone over time,
-    with the four phases shaded. The cascade PID takes off and hovers (blue,
-    olive); the learned network then regulates the drone to the commanded
+    with the four phases shaded. The cascade PID takes off and hovers at $(0,0,1)\,\mathrm{m}$ (blue,
+    yellow); the learned network then regulates the drone to the commanded
     setpoint $(0.5,-0.5,1.5)\,\mathrm{m}$ (green, dashed reference lines per
     axis); the cascade PID lands it (grey). The inner attitude and rate loops
     run continuously across all phases.}
@@ -2166,9 +2186,9 @@ pipeline, schedule and setpoint of the simulation: the network runs on the host
 PC at $100\,\mathrm{Hz}$ and streams its roll/pitch/thrust/yaw-rate setpoints to
 the drone, whose firmware attitude and rate loops close the inner loop on board.
 Because the commands are identical, the simulated and the real flights can be
-overlaid directly. Figure~\ref{fig:nn_real_state} compares the two states
-against the setpoint, and Figure~\ref{fig:nn_real_nnout} compares the network
-outputs.
+overlaid directly. Figure~\ref{fig:nn_real_state} compares the simulated and
+real state trajectories (with the setpoint shown for reference), and
+Figure~\ref{fig:nn_real_nnout} compares the network outputs.
 
 \subsubsection*{State tracking}
 
@@ -2179,8 +2199,9 @@ simulated one closely throughout takeoff, regulation and landing
 the real and simulated positions agree to a root-mean-square distance of
 $5.3\,\mathrm{cm}$ (maximum $7.4\,\mathrm{cm}$) --- the same order as the
 $4\,\mathrm{cm}$ sim-to-real discrepancy measured on the cascade-PID circle in
-Section~\ref{sec:circle_simreal}, which confirms that adding the learned outer
-loop has not degraded the fidelity of the simulator. The real drone holds the
+Section~\ref{sec:circle_simreal}, which confirms that replacing the outer
+position and velocity loops with the learned network has not degraded the
+fidelity of the simulator. The real drone holds the
 setpoint with a steady-state error of about $4\,\mathrm{cm}$, against
 $1.4\,\mathrm{cm}$ in simulation, the difference being largest on the vertical
 axis.
@@ -2205,19 +2226,37 @@ does not affect the position regulation.
     \label{fig:nn_real_state}
 \end{figure}
 
-\subsubsection*{Network outputs and the role of training noise}
+\subsubsection*{Network outputs}
 
 The network outputs (Figure~\ref{fig:nn_real_nnout}) follow the same overall
 profile in reality as in simulation --- a thrust transient settling onto hover,
 roll and pitch setpoints that briefly saturate at $\pm 20^\circ$ and relax, and
 a near-zero yaw rate --- but the real commands are markedly more oscillatory.
-This is expected and, in fact, intended: on the real drone the policy is reacting
-to a \emph{noisy} state estimate at every query, exactly the regime it was
-trained to cope with through the observation-noise injection of
-Section~\ref{sec:nn_training}. A policy trained without that noise, while
-equivalent in clean simulation, regulates from the noisy real estimate far less
-gracefully; the noisy policy is what makes the transfer in
-Figure~\ref{fig:nn_real_state} possible. The real flight thus closes the loop on
+Part of this is the policy reacting to a \emph{noisy} state estimate at every
+query, exactly the regime it was trained to cope with through the
+observation-noise injection of Section~\ref{sec:nn_training}: a policy trained
+without that noise, while equivalent in clean simulation, regulates from the
+noisy real estimate far less gracefully, and the noisy policy is what makes the
+transfer in Figure~\ref{fig:nn_real_state} possible. The oscillations should not,
+however, be read as fully accounted for. A sustained oscillatory command is also
+the classic signature of a loop \emph{latency}, and the real deployment has one
+that the simulator omits: the state estimate is sent up to the host over the
+radio, the network runs on the PC, and the setpoint is streamed back down --- a
+round-trip delay (plus host-scheduling jitter) that the zero-delay simulator does
+not reproduce. Such a residual transport lag lowers the phase margin and is a
+plausible source of the extra oscillation, so the sim-to-real gap here is small
+but not zero. A second, independent mismatch acts mainly on the vertical axis:
+the drone used in simulation and training weighs $29\,\mathrm{g}$ whereas the
+real airframe weighs about $31\,\mathrm{g}$ ($\sim\!7\%$ more), so the
+hover-thrust bias the network learned is slightly too low; because the network
+replaced the velocity loop, which carries no integrator
+(Section~\ref{sec:nn_pid_arch}), this deficit is not integrated away and is a
+likely contributor to the persistent vertical steady-state error noted above.
+Figure~\ref{fig:nn_real_nnout} indeed shows the real thrust oscillating around a
+level slightly above the stable simulated value, consistent with the heavier real
+airframe demanding more hover thrust than the policy --- calibrated for
+$29\,\mathrm{g}$ --- nominally emits. The
+real flight nonetheless closes the loop on
 the central argument of this chapter: a controller whose two outer loops are
 \emph{learned} and whose inner loops remain the firmware cascade can be trained
 entirely in simulation and transferred to the real Crazyflie, provided the
@@ -2230,8 +2269,10 @@ of Section~\ref{sec:circle_simreal} identified as the dominant residual gap.
     \caption{The four network outputs during the NN phase, simulation (blue)
     versus real drone (red): thrust (with the hover level), roll and pitch
     setpoints (with the $\pm 20^\circ$ firmware band) and yaw rate. The profiles
-    match; the real commands are noisier because the policy reacts to a noisy
-    on-board state estimate --- the very condition it was trained for.}
+    match; the real commands are noisier and more oscillatory --- partly because
+    the policy reacts to a noisy on-board state estimate (the condition it was
+    trained for), partly from residual effects absent in simulation (a loop
+    latency, a small mass mismatch).}
     \label{fig:nn_real_nnout}
 \end{figure}
 
@@ -2595,6 +2636,82 @@ controller competitive in the easy regime --- yet in the heavier,
 out-of-distribution payloads that matter for a real delivery task, the
 meta-learned controller adapts in a single few-shot step to an accuracy that
 neither the jointly-trained network nor the complete firmware cascade attains.
+
+\subsection{Real-World Transfer}\label{sec:maml_real}
+
+The natural next step was to repeat the deployment of Section~\ref{sec:nn_results}
+with the meta-learned controller and a real centred payload --- a known mass taped
+under the hull at the geometric centre --- using the \emph{same} four-phase
+pipeline (PID takeoff and hover to $(0,0,1)\,\mathrm{m}$, MAML regulation, PID
+landing). This transfer did \emph{not} succeed, and the way it failed is itself
+informative.
+
+The two PID phases behaved exactly as in the payload-free case: the firmware
+cascade took off and held the payload-laden drone at the hover point with no
+difficulty, its velocity-$z$ integrator silently supplying whatever thrust the
+heavier vehicle required. The failure occurred at the hand-over. Although the NN
+regulation setpoint was the same point the PID had just been holding, the instant
+the network took over the drone began to climb and did not stop, rising to the
+laboratory ceiling until the flight was aborted by hand. Figure~\ref{fig:maml_real_runaway}
+shows one such flight with an $8\,\mathrm{g}$ payload: the firmware PID holds
+$z\!\approx\!1\,\mathrm{m}$ indefinitely, whereas the MAML controller, taking over
+at the same setpoint, drives the drone past $2.3\,\mathrm{m}$ in under three
+seconds. The commanded thrust tells the story directly --- it sits around
+$60\,000$ and quickly saturates the $16$-bit range, far above the
+$\approx\!49\,800$ hover bias the network was given for the $29\,\mathrm{g}+8\,\mathrm{g}$
+vehicle.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{images/maml_real_runaway.png}
+    \caption{Real-drone deployment with a centred $8\,\mathrm{g}$ payload, same
+    pipeline as Section~\ref{sec:nn_results}. \emph{Top:} altitude. During the
+    PID takeoff and hover phases (shaded) the firmware cascade (green) holds the
+    setpoint; at the NN hand-over (dashed line) the MAML controller (red) climbs
+    uncontrollably to the ceiling and the flight is aborted by hand. \emph{Bottom:}
+    the NN thrust command runs well above the hover bias and saturates the
+    $16$-bit range, with no integral action to trim it back.}
+    \label{fig:maml_real_runaway}
+\end{figure}
+
+\subsubsection*{Interpretation: the missing integrator on the thrust axis}
+
+The mechanism is the mirror image of the simulated result. The firmware cascade
+hovers the payload-laden drone correctly because its velocity-$z$ loop is an
+\emph{integral} controller: it does not need to know the true mass or the true
+thrust-to-force mapping, it simply integrates the residual until the drone holds
+its altitude. The neural network replaced exactly that loop
+(Section~\ref{sec:nn_pid_arch}) and carries \emph{no} integrator on thrust; it
+applies a feed-forward hover command computed from the \emph{modelled} mass and
+the \emph{modelled} thrust mapping. In simulation those models are exact, so the
+feed-forward thrust is right and the controller is stable
+(Section~\ref{sec:maml_results}); on the real platform they are not --- the bare
+airframe weighs $\sim\!31\,\mathrm{g}$ rather than the modelled $29\,\mathrm{g}$
+(Section~\ref{sec:nn_results}), the thrust-to-force gain drifts with the battery,
+and the on-board velocity estimate is biased and delayed --- and with no integral
+action to absorb the mismatch, the small thrust error is not corrected but
+\emph{compounds} into the vertical runaway seen in
+Figure~\ref{fig:maml_real_runaway}.
+
+Crucially, the same controller without a payload transferred without trouble
+(Section~\ref{sec:nn_results}): there the identical thrust-calibration gap showed
+up only as a few-centimetre steady-state sag. Adding the centred mass raises the
+hover thrust the network must emit, and with it the absolute force error that an
+imperfect mapping produces, tipping a benign offset into an unstable one. The
+sim-to-real gap is therefore the same one identified throughout this work, but
+here it is \emph{amplified by the payload} to the point of breaking the transfer.
+
+This closes the chapter on a deliberately honest note. The simulated advantage of
+the meta-learned controller (Section~\ref{sec:maml_results}) came precisely from
+its integral-free, feed-forward thrust: free of the firmware integrator's
+transient lag, it set the right hover thrust in a single adapted step. On real
+hardware that very feature is its undoing --- the integrator the network discards
+is exactly what robustly rejects the unknown payload and thrust mapping, so the
+firmware cascade, the weaker controller in the simulated transient, is the only
+one of the three that actually flies the centred payload. A real-world
+demonstration of the meta-learning benefit would thus require giving the network
+back an integral channel on thrust (or an explicit on-line hover-thrust estimate),
+which is left as future work.
 
 % =====================================================
 \newpage

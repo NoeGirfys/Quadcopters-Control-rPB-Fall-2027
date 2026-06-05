@@ -91,7 +91,13 @@
       "Bash(grep -rl \"maml_offdirmag_pybullet_centered\\\\|report_compare_centered\\\\|MAML adapted\\\\|tab:maml_sse\" --include=*.py .)",
       "Bash(grep -q \"MAML:\" \"C:\\\\Users\\\\niels\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\C--Users-niels-Desktop-Semester-Project\\\\a2d519c0-789d-4f8a-95e1-4ea397b36edb\\\\tasks\\\\bfi0bo5gu.output\")",
       "Bash(rm -f _tmp_offdir_convergence.png _tmp_offdir_adaptation.png)",
-      "Bash(ls _tmp_offdir*)"
+      "Bash(ls _tmp_offdir*)",
+      "Bash(timeout 320 pdflatex -interaction=nonstopmode -halt-on-error main.tex)",
+      "Bash(grep -nE \"^!|Overfull \\\\\\\\\\\\\\\\vbox|titlepage|Float too large\" _c.log)",
+      "Bash(rm -f _titlepage-01.png)",
+      "Bash(git -C C:/Users/niels/Desktop/Semester_Project status --short)",
+      "Bash(pdftoppm -png -f 1 -l 1 -r 90 main.pdf _tp)",
+      "Bash(rm -f _c.log)"
     ]
   }
 }
