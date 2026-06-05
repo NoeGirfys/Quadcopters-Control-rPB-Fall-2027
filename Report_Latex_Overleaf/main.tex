@@ -888,8 +888,8 @@ back-propagates through the inner update~\eqref{eq:maml_inner}. In its standard
 second-order form this involves the Hessian of $\mathcal{L}_{\mathcal{T}_i}$
 through the chain rule; a first-order approximation that treats the inner
 update as identity, originally proposed in~\cite{finn2017maml}, halves the
-computational cost and was found to yield indistinguishable results in our
-experiments (TO CHECK AT THE END OF THE PROJECT). The meta-loss~\eqref{eq:maml_outer}
+computational cost and was found to yield almost indistinguishable results in our
+experiments. The meta-loss~\eqref{eq:maml_outer}
 explicitly optimises for fast \emph{within-task} adaptation rather than for
 average performance across tasks, which is what distinguishes MAML from a
 joint-training baseline.
@@ -910,8 +910,9 @@ Once meta-training has converged, the resulting initialisation
 $\boldsymbol{\theta}$ is expected to enable rapid adaptation to any new task
 $\mathcal{T}_{\mathrm{target}} \sim p(\mathcal{T})$. Given $K_{\mathrm{inner}}$
 samples drawn from $\mathcal{T}_{\mathrm{target}}$, the adapted parameters are
-obtained by performing exactly the same gradient step as in the inner loop,
-possibly repeated a few times:
+obtained by applying exactly the same gradient step as in the inner loop --- a
+single step in this work, although the procedure generalises to a few successive
+such steps:
 \begin{equation}
 \boldsymbol{\theta}_{\mathrm{final}} \;=\; \boldsymbol{\theta}
 - \alpha \, \nabla_{\boldsymbol{\theta}}\,
@@ -934,9 +935,7 @@ standard gradient descent until convergence. This baseline has no notion of
 fast adaptation: it learns one set of parameters that is a compromise across
 the entire training distribution. To make the comparison fair, the same
 few-shot adaptation~\eqref{eq:maml_adapt} is applied to the jointly-trained
-controller at test time (and, in this work, also during training to monitor a
-target-task generalisation metric in a symmetric fashion -- see
-Section~\ref{sec:maml_training}). Any performance gap between the two then
+controller at test time. Any performance gap between the two then
 reflects the specific contribution of the meta-optimisation: whether the
 meta-trained initialisation truly enables faster gradient-based adaptation than
 an initialisation obtained from averaging across tasks.
@@ -1006,7 +1005,7 @@ an initialisation obtained from averaging across tasks.
     target task $\mathcal{T}_{\mathrm{target}}$ used for few-shot adaptation at
     meta-test time. The inner loop (blue) computes a task-specific adapted
     parameter set $\boldsymbol{\theta}'_i$ from $K_{\mathrm{inner}}$ samples of
-    each training task. The outer loop (purple) evaluates the adapted
+    each training task. The outer loop (red) evaluates the adapted
     controllers on $K_{\mathrm{outer}}$ fresh samples per task and updates the
     meta-parameters $\boldsymbol{\theta}$ to minimise the resulting sum of
     post-adaptation losses. At meta-test time (right), the very same gradient
