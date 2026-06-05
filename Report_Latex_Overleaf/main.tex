@@ -480,10 +480,12 @@ Both formulations appear in this work, in different roles. The differentiable ro
 that \emph{train} the controllers (Sections~\ref{sec:nn_training}
 and~\ref{sec:maml_training}) integrate the approximate model of remark~(1): the body-rate
 dynamics~\eqref{eq:euler_components} with the orientation advanced by the near-hover update
-$\Phi_{k+1} = \Phi_k + T_s\,\omega_B$, i.e.\ Goffin's convention, which is light to
-back-propagate through the long unrolled horizon. Every closed-loop \emph{evaluation}, by
-contrast, is carried out in the more faithful \texttt{gym-pybullet-drones} \texttt{DYN}
-backend of remark~(2), with its exact quaternion kinematics
+$\Phi_{k+1} = \Phi_k + T_s\,\omega_B$, i.e.\ Goffin's convention, deliberately chosen here
+because its simpler, cheaper-to-differentiate form keeps the long unrolled training
+back-propagation tractable. Every closed-loop \emph{evaluation}, by contrast, is run on the
+more complete and faithful \texttt{gym-pybullet-drones} \texttt{DYN} backend of remark~(2),
+with its exact quaternion kinematics, precisely so that the controllers are assessed against
+dynamics as close as possible to the real drone's
 (Sections~\ref{sec:firmware_integration},~\ref{sec:nn_sim_results}
 and~\ref{sec:maml_results}). The quantitative impact of the difference between the two is
 investigated in the open-loop benchmark of Section~\ref{sec:dyn_comparison}, and is small
