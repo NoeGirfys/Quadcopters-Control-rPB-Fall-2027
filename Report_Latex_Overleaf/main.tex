@@ -1546,7 +1546,11 @@ platform. This chapter describes the experimental hardware
 (Section~\ref{sec:exp_setup}), studies the two positioning systems that were
 available (Section~\ref{sec:flowdeck_lighthouse}), and quantifies the agreement
 between simulation and reality on a circular trajectory
-(Section~\ref{sec:circle_simreal}).
+(Section~\ref{sec:circle_simreal}). The overarching goal, as in the previous
+chapter, is to make sure that a controller trained and tested in simulation will
+transfer to the real Crazyflie safely and with predictable behaviour, so that the
+simulator can be trusted as a stand-in for the real platform when developing the
+learned controllers of Sections~\ref{sec:regulation} and~\ref{sec:maml_offset}.
 
 \subsection{Experimental Setup}\label{sec:exp_setup}
 
@@ -1688,8 +1692,8 @@ time-of-flight rangefinder operates near its lower limit.
 
 The sim-to-real discrepancy for the Flow deck flight is correspondingly large:
 $7.2\,\mathrm{cm}$ in position and $13.3\,\mathrm{cm/s}$ in velocity over the
-circle (Table~\ref{tab:circle_discrepancy}), the velocity figure being roughly
-twice the Lighthouse value. One caveat must be stated plainly: with the Flow
+circle (Table~\ref{tab:circle_discrepancy}), almost
+twice the Lighthouse values. One caveat must be stated plainly: with the Flow
 deck the logged ``real'' state \emph{is} the optical-flow estimate itself, for
 which no independent ground truth is available. Part of the $7.2\,\mathrm{cm}$
 therefore reflects the Flow deck mis-estimating its own position, not the drone
@@ -1794,17 +1798,23 @@ simulator is, to this accuracy, a faithful twin of the real platform.
 \subsubsection*{Reading the numbers, and what they imply for training}
 
 The tracking error deserves a word, because at $24$--$29\,\mathrm{cm}$ it looks
-alarmingly large next to a $0.5\,\mathrm{m}$ radius. It is, however, almost
-entirely an \emph{along-track} (phase) lag rather than a radial deviation: the
-drone follows essentially the right circle but trails the moving target by some
-$30^\circ$ of arc (about half a second at the circle's angular rate), which is
-why the top views still show well-formed rings. The lag is plainly visible in the
-position row (top) of the time series: in both Figures~\ref{fig:ts_flowdeck}
-and~\ref{fig:ts_lighthouse} the real and the simulated $x$ and $y$ traces trail
-the dashed setpoint by the same margin. Crucially it is a property of the soft,
-deliberately non-aggressive default position gains of the Crazyflie cascade, not
-of the sensor, so it appears almost identically in simulation and in reality ---
-and is therefore subtracted out in the sim-to-real discrepancy.
+alarmingly large next to a $0.5\,\mathrm{m}$ radius. Its main component is an
+\emph{along-track} (phase) lag rather than a radial deviation: the drone follows
+a circle of essentially the right radius but trails the moving target by some
+$30^\circ$ of arc (about half a second at the circle's angular rate). This lag is
+plainly visible in the position row (top) of the time series: in both
+Figures~\ref{fig:ts_flowdeck} and~\ref{fig:ts_lighthouse} the real and the
+simulated $x$ and $y$ traces trail the dashed setpoint by the same margin. It is a
+property of the soft, deliberately non-aggressive default position gains of the
+Crazyflie cascade, not of the sensor, so it appears almost identically in
+simulation and in reality --- and is therefore subtracted out in the sim-to-real
+discrepancy. With the Lighthouse this lag is essentially the whole story, which is
+why its top view (Figure~\ref{fig:topview_lh}) is a clean, well-formed ring; with
+the Flow deck, by contrast, the logged top view (Figure~\ref{fig:topview_flow}) is
+a distorted, jittery circle --- the deck's noisier position estimate adds a radial
+error on top of the common lag, and it is this sensor-induced distortion, not the
+phase lag, that the larger Flow-deck sim-to-real discrepancy ($7.2$ versus
+$4.0\,\mathrm{cm}$, Table~\ref{tab:circle_discrepancy}) reflects.
 
 The residual sim-to-real discrepancy on the Lighthouse flight is small and
 structured. The dominant contributions are a slightly noisier real attitude ---
