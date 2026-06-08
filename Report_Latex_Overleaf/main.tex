@@ -1867,9 +1867,9 @@ Figure~\ref{fig:nn_pid_arch}.
         \node[plant] (mot)  [right=24mm of rate] {Power dist.\\$+$ motors};
         \node[plant] (dyn)  [right=14mm of mot]  {Drone\\dynamics};
 
-        % input
+        % input: the relative position target (reference)
         \draw[<-] (nn.west) -- ++(-14mm,0)
-            node[left, align=center] {state $\mathbf{o}_k$\\$+\,(\mathbf{p}^{\mathrm{sp}}-\hat{\mathbf{p}})$};
+            node[left, align=center] {relative target\\$\mathbf{p}^{\mathrm{sp}}-\hat{\mathbf{p}}$};
 
         % forward path
         \draw[->] (nn)   -- (att);
@@ -1888,9 +1888,9 @@ Figure~\ref{fig:nn_pid_arch}.
         \node[draw, dashed, rounded corners, fit=(att)(rate)(mot),
               inner sep=5mm, label={above:on-board firmware, $500\,\mathrm{Hz}$}] {};
 
-        % state feedback
+        % state feedback: the estimated state, i.e. the observation o_k
         \draw[->] (dyn.north) |- ($(nn.north)+(0,16mm)$) -- (nn.north);
-        \node[left] at ($(nn.north)+(0,5mm)$) {$\hat{\mathbf{x}}$};
+        \node[left, align=center] at ($(nn.north)+(0,6.5mm)$) {state\\$\mathbf{o}_k=\hat{\mathbf{x}}$};
     \end{tikzpicture}}
     \caption{Hybrid NN--PID control loop. The learned MLP (red) replaces the
     outer position and velocity loops and is queried at $100\,\mathrm{Hz}$ on the
@@ -2220,9 +2220,7 @@ traces are visibly noisier than their simulated counterparts, reflecting the
 sensor and estimation noise of the on-board state estimate that the deterministic
 simulator does not reproduce. Second, the yaw, which is never commanded, drifts
 slowly to about $8^\circ$ on the real drone (against $\sim 1^\circ$ in
-simulation); this uncommanded drift is consistent with the estimator drift and
-small airframe asymmetries already noted in Section~\ref{sec:circle_simreal} and
-does not affect the position regulation.
+simulation), without affecting the position regulation.
 
 \begin{figure}[H]
     \centering
@@ -2257,10 +2255,11 @@ plausible source of the extra oscillation, so the sim-to-real gap here is small
 but not zero. A second, independent mismatch acts mainly on the vertical axis:
 the drone used in simulation and training weighs $29\,\mathrm{g}$ whereas the
 real airframe weighs about $31\,\mathrm{g}$ ($\sim\!7\%$ more), so the
-hover-thrust bias the network learned is slightly too low; because the network
-replaced the velocity loop, which carries no integrator
-(Section~\ref{sec:nn_pid_arch}), this deficit is not integrated away and is a
-likely contributor to the persistent vertical steady-state error noted above.
+hover-thrust bias the network learned is slightly too low; and because the
+network replaced the velocity loop --- and, unlike the firmware loop it replaced,
+carries no integrator on thrust (Section~\ref{sec:nn_pid_arch}) --- this deficit
+is not integrated away and is a likely contributor to the persistent vertical
+steady-state error noted above.
 Figure~\ref{fig:nn_real_nnout} indeed shows the real thrust oscillating around a
 level slightly above the stable simulated value, consistent with the heavier real
 airframe demanding more hover thrust than the policy --- calibrated for
@@ -2271,6 +2270,13 @@ the central argument of this chapter: a controller whose two outer loops are
 entirely in simulation and transferred to the real Crazyflie, provided the
 training is made robust to the estimation noise that the sim-to-real validation
 of Section~\ref{sec:circle_simreal} identified as the dominant residual gap.
+Estimation noise is, however, probably not the \emph{only} residual gap. The most
+plausible explanations for the two smaller discrepancies observed here --- the
+extra command oscillation and the few-centimetre vertical steady-state error ---
+are, respectively, the radio round-trip latency and the slightly
+heavier-than-modelled airframe; neither was measured directly, so these remain
+well-motivated conjectures rather than established facts, that a future deployment
+would nonetheless have to address.
 
 \begin{figure}[H]
     \centering

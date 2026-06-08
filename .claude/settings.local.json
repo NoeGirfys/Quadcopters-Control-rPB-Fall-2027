@@ -97,7 +97,15 @@
       "Bash(rm -f _titlepage-01.png)",
       "Bash(git -C C:/Users/niels/Desktop/Semester_Project status --short)",
       "Bash(pdftoppm -png -f 1 -l 1 -r 90 main.pdf _tp)",
-      "Bash(rm -f _c.log)"
+      "Bash(rm -f _c.log)",
+      "Bash(pdftoppm -png -f 32 -l 32 -r 120 main.pdf _f11)",
+      "Bash(ls _f11*)",
+      "Bash(timeout 320 pdflatex -interaction=nonstopmode -halt-on-error -jobname=_check main.tex)",
+      "Bash(grep -nE \"^!|Undefined|Overfull \\\\\\\\\\\\\\\\hbox \\\\\\(\\([5-9][0-9]|[0-9]{3}\\)\" _c.log)",
+      "Bash(pdftoppm -png -f 32 -l 32 -r 120 _check.pdf _f11)",
+      "Bash(pdftoppm -png -f 33 -l 34 -r 120 _check.pdf _f11b)",
+      "Bash(pdftoppm -png -f 34 -l 34 -r 130 _check.pdf _f)",
+      "Bash(timeout 320 pdflatex -interaction=nonstopmode -halt-on-error -draftmode -jobname=_check main.tex)"
     ]
   }
 }
