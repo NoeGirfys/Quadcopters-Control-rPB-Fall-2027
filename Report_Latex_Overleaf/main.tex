@@ -2376,7 +2376,7 @@ initial drone state used to integrate the resulting dynamics. The three
 blocks are drawn independently:
 \begin{itemize}\itemsep1pt
     \item the \textbf{starting position} $(x_0, y_0, z_0)$ is uniform in a
-    cube of half-side $h$ about the regulation setpoint;
+    cube of half-side $h$ about the regulation setpoint (the origin for the training);
     \item the \textbf{mass position} $\mathbf{r}_o$ is drawn from an
     isotropic 3-D Gaussian of standard deviation $\sigma_p$, centred on a
     mean position $\boldsymbol{\mu}_p$;
@@ -2402,7 +2402,7 @@ fourth motor $M_4$ at an intermediate magnitude $\sim\!5\,\mathrm{g}$
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.95\textwidth]{images/maml_offdirmag_map.png}
+    \includegraphics[width=0.85\textwidth]{images/maml_offdirmag_map.png}
     \caption{Composite training task set, sampled once and held fixed for the
     run. Left: the body-frame attachment positions of the six tasks, one
     colour per task; marker size encodes the magnitude ($3$ or
@@ -2505,14 +2505,16 @@ Section~\ref{sec:maml_results}.
 
 To make the role of adaptation explicit, Figure~\ref{fig:maml_adaptcurve} plots
 the held-out task loss as a function of the number of $K$-shot gradient updates
-(at the checkpoint's inner learning rate), for both the MAML meta-initialisation
+(at the MAML model's inner learning rate), for both the MAML meta-initialisation
 and the joint baseline, on a centred $10\,\mathrm{g}$ payload. The two starting
 points are telling: the MAML init is a poor \emph{zero-shot} controller (it is
 trained to be a launch-point, not a finished policy) but a single update drops
 its loss far below the baseline's; the joint baseline is a good zero-shot
-controller that the same update \emph{degrades}, because that step --- tuned for
-MAML's single inner iteration --- over-fits the five support points of a policy
-not trained for it. The inner learning rate being calibrated for exactly one
+controller that the same update \emph{degrades}, because the inner step --- its
+learning rate co-calibrated with the MAML initialisation so that one update lands
+near \emph{MAML's} optimum --- is not tuned for the baseline: applied from the
+baseline's own, already near-optimal parameters, it simply carries them away from
+their optimum rather than toward it. The inner learning rate being calibrated for exactly one
 step, iterating it does not improve monotonically (it oscillates); the operating
 point is thus the single trained step, at which MAML reaches a loss about half
 the baseline's.
@@ -2521,7 +2523,7 @@ the baseline's.
     \centering
     \includegraphics[width=0.7\textwidth]{images/maml_offdirmag_adaptation.png}
     \caption{Held-out task loss versus number of $K$-shot gradient updates
-    (inner learning rate from the checkpoint), centred $10\,\mathrm{g}$ payload.
+    (inner learning rate from the MAML model), centred $10\,\mathrm{g}$ payload.
     MAML (red) starts high but a single step reaches its minimum, well below the
     baseline (blue); the baseline starts low (good zero-shot) and is harmed by
     the MAML-tuned step. The dotted line marks the trained, deployed single-step
@@ -2560,7 +2562,7 @@ Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} the two measures.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\textwidth]{images/maml_offdirmag_pybullet_centered.png}
+    \includegraphics[width=0.85\textwidth]{images/maml_offdirmag_pybullet_centered.png}
     \caption{PyBullet regulation from $(0.5,-0.5,0.5)$ to $(0,0,1)\,\mathrm{m}$
     with a centred payload (rows: $4$/$8$/$12$/$16\,\mathrm{g}$; columns:
     $x$/$y$/$z$). Firmware PID (green), baseline NN (grey), baseline NN adapted
@@ -2571,7 +2573,7 @@ Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} the two measures.
     \label{fig:maml_pybullet}
 \end{figure}
 
-\begin{table}[h]
+\begin{table}[H]
     \centering
     \caption{Steady-state position error [cm] (mean over the last second of the
     flight; lower is better). Best per row in bold.}
@@ -2589,7 +2591,7 @@ Tables~\ref{tab:maml_sse}--\ref{tab:maml_tloss} the two measures.
     \end{tabular}
 \end{table}
 
-\begin{table}[h]
+\begin{table}[H]
     \centering
     \caption{Cumulative trajectory cost over the whole flight (training
     cost~\eqref{eq:reg_cost}, lower is better). Absolute values are not
@@ -2622,10 +2624,13 @@ during the transient --- its velocity-$z$ integrator lags the heavier payload
 before winding up --- and the identically fine-tuned baseline degrades sharply
 at $16\,\mathrm{g}$ ($21\,\mathrm{cm}$ error, a visible $z$ overshoot),
 confirming that the inner step tuned for MAML is destructive when applied to the
-joint initialisation. On the cumulative cost the ordering is the same, MAML
-lowest at every payload, but the margins are tighter: the common transport from
-the start to the setpoint dominates the integral, so the steady-state error is
-the more discriminating measure of payload rejection.
+joint initialisation. On the cumulative cost the ordering is the same --- MAML
+lowest at every payload --- but the margins are tighter: most of the integral is
+accrued during the initial travel from the start to the setpoint, a manoeuvre
+essentially identical for all four controllers and almost payload-independent,
+whereas the payload-rejection differences live only in the final hold. The
+steady-state error, measured over the last second alone, isolates that hold and
+is therefore the more discriminating measure of payload rejection.
 
 \subsubsection*{Why the advantage is bounded, and what it means}
 
@@ -2658,14 +2663,17 @@ The natural next step was to repeat the deployment of Section~\ref{sec:nn_result
 with the meta-learned controller and a real centred payload --- a known mass taped
 under the hull at the geometric centre --- using the \emph{same} four-phase
 pipeline (PID takeoff and hover to $(0,0,1)\,\mathrm{m}$, MAML regulation, PID
-landing). This transfer did \emph{not} succeed, and the way it failed is itself
-informative.
+landing). This transfer did \emph{not} succeed, and while we can only offer
+plausible explanations for why, the way it failed is suggestive.
 
 The two PID phases behaved exactly as in the payload-free case: the firmware
 cascade took off and held the payload-laden drone at the hover point with no
 difficulty, its velocity-$z$ integrator silently supplying whatever thrust the
-heavier vehicle required. The failure occurred at the hand-over. Although the NN
-regulation setpoint was the same point the PID had just been holding, the instant
+heavier vehicle required --- we did have to lengthen the takeoff phase to about
+four seconds, as the laden drone climbed noticeably more slowly. The failure
+occurred at the hand-over. Although the NN regulation setpoint was the same point
+the PID had just been holding --- so the network only had to hover in place with
+the additional mass --- the instant
 the network took over the drone began to climb and did not stop, rising to the
 laboratory ceiling until the flight was aborted by hand. Figure~\ref{fig:maml_real_runaway}
 shows one such flight with an $8\,\mathrm{g}$ payload: the firmware PID holds
@@ -2689,7 +2697,7 @@ vehicle.
     \label{fig:maml_real_runaway}
 \end{figure}
 
-\subsubsection*{Interpretation: the missing integrator on the thrust axis}
+\subsubsection*{Interpretation: a feed-forward thrust error the payload makes fatal}
 
 The mechanism is the mirror image of the simulated result. The firmware cascade
 hovers the payload-laden drone correctly because its velocity-$z$ loop is an
@@ -2704,17 +2712,18 @@ feed-forward thrust is right and the controller is stable
 airframe weighs $\sim\!31\,\mathrm{g}$ rather than the modelled $29\,\mathrm{g}$
 (Section~\ref{sec:nn_results}), the thrust-to-force gain drifts with the battery,
 and the on-board velocity estimate is biased and delayed --- and with no integral
-action to absorb the mismatch, the small thrust error is not corrected but
-\emph{compounds} into the vertical runaway seen in
-Figure~\ref{fig:maml_real_runaway}.
+action to absorb the mismatch, this thrust error is left uncorrected. On its own
+the error is small; under the added payload, as the next paragraph makes precise,
+it grows into the vertical runaway seen in Figure~\ref{fig:maml_real_runaway}.
 
 Crucially, the same controller without a payload transferred without trouble
 (Section~\ref{sec:nn_results}): there the identical thrust-calibration gap showed
 up only as a few-centimetre steady-state sag. Adding the centred mass raises the
-hover thrust the network must emit, and with it the absolute force error that an
-imperfect mapping produces, tipping a benign offset into an unstable one. The
-sim-to-real gap is therefore the same one identified throughout this work, but
-here it is \emph{amplified by the payload} to the point of breaking the transfer.
+hover thrust the network must emit, which likely increases the absolute force error
+an imperfect mapping produces; this is our best explanation for why a previously
+benign offset turned unstable. If so, the sim-to-real gap here would be the same
+one identified throughout this work, only amplified by the payload to the point of
+breaking the transfer.
 
 This closes the chapter on a deliberately honest note. The simulated advantage of
 the meta-learned controller (Section~\ref{sec:maml_results}) came precisely from
@@ -2723,14 +2732,81 @@ transient lag, it set the right hover thrust in a single adapted step. On real
 hardware that very feature is its undoing --- the integrator the network discards
 is exactly what robustly rejects the unknown payload and thrust mapping, so the
 firmware cascade, the weaker controller in the simulated transient, is the only
-one of the three that actually flies the centred payload. A real-world
-demonstration of the meta-learning benefit would thus require giving the network
-back an integral channel on thrust (or an explicit on-line hover-thrust estimate),
-which is left as future work.
+one of the three that actually flies the centred payload.
 
 % =====================================================
 \newpage
 \section{Conclusion}
+
+This project set out to carry the meta-learning quadcopter controller of
+Goffin~\cite{goffin2026} from a simulation-only study to a real Crazyflie, and to
+do so while explicitly characterising the sim-to-real gap that such a transition
+exposes.
+
+\paragraph{What was achieved.}
+The central enabler was making the simulator faithful to one specific platform.
+Rather than rely on the generic controller shipped with
+\texttt{gym-pybullet-drones}, we ported the Crazyflie's cascade PID firmware from C
+to Python and embedded it in the simulator, so that the inner attitude and rate
+loops driving the simulated drone are the very same loops running on the hardware.
+The open-loop comparison of Section~\ref{sec:dyn_comparison} confirmed that the
+gym-pybullet dynamics agree closely with Goffin's model, and the circle-tracking
+experiment of Section~\ref{sec:circle_simreal} quantified the residual closed-loop
+gap on the real platform. On this foundation the hybrid NN-PID controller of
+Section~\ref{sec:regulation} --- a network replacing only the outer position and
+velocity loops --- was trained entirely in simulation and transferred to the real
+drone, regulating it to a commanded setpoint with behaviour that matched the
+simulated prediction. Finally, MAML was applied to a disturbance Goffin never
+treated, a centred or offset payload, and meta-training did yield a controller
+that adapted in a single few-shot step to an accuracy the jointly-trained baseline
+and the full firmware cascade could not match in simulation.
+
+\paragraph{Limitations.}
+That meta-learning advantage, however, was slight. The honest reading of
+Section~\ref{sec:maml_results} is that the cascade PID and even the plain
+jointly-trained network are already very good at rejecting a payload --- the
+firmware's integral action removes the steady-state error almost for free --- so
+the margin MAML buys over them, while real, is small and only clearly visible in
+the heaviest out-of-distribution payloads. More importantly, the ultimate goal,
+MAML on the real drone, was not reached: at the hand-over from the PID takeoff to
+the meta-learned controller the laden drone climbed to the ceiling
+(Section~\ref{sec:maml_real}), most plausibly because the network carries no
+thrust integrator and its feed-forward hover command was miscalibrated for the
+real vehicle --- a sim-to-real gap amplified by the added mass rather than
+a failure of the meta-learning itself.
+
+\paragraph{Future work.}
+Several directions follow naturally. First, the meta-learning task distribution
+should be chosen so that adaptation actually matters: a centred payload is rejected
+almost perfectly by the integral action of the inner loops, which leaves little for
+MAML to improve. Tasks the base cascade genuinely \emph{cannot} handle well ---
+strongly offset masses, asymmetric or time-varying disturbances --- would give the
+meta-learned policy a regime in which its advantage is decisive rather than
+marginal. Second, the single inner adaptation step used here was the configuration
+that trained most reliably, but a few additional inner steps may unlock a larger
+share of MAML's benefit and are worth revisiting. Third, the runaway on the real
+drone points squarely at the open-loop thrust calibration: the network emits a
+hover thrust computed from the modelled mass and thrust mapping, which on the real
+platform is slightly wrong. Without a payload this error was benign --- the
+payload-free controller of Section~\ref{sec:nn_results} transferred with only a
+few-centimetre sag --- but the centred mass raises the hover thrust the network
+must emit, and with it the absolute force error, tipping that benign offset into
+the vertical runaway of Section~\ref{sec:maml_real}. The robust fix is to make the
+thrust command closed-loop on the real vehicle, by giving the network an integral
+channel on thrust or an explicit on-line hover-thrust estimate --- which is exactly
+why the firmware cascade, whose velocity-$z$ loop integrates this very error, flies
+the laden drone without trouble. Finally, training in this
+work relied on the approximate near-hover model that conflates the body rates
+$(p,q,r)$ with the Euler-angle derivatives $(\dot\phi,\dot\theta,\dot\psi)$; a
+follow-up could differentiate through the exact quaternion-based dynamics that keep
+the two distinct, tightening the model the controller is optimised against and
+shrinking one more contributor to the sim-to-real gap.
+
+Even though the headline objective was not crowned with a successful real-drone
+demonstration of MAML, the project delivered a simulation pipeline that mirrors the
+Crazyflie's own control stack, a regulation controller that does transfer to
+hardware, and a documented account of where the meta-learning transfer broke down
+together with a plausible explanation of why --- a solid base for the next attempt.
 
 \newpage
 % %%%%%%%%% REFERENCES SECTION %%%%%%%%%
