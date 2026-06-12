@@ -632,15 +632,15 @@ def _plot_nn_sim(data: dict):
     ax.set_title('NN Outputs (attitude)')
     ax.grid(True, alpha=0.3)
 
-    # -- Thrust --
+    # -- Thrust (NN phase only, like the other NN outputs / real mode) --
     ax = axes[2, 0]
-    ax.plot(t, thrust, color='black', label='thrust')
+    ax.plot(t_nn, thrust[nn_mask], color='black', label='thrust')
     ax.axhline(HOVER_THRUST_U16, ls=':', color='gray',
                label=f'hover={HOVER_THRUST_U16:.0f}')
     ax.set_ylabel('Thrust [uint16]')
     ax.set_xlabel('Time [s]')
     ax.legend(fontsize=7)
-    ax.set_title('Thrust')
+    ax.set_title('NN Thrust')
     ax.grid(True, alpha=0.3)
 
     # -- RPMs --
@@ -884,10 +884,13 @@ def run_real_nn(ckpt_path: str, takeoff_pos=(0, 0, 0.5), target_pos=(0, 0, 1),
                     'yaw_rate': float(yaw_rate),
                 })
 
-                # send_setpoint: (roll_deg, pitch_deg, yaw_rate_deg/s,
+                # send_setpoint: (roll_deg, pitch_deg(neg), yaw_rate_deg/s(neg),
                 #                 thrust_uint16)
+                # Firmware RPYT convention: positive yawrate = clockwise =
+                # decreasing stabilizer.yaw, opposite to the sim/training
+                # convention (yaw_sp += yaw_rate*dt) -> negate.
                 cf.commander.send_setpoint(
-                    roll_deg, -pitch_deg, yaw_rate, int(thrust))
+                    roll_deg, -pitch_deg, -yaw_rate, int(thrust))
 
                 if i % NN_FREQ == 0:
                     t = elapsed_phases01 + i / NN_FREQ

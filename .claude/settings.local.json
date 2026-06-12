@@ -107,7 +107,18 @@
       "Bash(pdftoppm -png -f 34 -l 34 -r 130 _check.pdf _f)",
       "Bash(timeout 320 pdflatex -interaction=nonstopmode -halt-on-error -draftmode -jobname=_check main.tex)",
       "Bash(pdflatex -draftmode -interaction=nonstopmode -halt-on-error -jobname=_check main.tex)",
-      "Bash(rm -f _check.*)"
+      "Bash(rm -f _check.*)",
+      "Bash(mkdir -p /tmp/pptx_extract)",
+      "Bash(unzip -o -q Slides_final_pres_MAML.pptx -d /tmp/pptx_extract)",
+      "Bash(python3 -c \"pass\")",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"from PIL import Image; im=Image.open\\('Crazyflie_topwiew_presentation.png'\\); print\\(im.size\\)\")",
+      "Bash(powershell -NoProfile -Command 'Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Image]::FromFile\\('\\\\''C:\\\\Users\\\\niels\\\\Desktop\\\\Semester_Project\\\\Crazyflie_topwiew_presentation.png'\\\\''\\); '\\\\''{0}x{1}'\\\\'' -f $i.Width,$i.Height')",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe make_task_overlay.py)",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import py_compile; py_compile.compile\\('make_task_overlay.py', doraise=True\\); print\\('OK: syntax + imports parse'\\)\")",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import tkinter; import matplotlib; matplotlib.use\\('TkAgg'\\); print\\('TkAgg OK -> ginput will work'\\)\")",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import py_compile; py_compile.compile\\('make_task_overlay.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(C:/Users/niels/miniconda3/envs/venv_cf_313/python.exe *)",
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe *)"
     ]
   }
 }

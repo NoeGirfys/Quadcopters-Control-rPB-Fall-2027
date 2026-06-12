@@ -575,8 +575,11 @@ def run_real(args, policy, theta, m_extra, r_offset, hover_u16, info, device):
                     nn_cmd_log.append({'t': elapsed_phases01 + i / NN_FREQ, 't_wall': t_wall,
                                        'thrust': thrust, 'roll': roll_deg,
                                        'pitch': pitch_deg, 'yaw_rate': yaw_rate})
-                    # send_setpoint(roll, pitch(neg), yaw_rate, thrust_u16)
-                    cf.commander.send_setpoint(roll_deg, -pitch_deg, yaw_rate, int(thrust))
+                    # send_setpoint(roll, pitch(neg), yaw_rate(neg), thrust_u16)
+                    # Firmware RPYT convention: positive yawrate = clockwise =
+                    # decreasing stabilizer.yaw, opposite to the sim/training
+                    # convention (yaw_sp += yaw_rate*dt) -> negate.
+                    cf.commander.send_setpoint(roll_deg, -pitch_deg, -yaw_rate, int(thrust))
                     if i % NN_FREQ == 0:
                         err = math.dist((ds['x'], ds['y'], ds['z']), nn_target)
                         print(f"  t={elapsed_phases01 + i/NN_FREQ:5.1f}s pos="
