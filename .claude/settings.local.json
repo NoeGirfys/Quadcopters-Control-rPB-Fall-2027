@@ -118,7 +118,8 @@
       "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import tkinter; import matplotlib; matplotlib.use\\('TkAgg'\\); print\\('TkAgg OK -> ginput will work'\\)\")",
       "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe -c \"import py_compile; py_compile.compile\\('make_task_overlay.py', doraise=True\\); print\\('OK'\\)\")",
       "Bash(C:/Users/niels/miniconda3/envs/venv_cf_313/python.exe *)",
-      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe *)"
+      "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe *)",
+      "Bash(echo \"EXIT $?\")"
     ]
   }
 }

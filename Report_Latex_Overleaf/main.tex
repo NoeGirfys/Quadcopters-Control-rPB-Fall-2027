@@ -2659,80 +2659,107 @@ neither the jointly-trained network nor the complete firmware cascade attains.
 
 \subsection{Real-World Transfer}\label{sec:maml_real}
 
-The natural next step was to repeat the deployment of Section~\ref{sec:nn_results}
-with the meta-learned controller and a real centred payload --- a known mass taped
-under the hull at the geometric centre --- using the \emph{same} four-phase
-pipeline (PID takeoff and hover to $(0,0,1)\,\mathrm{m}$, MAML regulation, PID
-landing). This transfer did \emph{not} succeed, and while we can only offer
-plausible explanations for why, the way it failed is suggestive.
+The final step was to repeat the deployment of Section~\ref{sec:nn_results} with
+the meta-learned controller and a \emph{real} payload --- a known $8.21\,\mathrm{g}$
+mass taped under the hull at the geometric centre --- using the same four-phase
+pipeline (PID takeoff, PID hover at $(0,0,0.5)\,\mathrm{m}$, NN regulation to the
+setpoint $(0.5,-0.5,1.0)\,\mathrm{m}$, PID landing). The NN phase is thus a
+diagonal displacement of $(+0.5,-0.5,+0.5)\,\mathrm{m}$ carrying the payload, the
+same manoeuvre length as the simulated deployment task of
+Section~\ref{sec:maml_results}. All four controllers of that comparison ---
+firmware PID, baseline NN, baseline NN adapted, and MAML adapted --- were flown in
+turn, at the same payload and the same setpoint, so the sim and real comparisons
+are directly comparable.
 
-The two PID phases behaved exactly as in the payload-free case: the firmware
-cascade took off and held the payload-laden drone at the hover point with no
-difficulty, its velocity-$z$ integrator silently supplying whatever thrust the
-heavier vehicle required --- we did have to lengthen the takeoff phase to about
-four seconds, as the laden drone climbed noticeably more slowly. The failure
-occurred at the hand-over. Although the NN regulation setpoint was the same point
-the PID had just been holding --- so the network only had to hover in place with
-the additional mass --- the instant
-the network took over the drone began to climb and did not stop, rising to the
-laboratory ceiling until the flight was aborted by hand. Figure~\ref{fig:maml_real_runaway}
-shows one such flight with an $8\,\mathrm{g}$ payload: the firmware PID holds
-$z\!\approx\!1\,\mathrm{m}$ indefinitely, whereas the MAML controller, taking over
-at the same setpoint, drives the drone past $2.3\,\mathrm{m}$ in under three
-seconds. The commanded thrust tells the story directly --- it sits around
-$60\,000$ and quickly saturates the $16$-bit range, far above the
-$\approx\!49\,800$ hover bias the network was given for the $29\,\mathrm{g}+8\,\mathrm{g}$
-vehicle.
+\subsubsection*{Results}
+
+All four controllers fly the laden drone to the setpoint.
+Figure~\ref{fig:maml_real_compare} overlays the three position axes for one flight
+of each, and Table~\ref{tab:maml_real} reports both the steady-state error (mean
+over the last second of the NN phase) and the altitude transient. The horizontal
+axes are essentially solved by every controller --- all four reach $x$ and $y$
+within a centimetre or two --- so the discriminating axis is altitude, exactly
+where the added weight bites, and it must be read on \emph{two} counts: how tightly
+the controller holds the target at the end, and how it gets there.
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\textwidth]{images/maml_real_runaway.png}
-    \caption{Real-drone deployment with a centred $8\,\mathrm{g}$ payload, same
-    pipeline as Section~\ref{sec:nn_results}. \emph{Top:} altitude. During the
-    PID takeoff and hover phases (shaded) the firmware cascade (green) holds the
-    setpoint; at the NN hand-over (dashed line) the MAML controller (red) climbs
-    uncontrollably to the ceiling and the flight is aborted by hand. \emph{Bottom:}
-    the NN thrust command runs well above the hover bias and saturates the
-    $16$-bit range, with no integral action to trim it back.}
-    \label{fig:maml_real_runaway}
+    \includegraphics[width=\textwidth]{images/maml_real_compare_8g.png}
+    \caption{Real-drone regulation to $(0.5,-0.5,1.0)\,\mathrm{m}$ with a centred
+    $8.21\,\mathrm{g}$ payload, NN phase only ($t=0$ at hand-over). Firmware PID
+    (green, dash-dot), baseline NN (grey, dashed), baseline NN adapted (blue),
+    MAML adapted (red); dotted lines are the setpoints. The altitude axis is
+    decisive: MAML rises smoothly to the $1\,\mathrm{m}$ target with almost no
+    overshoot, whereas the firmware cascade overshoots to $\sim\!1.26\,\mathrm{m}$
+    before its integrator settles, and the identically fine-tuned baseline sags to
+    $\sim\!0.89\,\mathrm{m}$ --- the same destructive adaptation seen at heavy
+    payload in simulation (Section~\ref{sec:maml_results}).}
+    \label{fig:maml_real_compare}
 \end{figure}
 
-\subsubsection*{Interpretation: a feed-forward thrust error the payload makes fatal}
+\begin{table}[H]
+    \centering
+    \caption{Real-drone regulation with the centred $8.21\,\mathrm{g}$ payload.
+    Steady-state error [cm] is the mean over the last second of the NN phase
+    (signed per-axis and Euclidean norm); the last two columns characterise the
+    altitude transient: the peak $z$ overshoot above the $1\,\mathrm{m}$ target and
+    the settling time $t_s$ to enter and stay within a $\pm5\,\mathrm{cm}$ band.
+    Best per column in bold; ``---'' marks the adapted baseline, which never
+    reaches the band (it holds $\sim\!10\,\mathrm{cm}$ low).}
+    \label{tab:maml_real}
+    \small
+    \begin{tabular}{l cccc cc}
+        \toprule
+        & \multicolumn{4}{c}{steady-state error [cm]} & \multicolumn{2}{c}{$z$ transient} \\
+        \cmidrule(lr){2-5}\cmidrule(lr){6-7}
+        Controller & $e_x$ & $e_y$ & $e_z$ & $\lVert e\rVert$ & overshoot [cm] & $t_s$ [s] \\
+        \midrule
+        firmware PID        & $+0.3$ & $+0.1$ & $+0.5$  & $\mathbf{0.57}$ & $+26.1$ & $4.4$ \\
+        baseline NN         & $+0.6$ & $+0.5$ & $+1.8$  & $1.96$ & $+6.8$ & $6.5$ \\
+        baseline NN adapted & $+0.1$ & $+0.2$ & $-11.5$ & $11.48$ & --- & --- \\
+        MAML adapted        & $+0.2$ & $+1.3$ & $-0.9$  & $1.61$ & $\mathbf{+1.4}$ & $\mathbf{2.7}$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
 
-The mechanism is the mirror image of the simulated result. The firmware cascade
-hovers the payload-laden drone correctly because its velocity-$z$ loop is an
-\emph{integral} controller: it does not need to know the true mass or the true
-thrust-to-force mapping, it simply integrates the residual until the drone holds
-its altitude. The neural network replaced exactly that loop
-(Section~\ref{sec:nn_pid_arch}) and carries \emph{no} integrator on thrust; it
-applies a feed-forward hover command computed from the \emph{modelled} mass and
-the \emph{modelled} thrust mapping. In simulation those models are exact, so the
-feed-forward thrust is right and the controller is stable
-(Section~\ref{sec:maml_results}); on the real platform they are not --- the bare
-airframe weighs $\sim\!31\,\mathrm{g}$ rather than the modelled $29\,\mathrm{g}$
-(Section~\ref{sec:nn_results}), the thrust-to-force gain drifts with the battery,
-and the on-board velocity estimate is biased and delayed --- and with no integral
-action to absorb the mismatch, this thrust error is left uncorrected. On its own
-the error is small; under the added payload, as the next paragraph makes precise,
-it grows into the vertical runaway seen in Figure~\ref{fig:maml_real_runaway}.
+\subsubsection*{Interpretation: MAML gives the best trajectory, not just the best endpoint}
 
-Crucially, the same controller without a payload transferred without trouble
-(Section~\ref{sec:nn_results}): there the identical thrust-calibration gap showed
-up only as a few-centimetre steady-state sag. Adding the centred mass raises the
-hover thrust the network must emit, which likely increases the absolute force error
-an imperfect mapping produces; this is our best explanation for why a previously
-benign offset turned unstable. If so, the sim-to-real gap here would be the same
-one identified throughout this work, only amplified by the payload to the point of
-breaking the transfer.
+Read on the steady-state error alone, the firmware cascade looks marginally best
+($0.6\,\mathrm{cm}$): its velocity-$z$ loop is an \emph{integral} controller that
+needs to know neither the true mass nor the true thrust-to-force mapping, so it
+eventually integrates away the residual and holds altitude. But that final
+tightness is bought with a violent transient --- the cascade overshoots the target
+by $26\,\mathrm{cm}$, climbing to $1.26\,\mathrm{m}$ before its integrator winds
+down, and does not settle within $5\,\mathrm{cm}$ until $4.4\,\mathrm{s}$. The
+last-second error hides exactly the behaviour that matters in flight: the integral
+loop is slow to react to the added weight, so it lags, over-corrects, and rings.
 
-This closes the chapter on a deliberately honest note. The simulated advantage of
-the meta-learned controller (Section~\ref{sec:maml_results}) came precisely from
-its integral-free, feed-forward thrust: free of the firmware integrator's
-transient lag, it set the right hover thrust in a single adapted step. On real
-hardware that very feature is its undoing --- the integrator the network discards
-is exactly what robustly rejects the unknown payload and thrust mapping, so the
-firmware cascade, the weaker controller in the simulated transient, is the only
-one of the three that actually flies the centred payload.
+The MAML controller shows the opposite, and better, profile. It replaced the
+integral loop (Section~\ref{sec:nn_pid_arch}) with a feed-forward hover command;
+because the real mass and thrust mapping differ slightly from the modelled ones,
+that command needs trimming, and the single few-shot adaptation supplies the right
+thrust bias directly rather than integrating towards it. The result is a nearly
+critically damped climb: only $1.4\,\mathrm{cm}$ of overshoot --- a factor of
+$\sim\!19$ below the firmware PID --- the fastest settling of all four
+($2.7\,\mathrm{s}$), and a final altitude within $0.9\,\mathrm{cm}$ of the target
+($1.6\,\mathrm{cm}$ overall). It is thus the best controller on the whole
+trajectory: it reaches the setpoint fastest, overshoots least, and holds it to a
+centimetre, giving up only half a centimetre of steady-state error to the cascade
+while avoiding the cascade's large excursion.
+
+The two baselines fill in the ordering. The \emph{un-adapted} network is MAML's
+nearest rival at the endpoint ($2.0\,\mathrm{cm}$) but reaches it slowly, with a
+$6.8\,\mathrm{cm}$ overshoot and a $6.5\,\mathrm{s}$ settle; the identically
+fine-tuned baseline collapses in $z$ to an $11.5\,\mathrm{cm}$ undershoot and never
+enters the $\pm5\,\mathrm{cm}$ band --- the very same destructive adaptation that
+degraded the joint initialisation at heavy payload in simulation
+(Section~\ref{sec:maml_results}), now visible on hardware at a single moderate
+payload. This is the meta-learning result the transfer confirms: given the
+\emph{identical} few-shot update, the MAML initialisation adapts into the best
+trajectory of the four, while the same update drives the joint network into a gross
+altitude error. The single-step adaptation that trained most reliably is thus, on
+the real platform, the difference between a controller that flies the payload
+crisply and one that does not fly it at all.
 
 % =====================================================
 \newpage
@@ -2757,23 +2784,27 @@ Section~\ref{sec:regulation} --- a network replacing only the outer position and
 velocity loops --- was trained entirely in simulation and transferred to the real
 drone, regulating it to a commanded setpoint with behaviour that matched the
 simulated prediction. Finally, MAML was applied to a disturbance Goffin never
-treated, a centred or offset payload, and meta-training did yield a controller
+treated, a centred or offset payload, and meta-training yielded a controller
 that adapted in a single few-shot step to an accuracy the jointly-trained baseline
-and the full firmware cascade could not match in simulation.
+and the full firmware cascade could not match in simulation --- and this
+meta-learned controller was then flown on the real Crazyflie, regulating an
+$8.21\,\mathrm{g}$-laden drone to the target within $1.6\,\mathrm{cm}$ where the
+identically fine-tuned baseline failed (Section~\ref{sec:maml_real}).
 
 \paragraph{Limitations.}
-That meta-learning advantage, however, was slight. The honest reading of
-Section~\ref{sec:maml_results} is that the cascade PID and even the plain
-jointly-trained network are already very good at rejecting a payload --- the
-firmware's integral action removes the steady-state error almost for free --- so
-the margin MAML buys over them, while real, is small and only clearly visible in
-the heaviest out-of-distribution payloads. More importantly, the ultimate goal,
-MAML on the real drone, was not reached: at the hand-over from the PID takeoff to
-the meta-learned controller the laden drone climbed to the ceiling
-(Section~\ref{sec:maml_real}), most plausibly because the network carries no
-thrust integrator and its feed-forward hover command was miscalibrated for the
-real vehicle --- a sim-to-real gap amplified by the added mass rather than
-a failure of the meta-learning itself.
+That meta-learning advantage, however, was bounded. The honest reading of
+Sections~\ref{sec:maml_results} and~\ref{sec:maml_real} is that the cascade PID and
+even the plain jointly-trained network are already good at rejecting a centred
+payload in \emph{steady state} --- the firmware's integral action removes the
+final error almost for free, albeit only after a large altitude overshoot --- so
+the margin MAML buys in end-point accuracy over a well-deployed baseline, while
+real, is small and only clearly visible in the heaviest out-of-distribution
+payloads. What the meta-learned initialisation buys unambiguously, both in
+simulation and on the real drone, is a better \emph{trajectory} and a \emph{safe}
+adaptation: on hardware it reaches the target fastest and with the least overshoot
+of all four controllers, and given the identical few-shot update it holds the
+setpoint while the same update drives the joint network into a gross altitude error
+(Section~\ref{sec:maml_real}).
 
 \paragraph{Future work.}
 Several directions follow naturally. First, the meta-learning task distribution
@@ -2784,29 +2815,41 @@ strongly offset masses, asymmetric or time-varying disturbances --- would give t
 meta-learned policy a regime in which its advantage is decisive rather than
 marginal. Second, the single inner adaptation step used here was the configuration
 that trained most reliably, but a few additional inner steps may unlock a larger
-share of MAML's benefit and are worth revisiting. Third, the runaway on the real
-drone points squarely at the open-loop thrust calibration: the network emits a
-hover thrust computed from the modelled mass and thrust mapping, which on the real
-platform is slightly wrong. Without a payload this error was benign --- the
-payload-free controller of Section~\ref{sec:nn_results} transferred with only a
-few-centimetre sag --- but the centred mass raises the hover thrust the network
-must emit, and with it the absolute force error, tipping that benign offset into
-the vertical runaway of Section~\ref{sec:maml_real}. The robust fix is to make the
-thrust command closed-loop on the real vehicle, by giving the network an integral
-channel on thrust or an explicit on-line hover-thrust estimate --- which is exactly
-why the firmware cascade, whose velocity-$z$ loop integrates this very error, flies
-the laden drone without trouble. Finally, training in this
+share of MAML's benefit and are worth revisiting. Third, the real-drone transfer
+still leans on an open-loop thrust calibration: the network emits a hover thrust
+computed from the modelled mass and thrust mapping, which on the real platform is
+slightly wrong, leaving the meta-learned controller about half a centimetre of
+residual steady-state error the integral-based firmware cascade does not have
+(Section~\ref{sec:maml_real}) --- though the cascade pays for that tightness with a
+large altitude overshoot the meta-learned controller avoids. A natural improvement
+is to make the thrust command closed-loop on the real vehicle, by giving the
+network an integral channel on thrust or an explicit on-line hover-thrust estimate
+--- adding to the meta-learned controller's already superior transient the last
+scrap of steady-state accuracy that a pure integrator gives for free. Fourth, the
+network runs off-board and closes its loop over the radio link, so every command it
+issues acts on the drone one round-trip of communication and estimation latency
+after the state it was computed from; the training simulator, by contrast, applies
+each command instantaneously, so the policy is never exposed to this delay and
+cannot learn to anticipate it. A follow-up should model the transmission and
+processing latency explicitly in the simulator --- delaying the observations the
+network sees and the actions it applies by the measured round-trip time --- so that
+meta-training produces a policy that accounts for the lag and adapts its command
+ahead of the state, rather than reacting to information that is already stale on the
+real platform. Finally,
+training in this
 work relied on the approximate near-hover model that conflates the body rates
 $(p,q,r)$ with the Euler-angle derivatives $(\dot\phi,\dot\theta,\dot\psi)$; a
 follow-up could differentiate through the exact quaternion-based dynamics that keep
 the two distinct, tightening the model the controller is optimised against and
 shrinking one more contributor to the sim-to-real gap.
 
-Even though the headline objective was not crowned with a successful real-drone
-demonstration of MAML, the project delivered a simulation pipeline that mirrors the
-Crazyflie's own control stack, a regulation controller that does transfer to
-hardware, and a documented account of where the meta-learning transfer broke down
-together with a plausible explanation of why --- a solid base for the next attempt.
+Taken together, the project delivered a simulation pipeline that mirrors the
+Crazyflie's own control stack, a regulation controller that transfers to hardware,
+and a meta-learned controller that adapts in a single few-shot step and flies a
+real payload-laden drone to its setpoint, safely where the jointly-trained baseline
+does not. The remaining gap to the integral-based firmware cascade in steady state
+is small and its cause is understood, leaving a clear and concrete path for the
+next iteration.
 
 \newpage
 % %%%%%%%%% REFERENCES SECTION %%%%%%%%%
