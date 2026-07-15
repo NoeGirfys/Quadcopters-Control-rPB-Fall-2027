@@ -1,5 +1,21 @@
-#if you want to push some changes of the library on your repo
--e ./gym-pybullet-drones 
-#motioncapture
-cflib
-cfclient
+# Dependencies for the Semester Project (Meta-Learning NN Control on a Crazyflie).
+# Environment used: conda env `venv_cf_313`, Python 3.13.
+#   conda create -n venv_cf_313 python=3.13 && conda activate venv_cf_313
+#   pip install -r requirements.txt
+# Versions below are the ones this project was validated against.
+
+# --- Simulator (vendored, editable) -----------------------------------------
+# gym-pybullet-drones; its own install pulls pybullet, gymnasium, scipy, Pillow.
+-e ./gym-pybullet-drones
+
+# --- Core: training, differentiable dynamics, plotting, YAML configs ---------
+torch==2.11.0
+numpy==2.4.4
+matplotlib==3.10.9
+PyYAML==6.0.3
+pybullet==3.2.7          # also a gym-pybullet-drones dep; imported directly too
+
+# --- Real Crazyflie flights (radio comms + config client/GUI) ---------------
+# Only needed to fly the real drone (fly_nn_cf_pid.py / fly_maml_cf_pid.py --mode attitude).
+cflib==0.1.32
+cfclient==2026.4

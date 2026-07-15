@@ -17,3 +17,6 @@ venv_MAML_SCITAS/
 *.bcf
 *.run.xml
 *.spl
+# Editor / local tooling (not part of the project)
+.claude/
+.vscode/

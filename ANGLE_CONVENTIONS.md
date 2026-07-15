@@ -1,36 +1,36 @@
-# Conventions angulaires : body rates vs dérivées d'Euler
+# Angular conventions: body rates vs Euler-angle derivatives
 
-Document de référence pour le projet de semestre. Il clarifie la distinction
-entre **dérivées des angles d'Euler** $\dot\Phi=(\dot\phi,\dot\theta,\dot\psi)$
-et **body rates** $\omega_B=(p,q,r)$, recense les conventions utilisées dans le
-projet, et localise dans chaque base de code où chaque grandeur est employée.
+Reference note for the semester project. It clarifies the distinction between
+**Euler-angle derivatives** $\dot\Phi=(\dot\phi,\dot\theta,\dot\psi)$ and
+**body rates** $\omega_B=(p,q,r)$, catalogues the conventions used across the
+project, and locates in each codebase where each quantity is used.
 
 ---
 
-## 1. Rappel théorique
+## 1. Theoretical background
 
-### 1.1 Y a-t-il une notion de « body angles » (ordre 0) ?
+### 1.1 Is there a notion of "body angles" (order 0)?
 
-**Non.** Les body rates $(p,q,r)$ ne sont la dérivée d'aucun vecteur d'angles.
-La vitesse angulaire $\omega_B$ est une grandeur **anholonome** (non
-intégrable) : il n'existe aucune paramétrisation $\Theta$ de l'orientation
-telle que $\dot\Theta=\omega_B$. Intégrer $p$ dans le temps ne produit pas un
-angle bien défini — le résultat dépend du chemin parcouru.
+**No.** The body rates $(p,q,r)$ are not the derivative of any vector of angles.
+The angular velocity $\omega_B$ is an **anholonomic** (non-integrable) quantity:
+there is no parametrisation $\Theta$ of the orientation such that
+$\dot\Theta=\omega_B$. Integrating $p$ over time does not produce a well-defined
+angle — the result depends on the path taken.
 
-| Ordre | Représentation « Euler » | Représentation « body » | Différence ? |
-|-------|--------------------------|-------------------------|--------------|
-| 0 — orientation | $(\phi,\theta,\psi)$, carte sur $SO(3)$ | *n'existe pas* | — l'orientation est unique, indépendante du repère |
-| 1 — vitesse angulaire | $\dot\Phi$ | $\omega_B=(p,q,r)$ | **oui** |
-| 2 — accélération angulaire | $\ddot\Phi$ | $\dot\omega_B$ | **oui** (implique aussi $\dot W$) |
+| Order | "Euler" representation | "Body" representation | Difference? |
+|-------|------------------------|-----------------------|-------------|
+| 0 — orientation | $(\phi,\theta,\psi)$, chart on $SO(3)$ | *does not exist* | — the orientation is unique, frame-independent |
+| 1 — angular velocity | $\dot\Phi$ | $\omega_B=(p,q,r)$ | **yes** |
+| 2 — angular acceleration | $\ddot\Phi$ | $\dot\omega_B$ | **yes** (also involves $\dot W$) |
 
-À l'ordre 0 il y a juste **l'orientation**, un élément de $SO(3)$ sur lequel
-toutes les représentations sont d'accord ; les angles d'Euler en sont une
-carte. La distinction body/Euler n'apparaît qu'à partir de l'ordre 1.
+At order 0 there is only **the orientation**, an element of $SO(3)$ on which all
+representations agree; the Euler angles are one chart of it. The body/Euler
+distinction only appears from order 1 onward.
 
-### 1.2 Relation cinématique
+### 1.2 Kinematic relation
 
-Body rates et dérivées d'Euler sont reliés par la matrice de transformation
-cinématique :
+Body rates and Euler-angle derivatives are related by the kinematic
+transformation matrix:
 
 $$\omega_B = W(\phi,\theta)\,\dot\Phi,\qquad
 W(\phi,\theta)=\begin{bmatrix}
@@ -39,70 +39,68 @@ W(\phi,\theta)=\begin{bmatrix}
 0 & -s_\phi & c_\phi c_\theta
 \end{bmatrix}$$
 
-Comme $W(0,0)=I_3$, on a $\omega_B\simeq\dot\Phi$ près du hover. La
-distinction devient non négligeable hors du régime hover, et $W^{-1}$
-dégénère à $\theta=\pm\pi/2$ (gimbal lock).
+Since $W(0,0)=I_3$, we have $\omega_B\simeq\dot\Phi$ near hover. The distinction
+becomes non-negligible away from the hover regime, and $W^{-1}$ degenerates at
+$\theta=\pm\pi/2$ (gimbal lock).
 
-### 1.3 Conséquence sur le vecteur d'état
+### 1.3 Consequence for the state vector
 
-Le vecteur d'état 12-D du code empile `[φ, p, θ, q, ψ, r]` : un angle d'Euler
-**couplé à un body rate qui n'en est pas la dérivée**. Les deux coïncident
-seulement près du hover. Le rapport (section 2.1) écrit ce vecteur avec
-$\dot\phi,\dot\theta,\dot\psi$ ; rigoureusement les emplacements angulaires
-contiennent $p,q,r$.
+The 12-D state vector of the code stacks `[φ, p, θ, q, ψ, r]`: an Euler angle
+**paired with a body rate that is not its derivative**. The two coincide only
+near hover. The report (Section 2.1) writes this vector with
+$\dot\phi,\dot\theta,\dot\psi$; strictly speaking the angular slots contain
+$p,q,r$.
 
 ---
 
-## 2. Conventions du projet
+## 2. Project conventions
 
-### 2.1 Repères
+### 2.1 Frames
 
-- **Repère monde** $\mathcal{W}$ : inertiel, $z$ vers le haut.
-- **Repère corps** $\mathcal{B}$ : attaché au CoM, $x_B$ avant, $y_B$ gauche,
-  $z_B$ aligné avec la poussée.
-- Orientation paramétrée par les angles d'Euler ZYX $(\phi,\theta,\psi)$.
+- **World frame** $\mathcal{W}$: inertial, $z$ pointing up.
+- **Body frame** $\mathcal{B}$: attached to the CoM, $x_B$ forward, $y_B$ left,
+  $z_B$ aligned with the thrust.
+- Orientation parametrised by the ZYX Euler angles $(\phi,\theta,\psi)$.
 
-### 2.2 Vecteur d'état (ordre du code)
+### 2.2 State vector (code order)
 
 ```
 [x, vx, y, vy, z, vz, phi, p, theta, q, psi, r]
  0   1   2   3   4   5    6   7    8   9   10  11
 ```
 
-Les emplacements 7, 9, 11 contiennent les **body rates** $(p,q,r)$, pas
-$\dot\Phi$.
+Slots 7, 9, 11 hold the **body rates** $(p,q,r)$, not $\dot\Phi$.
 
-### 2.3 Convention de signe du pitch
+### 2.3 Pitch sign convention
 
-- **pybullet** (utilisé en simulation) : pitch positif = nez **vers le bas**.
-- **Firmware Crazyflie** (aéronautique) : pitch positif = nez **vers le haut**.
-- Roll et yaw : conventions identiques entre les deux.
+- **pybullet** (used in simulation): positive pitch = nose **down**.
+- **Crazyflie firmware** (aeronautical): positive pitch = nose **up**.
+- Roll and yaw: identical conventions between the two.
 
-→ Lors de la conversion pybullet ↔ firmware/réel, on **nie le pitch** $\theta$
-**et le pitch rate** $q$. Le roll et le yaw ne sont pas touchés.
+→ When converting pybullet ↔ firmware/real, we **negate the pitch** $\theta$
+**and the pitch rate** $q$. Roll and yaw are left untouched.
 
-### 2.4 Vitesse angulaire selon la source
+### 2.4 Angular velocity by source
 
-| Source | Forme native | Conversion appliquée |
-|--------|---------------|----------------------|
-| `obs[13:16]` de gym-pybullet | $\omega$ repère **monde** | `R.T @ ang_v` → body |
-| Gyroscope du vrai Crazyflie (`gyro.x/y/z`) | body rates (deg/s) | aucune (déjà body) |
-| Modèle de Goffin | dérivées d'Euler $\dot\Phi$ | — |
+| Source | Native form | Conversion applied |
+|--------|-------------|--------------------|
+| `obs[13:16]` from gym-pybullet | $\omega$ in **world** frame | `R.T @ ang_v` → body |
+| Real Crazyflie gyroscope (`gyro.x/y/z`) | body rates (deg/s) | none (already body) |
+| Goffin's model | Euler-angle derivatives $\dot\Phi$ | — |
 
 ---
 
-## 3. Audit par base de code
+## 3. Codebase-by-codebase audit
 
-**Résumé :** un seul code utilise les dérivées d'Euler — le modèle de Goffin
-dans `compare_models_openloop`, et c'est voulu (le but est de le reproduire
-fidèlement). Partout ailleurs on travaille en body rates.
+**Summary:** a single codebase uses Euler-angle derivatives — Goffin's model in
+`compare_models_openloop`, and that is intentional (the goal is to reproduce it
+faithfully). Everywhere else the project works in body rates.
 
-### 3.1 `compare_models_openloop/` — dérivées d'Euler
+### 3.1 `compare_models_openloop/` — Euler-angle derivatives
 
-`goffin_dynamics.py` implémente le modèle de Goffin **entièrement en Euler
-rates**.
+`goffin_dynamics.py` implements Goffin's model **entirely in Euler rates**.
 
-État (L24-37) — angles d'Euler + dérivées d'Euler :
+State (L24-37) — Euler angles + Euler-angle derivatives:
 
 ```python
 # x = [x, xd, y, yd, z, zd, phi, phid, theta, thetad, psi, psid]^T
@@ -111,8 +109,8 @@ ITHETA, ITHETAD = 8, 9
 IPSI, IPSID   = 10, 11
 ```
 
-`nonlinear_continuous` (L178-180) — couplage gyroscopique écrit en dérivées
-d'Euler (eq. 2.10-2.12 de Goffin, forme approchée) :
+`nonlinear_continuous` (L178-180) — gyroscopic coupling written in Euler-angle
+derivatives (Goffin eq. 2.10-2.12, approximate form):
 
 ```python
 phi_dd   = (tau_x + (self.Iy - self.Iz) * thetad * psid) / self.Ix   # (2.10)
@@ -120,12 +118,12 @@ theta_dd = (tau_y + (self.Iz - self.Ix) * phid   * psid) / self.Iy   # (2.11)
 psi_dd   = (tau_z + (self.Ix - self.Iy) * phid   * thetad) / self.Iz # (2.12)
 ```
 
-Intégration de l'orientation (L189, L191, L193) : `dxdt[IPHI] = phid` etc.
-`linearized_continuous` (L201-245) : même structure.
+Orientation integration (L189, L191, L193): `dxdt[IPHI] = phid` etc.
+`linearized_continuous` (L201-245): same structure.
 
-**`gym_state_to_goffin` (L268-310) — le seul convertisseur explicite du
-projet.** Il prend la vitesse angulaire monde de pybullet et la ramène en
-dérivées d'Euler :
+**`gym_state_to_goffin` (L268-310) — the only explicit converter in the
+project.** It takes pybullet's world angular velocity and maps it back to
+Euler-angle derivatives:
 
 ```python
 # World -> body angular velocity
@@ -139,37 +137,36 @@ if np.abs(c_theta) > 1e-8:
     psi_dot   = (s_phi/c_theta)*omega_body[1] + (c_phi/c_theta)*omega_body[2]
 ```
 
-C'est l'unique endroit du projet où la conversion $\omega_B\to\dot\Phi$
-(matrice $W^{-1}$) est faite.
+This is the single place in the project where the conversion $\omega_B\to\dot\Phi$
+(matrix $W^{-1}$) is performed.
 
-`run_dynamics_comparison.py` (L121, L171) : `env.ang_v` de gym-pybullet est en
-repère monde ; tout ce qui entre dans le modèle Goffin passe par
-`gym_state_to_goffin`. La comparaison est donc honnête — pybullet (body rates
-en interne) est converti en Euler rates pour être comparé à Goffin.
+`run_dynamics_comparison.py` (L121, L171): gym-pybullet's `env.ang_v` is in the
+world frame; everything entering Goffin's model goes through
+`gym_state_to_goffin`. The comparison is therefore honest — pybullet (body rates
+internally) is converted to Euler rates to be compared against Goffin.
 
 ### 3.2 `circle_comparison_simu_and_real/` — body rates
 
-`cf_firmware_pid_sim.py`, `obs_to_firmware_state` (L329-376) :
+`cf_firmware_pid_sim.py`, `obs_to_firmware_state` (L329-376):
 
 ```python
-ang_v  = obs[13:16]                      # [rad/s] global          (L343)
+ang_v  = obs[13:16]                      # [rad/s] world           (L343)
 ...
-rpy[1] = -rpy[1]                         # pitch : pybullet -> firmware (L354)
+rpy[1] = -rpy[1]                         # pitch: pybullet -> firmware (L354)
 ...
 gyro_body = R.T @ ang_v          # [rad/s] body frame              (L370)
 gyro_deg  = np.degrees(gyro_body)
-gyro_deg[1] = -gyro_deg[1]       # pitch rate : même raison        (L374)
+gyro_deg[1] = -gyro_deg[1]       # pitch rate: same reason         (L374)
 ```
 
-- `rpy` = angles d'Euler (ordre 0), `gyro_deg` = **body rates**.
-- La boucle Rate PID consomme `gyro_deg` = body rates (L473, L491).
-- Logs du vrai drone (L1312-1314) : `gyro.x/y/z` = gyroscope brut = body rates
-  natifs.
+- `rpy` = Euler angles (order 0), `gyro_deg` = **body rates**.
+- The Rate PID loop consumes `gyro_deg` = body rates (L473, L491).
+- Real-drone logs (L1312-1314): `gyro.x/y/z` = raw gyroscope = native body rates.
 
 ### 3.3 `training_regulation_simu_and_real/` — body rates
 
-`train_nn_cf_pid.py`, `dynamics_substep` (L153-204). État `[...phi,p,theta,q,
-psi,r]`. Couplage gyroscopique en body rates (L188-190) :
+`train_nn_cf_pid.py`, `dynamics_substep` (L153-204). State `[...phi,p,theta,q,
+psi,r]`. Gyroscopic coupling in body rates (L188-190):
 
 ```python
 gyro_x = (I_Z - I_Y) * q * r
@@ -177,26 +174,26 @@ gyro_y = (I_X - I_Z) * p * r
 gyro_z = (I_Y - I_X) * p * q
 ```
 
-⚠️ **Nuance** — intégration de l'orientation (L201) :
+⚠️ **Caveat** — orientation integration (L201):
 
 ```python
 phi_n = phi + dt * p_n;   theta_n = theta + dt * q_n;   psi_n = psi + dt * r_n
 ```
 
-La *dynamique* rotationnelle est correcte en body rates, mais la *cinématique*
-d'orientation utilise l'approximation petit-angle $\omega_B\simeq\dot\Phi$
-(la matrice $W^{-1}$ est omise).
+The rotational *dynamics* are correct in body rates, but the orientation
+*kinematics* use the small-angle approximation $\omega_B\simeq\dot\Phi$ (the
+matrix $W^{-1}$ is omitted).
 
-`fly_nn_cf_pid.py` :
-- `obs_to_nn_state` (L126-157) : `gyro_body = R.T @ ang_v` (L150) → body rates.
-- `drone_state_to_nn_state` (L160-178) : `gyro_x/y/z` du vrai IMU → body rates ;
-  pitch et `q` niés (L168, L173).
+`fly_nn_cf_pid.py`:
+- `obs_to_nn_state` (L126-157): `gyro_body = R.T @ ang_v` (L150) → body rates.
+- `drone_state_to_nn_state` (L160-178): `gyro_x/y/z` from the real IMU → body
+  rates; pitch and `q` negated (L168, L173).
 
 ### 3.4 `training_MAML/` — body rates
 
-`maml_lib/dynamics.py` :
+`maml_lib/dynamics.py`:
 
-`nonlinear_step` (L53-98) — body rates, gyroscopique complet :
+`nonlinear_step` (L53-98) — body rates, full gyroscopic term:
 
 ```python
 omega = torch.stack([p, q, r], dim=-1)                             # (L85)
@@ -205,25 +202,24 @@ gyro = torch.cross(omega, Iomega, dim=-1)                          # (L87)
 omega_dot = (mass.I_inv @ (tau - gyro).unsqueeze(-1)).squeeze(-1)
 ```
 
-Intégration de l'orientation (L95) : `phi_n = phi + dt*p_n` — même
-approximation petit-angle qu'en 3.3.
+Orientation integration (L95): `phi_n = phi + dt*p_n` — same small-angle
+approximation as in 3.3.
 
-`linearized_step` (L101-140) : body rates, sans couplage gyroscopique,
-orientation L137 identique.
+`linearized_step` (L101-140): body rates, without gyroscopic coupling,
+orientation L137 identical.
 
-`test_maml_pybullet.py`, `obs_to_nn_state` (L66-89) : `gyro_body = R.T @ ang_v`
-(L82) → body rates. `rollout.py` / `policy.py` ne font que transmettre l'état.
+`test_maml_pybullet.py`, `obs_to_nn_state` (L66-89): `gyro_body = R.T @ ang_v`
+(L82) → body rates. `rollout.py` / `policy.py` merely pass the state through.
 
-### 3.5 Goffin vs entraînement : le même modèle
+### 3.5 Goffin vs training: the same model
 
-Question naturelle : le modèle de Goffin et la dynamique de
-`train_nn_cf_pid.py` / `maml_lib/dynamics.py` sont-ils le même modèle, à un
-renommage de variables près (`phi_dot` ↔ `p`) ? **Oui.** Comparaison terme à
-terme du modèle nonlinéaire.
+A natural question: are Goffin's model and the dynamics of
+`train_nn_cf_pid.py` / `maml_lib/dynamics.py` the same model, up to a variable
+renaming (`phi_dot` ↔ `p`)? **Yes.** Term-by-term comparison of the nonlinear
+model.
 
-**Translation** — `train_nn` calcule `thrust_world = F·R[:,:,2]` (3ᵉ colonne de
-la matrice de rotation ZYX). Cette colonne donne exactement les expressions de
-Goffin :
+**Translation** — `train_nn` computes `thrust_world = F·R[:,:,2]` (3rd column of
+the ZYX rotation matrix). This column gives exactly Goffin's expressions:
 
 ```
 ax = F/m·(cφ·sθ·cψ + sφ·sψ)   ≡ Goffin (2.7)
@@ -231,78 +227,76 @@ ay = F/m·(cφ·sθ·sψ − sφ·cψ)   ≡ Goffin (2.8)
 az = F/m·cφ·cθ − g            ≡ Goffin (2.9)
 ```
 
-**Rotation** — équation d'Euler. `train_nn` :
+**Rotation** — Euler's equation. `train_nn`:
 
 ```
 p_dot = (tau_x − (I_Z−I_Y)·q·r) / I_X
       = (tau_x + (I_Y−I_Z)·q·r) / I_X
 ```
 
-Goffin (2.10) : `phi_dd = (tau_x + (Iy−Iz)·θ̇·ψ̇) / Ix`. **Formule identique**
-sous le renommage `p↔φ̇, q↔θ̇, r↔ψ̇`.
+Goffin (2.10): `phi_dd = (tau_x + (Iy−Iz)·θ̇·ψ̇) / Ix`. **Identical formula**
+under the renaming `p↔φ̇, q↔θ̇, r↔ψ̇`.
 
-**Mixage moteurs** (config X) — identique.
+**Motor mixing** (X configuration) — identical.
 
-**Intégration de l'orientation** — les deux écrivent
-`angle_{k+1} = angle_k + dt · (variable de vitesse angulaire)`. Goffin appelle
-cette variable `φ̇`, `train_nn` l'appelle `p`, mais le calcul exécuté est le
-même. Autrement dit **les deux codes font la même et unique approximation**
-$\dot\Phi\equiv\omega_B$ : ils utilisent la variable à la fois (a) comme body
-rate dans l'équation d'Euler et (b) comme dérivée d'Euler pour intégrer
-l'orientation. Ce n'est cohérent que près du hover.
+**Orientation integration** — both write
+`angle_{k+1} = angle_k + dt · (angular-velocity variable)`. Goffin calls this
+variable `φ̇`, `train_nn` calls it `p`, but the computation performed is the
+same. In other words **both codebases make the same, single approximation**
+$\dot\Phi\equiv\omega_B$: they use the variable both (a) as a body rate in
+Euler's equation and (b) as an Euler-angle derivative to integrate the
+orientation. This is only consistent near hover.
 
-**Conclusion : physiquement c'est le même modèle.** Le nom des variables
-(`phi_dot` vs `p`) ne change rien aux calculs ; aucun des deux n'est « plus
-correct » que l'autre — c'est la même approximation décrite depuis deux points
-de vue opposés.
+**Conclusion: physically it is the same model.** The variable names (`phi_dot`
+vs `p`) change nothing in the computations; neither is "more correct" than the
+other — it is the same approximation described from two opposite viewpoints.
 
-Les seules vraies différences ne sont **pas** dans le modèle de dynamique :
+The only real differences are **not** in the dynamics model:
 
-1. **Schéma d'intégration.** Goffin utilise un Euler explicite
-   (`state + dt·dxdt`, toutes les dérivées évaluées sur l'état ancien).
-   `train_nn` et `maml_lib` utilisent un Euler **semi-implicite (symplectique)**:
-   vitesses/rates d'abord, puis positions/angles à partir des *nouvelles*
-   vitesses. Différence numérique, pas physique ; négligeable à petit `dt`,
-   plus stable sur long horizon pour le symplectique.
-2. **Masse décentrée.** `maml_lib/dynamics.py` généralise au point-masse
-   décentré (`M_total`, inertie corrigée de Steiner, offset du CoM `r_com`).
-   Pour le drone de base (masse centrée, inertie diagonale) il se réduit
-   exactement à la dynamique de `train_nn_cf_pid.py`.
-
----
-
-## 4. Tableau de synthèse
-
-Il n'existe en réalité que **deux modèles de dynamique distincts** dans le
-projet :
-
-| Modèle | Codes | Dynamique (transl. + rotation) | Cinématique d'orientation |
-|--------|-------|-------------------------------|---------------------------|
-| Approché (hover) | `goffin_dynamics.py`, `train_nn_cf_pid.py`, `maml_lib/dynamics.py` | mêmes équations d'Euler | $\omega_B\equiv\dot\Phi$, `angle + dt·ω` |
-| Exact | gym-pybullet DYN (`_integrateQ`) | mêmes équations d'Euler | quaternion exact |
-
-Goffin et les simulateurs d'entraînement implémentent **le même** modèle
-approché (cf. 3.5), à une variante d'intégration explicite/semi-implicite près.
-Le seul modèle réellement distinct est celui de gym-pybullet : équations de
-dynamique identiques, mais intégration de l'orientation par quaternion exact au
-lieu de `φ + dt·p`. La distinction body rates / dérivées d'Euler ne porte donc
-que sur le **nom** des variables et la **cinématique d'orientation** — jamais
-sur les équations de dynamique elles-mêmes.
+1. **Integration scheme.** Goffin uses an explicit (forward) Euler scheme
+   (`state + dt·dxdt`, all derivatives evaluated at the old state). `train_nn`
+   and `maml_lib` use a **semi-implicit (symplectic) Euler** scheme:
+   velocities/rates first, then positions/angles from the *new* velocities. A
+   numerical, not physical, difference; negligible at small `dt`, more stable
+   over a long horizon for the symplectic one.
+2. **Offset mass.** `maml_lib/dynamics.py` generalises to the off-centre point
+   mass (`M_total`, Steiner-corrected inertia, CoM offset `r_com`). For the
+   baseline drone (centred mass, diagonal inertia) it reduces exactly to the
+   dynamics of `train_nn_cf_pid.py`.
 
 ---
 
-## 5. Points de vigilance
+## 4. Summary table
 
-1. **Cohérence entraînement ↔ déploiement.** Le réseau de neurones voit
-   toujours des body rates : en simulation parce qu'on applique `R.T @ ang_v`,
-   sur le réel parce que le gyroscope les mesure nativement. Un désaccord ici
-   serait un pur écart sim-to-real.
-2. **Le pitch.** À chaque frontière pybullet ↔ firmware/réel, $\theta$ et $q$
-   sont niés. Roll et yaw jamais.
-3. **Le nom trompeur dans gym-pybullet.** La variable `rpy_rates` de
-   `BaseAviary` contient en réalité $\omega_B=(p,q,r)$, pas $\dot\Phi$ — voir
-   le rapport, section 2.1.
-4. **Formulation du rapport.** La remarque de la section 2.3
-   (« propagate $(p,q,r)$ through eq. 2.10-2.12 ») ne vaut que pour la partie
-   *dynamique* ; l'intégration de $\Phi$ dans les simulateurs d'entraînement
-   est approchée (petit-angle). À préciser dans les sections 5.2 / 6.2.
+There are in fact only **two distinct dynamics models** in the project:
+
+| Model | Codebases | Dynamics (transl. + rotation) | Orientation kinematics |
+|-------|-----------|-------------------------------|------------------------|
+| Approximate (hover) | `goffin_dynamics.py`, `train_nn_cf_pid.py`, `maml_lib/dynamics.py` | same Euler equations | $\omega_B\equiv\dot\Phi$, `angle + dt·ω` |
+| Exact | gym-pybullet DYN (`_integrateQ`) | same Euler equations | exact quaternion |
+
+Goffin and the training simulators implement **the same** approximate model
+(cf. 3.5), up to an explicit/semi-implicit integration variant. The only truly
+distinct model is gym-pybullet's: identical dynamics equations, but orientation
+integrated via an exact quaternion instead of `φ + dt·p`. The body-rates /
+Euler-derivatives distinction therefore only concerns the **name** of the
+variables and the **orientation kinematics** — never the dynamics equations
+themselves.
+
+---
+
+## 5. Points to watch
+
+1. **Training ↔ deployment consistency.** The neural network always sees body
+   rates: in simulation because we apply `R.T @ ang_v`, on the real drone
+   because the gyroscope measures them natively. A mismatch here would be a pure
+   sim-to-real gap.
+2. **The pitch.** At every pybullet ↔ firmware/real boundary, $\theta$ and $q$
+   are negated. Roll and yaw never.
+3. **The misleading name in gym-pybullet.** `BaseAviary`'s `rpy_rates` variable
+   actually holds $\omega_B=(p,q,r)$, not $\dot\Phi$ — see the report,
+   Section 2.1.
+4. **Report wording.** The remark in Section 2.3 ("propagate $(p,q,r)$ through
+   eq. 2.10-2.12") only holds for the *dynamics* part; the integration of $\Phi$
+   in the training simulators is approximate (small-angle). To be clarified in
+   Sections 5.2 / 6.2.

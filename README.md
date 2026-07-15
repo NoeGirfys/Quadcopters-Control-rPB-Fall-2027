@@ -28,17 +28,18 @@ conda environment on Python 3.13:
 ```bash
 conda create -n venv_cf_313 python=3.13
 conda activate venv_cf_313
-
-# gym-pybullet-drones is vendored and installed editable (see requirements.txt)
-pip install -e ./gym-pybullet-drones
-
-# real-drone communication (Crazyflie radio + client)
-pip install cflib cfclient
+pip install -r requirements.txt
 ```
 
-`requirements.txt` captures the editable install and the Crazyflie packages.
-Core scientific deps (`torch`, `numpy`, `matplotlib`, `pyyaml`, `scipy`) are pulled
-in by the above or installed on demand.
+`requirements.txt` pins every library the code uses (versions this project was
+validated against):
+
+- **`-e ./gym-pybullet-drones`** — the vendored simulator, installed editable; its
+  own install pulls `pybullet`, `gymnasium`, `scipy`, `Pillow`.
+- **`torch`, `numpy`, `matplotlib`, `PyYAML`, `pybullet`** — training, differentiable
+  dynamics, plotting, and the YAML task configs.
+- **`cflib`, `cfclient`** — real-drone radio comms and the config client; only needed
+  to fly the physical Crazyflie (`fly_*_cf_pid.py --mode attitude`).
 
 ### 1.2 Running scripts — import paths
 
@@ -229,7 +230,7 @@ python training_MAML/plot_real_compare.py --pid ... --base ... --base-adapt ... 
 
 `flights/` naming: `maml_real_<controller>_<mass>g_<timestamp>.npz`, controllers
 `pid` / `base` / `base-adapt` / `maml`. **Only the `20260611` real flights are
-post-yaw-fix** (see §5 below) — earlier real MAML logs predate that fix.
+post-yaw-fix** (see §4 below) — earlier real MAML logs predate that fix.
 
 ### 3.8 `MetaLearning-Control-Quadcopters-main/` — Goffin's prior work (§1.2)
 
