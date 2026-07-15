@@ -121,7 +121,9 @@
       "Bash(/c/Users/niels/anaconda3/envs/venv_cf_313/python.exe *)",
       "Bash(echo \"EXIT $?\")",
       "Bash(grep -E \"\\\\.\\(pt|png|npz\\)$\")",
-      "Bash(grep \"\\\\.pt$\")"
+      "Bash(grep \"\\\\.pt$\")",
+      "Bash(iconv -f UTF-16LE -t UTF-8 README.md)",
+      "Bash(mv -f /tmp/readme_utf8.md README.md)"
     ]
   }
 }
